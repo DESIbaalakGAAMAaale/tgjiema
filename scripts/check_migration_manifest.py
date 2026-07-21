@@ -2,9 +2,9 @@
 """R65 P1-08 / R66 P0-01: migration catalog 完整性 + 签名绑定严格校验。
 
 终审报告 P1-08 根治逻辑:
-    Migration 005/006/007 需纳入签名 release manifest。
+    Migration 005/006/007/008 需纳入签名 release manifest。
     本轮 Release 在生成 release manifest 前已经失败,因此新增迁移尚无已签名、
-    同 digest 的生产证据。必须验证 001–007 全集合、顺序、hash、前驱、
+    同 digest 的生产证据。必须验证 001–008 全集合、顺序、hash、前驱、
     DDL version 和回滚策略。
 
 R66 P0-01 整改要点(catalog-only 模型):
@@ -20,8 +20,8 @@ R66 P0-01 整改要点(catalog-only 模型):
 校验矩阵(strict 模式默认开启):
   0. catalog-only 模型验证 — 必须不包含 release_commit / tree_sha 字段
      (R66 P0-01: 自引用字段必须移除)
-  1. 001-007 全集合存在 (manifest 必须列出所有 migration_id)
-  2. predecessor 链完整 (001 ← 002 ← 003 ← ... ← 007)
+  1. 001-008 全集合存在 (manifest 必须列出所有 migration_id)
+  2. predecessor 链完整 (001 ← 002 ← 003 ← ... ← 008)
   3. 每个 SQL 文件 SHA-256 与 manifest 一致 (fail-closed on tampering)
   4. ddl_version 单调非递减 (允许同值,不允许下降)
   5. rollback_strategy 非空 (每个 migration 必须有回滚策略)
@@ -62,9 +62,10 @@ MIGRATIONS_DIR = REPO_ROOT / "database" / "migrations"
 MANIFEST_PATH = MIGRATIONS_DIR / "migration-manifest.json"
 RELEASE_MANIFEST_PATH = REPO_ROOT / "release-artifacts" / "release-manifest.json"
 
-# 期望的 migration_id 集合 (001-007)
+# 期望的 migration_id 集合 (001-008)
 # R65 P1-08: 全集合必须存在,不允许漏项
-EXPECTED_MIGRATION_IDS: list[str] = [f"{i:03d}" for i in range(1, 8)]
+# R67 P1-06: 扩展为 001-008(新增 008_restore_switch_reconciler.sql)
+EXPECTED_MIGRATION_IDS: list[str] = [f"{i:03d}" for i in range(1, 9)]
 
 
 def _file_sha256(path: Path) -> str:
@@ -160,12 +161,12 @@ def verify_manifest(
                 f"HEAD 绑定由 release-artifacts/release-manifest.json 承担"
             )
 
-    # 1. 校验 001-007 全集合存在
+    # 1. 校验 001-008 全集合存在
     found_ids = [str(e.get("migration_id", "")).strip() for e in migrations]
     for expected_id in EXPECTED_MIGRATION_IDS:
         if expected_id not in found_ids:
             errors.append(
-                f"缺少 migration_id={expected_id} (期望 001-007 全集合)"
+                f"缺少 migration_id={expected_id} (期望 001-008 全集合)"
             )
 
     # 检查重复 migration_id
@@ -334,7 +335,7 @@ def _parse_args() -> argparse.Namespace:
         "--strict",
         action="store_true",
         default=True,
-        help="严格模式(默认开启):严格校验 001-007 全集合/SHA-256/"
+        help="严格模式(默认开启):严格校验 001-008 全集合/SHA-256/"
         "predecessor 链/ddl_version/rollback_strategy",
     )
     parser.add_argument(

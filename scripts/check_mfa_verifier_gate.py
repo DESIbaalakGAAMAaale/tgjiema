@@ -49,11 +49,20 @@ SCAN_DIRS: list[str] = ["bots", "services", "admin"]
 
 # 白名单(允许直接调用 sync verifier 的文件/目录,相对 REPO_ROOT,POSIX 路径)
 # 命中任一前缀的文件将被跳过(允许直接调用)
+# R67 P1-08: scripts/ 不再整体跳过 — 通过 `is_skippable_script()` 细粒度判断。
+# 仅 GATE_SCANNERS 可跳过;OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
 ALLOWED_PREFIXES: list[str] = [
     "admin/mfa.py",  # sync verifier 的定义文件本身
     "tests/",        # 测试代码
-    "scripts/",      # 运维脚本(含本门禁脚本自身)
 ]
+
+# R67 P1-08: scripts/ 下可跳过的文件清单(从 _script_categories 导入)
+try:
+    from scripts._script_categories import is_skippable_script as _is_skippable_script_p1_08
+except ImportError:
+    # _script_categories 不可用时 fail-closed:不跳过任何 scripts/ 文件
+    def _is_skippable_script_p1_08(rel_path: str) -> bool:
+        return False
 
 # 跳过的目录名(出现在路径中即跳过)
 SKIP_DIR_PARTS: list[str] = [
@@ -93,11 +102,18 @@ def _is_skipped_path(path: Path) -> bool:
 
 
 def _is_allowed(path: Path) -> bool:
-    """检查文件路径是否在白名单前缀中。"""
+    """检查文件路径是否在白名单前缀中。
+
+    R67 P1-08: scripts/ 细粒度判断 — 仅 GATE_SCANNERS 可跳过;
+    OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
+    """
     rel = _rel_posix(path)
     for prefix in ALLOWED_PREFIXES:
         if rel == prefix or rel.startswith(prefix):
             return True
+    # R67 P1-08: scripts/ 细粒度判断
+    if rel.startswith("scripts/") and _is_skippable_script_p1_08(rel):
+        return True
     return False
 
 

@@ -2,7 +2,7 @@
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
     "enum_count": 147,
-    "generated_at": "2026-07-20T09:23:32.847727Z",
+    "generated_at": "2026-07-20T17:06:32.268234Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -1593,6 +1593,21 @@
       "show_retry_button": false,
       "telegram_presentation": "inline"
     },
+    "PRODUCTION.EVIDENCE.ALREADY_CONSUMED": {
+      "audit_level": "critical",
+      "code": "PRODUCTION.EVIDENCE.ALREADY_CONSUMED",
+      "http_status": 409,
+      "message_key": "errors.production.evidence.already_consumed",
+      "retryable": false,
+      "safe_params": [
+        "artifact_type",
+        "consumed_candidate",
+        "candidate_tag"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "PRODUCTION.RESTORE.HASH_MISMATCH": {
       "audit_level": "critical",
       "code": "PRODUCTION.RESTORE.HASH_MISMATCH",
@@ -1765,7 +1780,10 @@
       "retryable": false,
       "safe_params": [
         "caller",
-        "reason"
+        "reason",
+        "entry_point",
+        "source_env_var",
+        "allow_legacy_restore_set"
       ],
       "severity": "critical",
       "show_retry_button": false,

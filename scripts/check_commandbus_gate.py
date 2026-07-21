@@ -23,7 +23,9 @@
 - services/rbac.py                (高风险 API 的定义文件)
 - services/maintenance_mode.py    (高风险 API 的定义文件)
 - tests/                          (测试代码)
-- scripts/                        (运维脚本)
+- scripts/ (R67 P1-08 细粒度)     — 仅 GATE_SCANNERS 类脚本可跳过自检;
+                                    OFFLINE_RECOVERY_TOOLS 与
+                                    GOVERNANCE_SCRIPTS 必须被扫描
 
 R44 G0-3: backup_engine.restore 白名单收紧
 - 不再允许 services/disaster_recovery.py / services/db_restore.py /
@@ -92,10 +94,18 @@ ALLOWED_PREFIXES: list[str] = [
     "services/content_reports.py",
     "services/rbac.py",
     "services/maintenance_mode.py",
-    # 测试与运维脚本
+    # 测试代码
     "tests/",
-    "scripts/",
 ]
+
+# R67 P1-08: scripts/ 下可跳过的文件清单(从 _script_categories 导入)
+# 仅 GATE_SCANNERS 可跳过;OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
+try:
+    from scripts._script_categories import is_skippable_script as _is_skippable_script_p1_08
+except ImportError:
+    # _script_categories 不可用时 fail-closed:不跳过任何 scripts/ 文件
+    def _is_skippable_script_p1_08(rel_path: str) -> bool:
+        return False
 
 # 跳过的目录(不扫描)
 SKIP_DIR_PARTS: list[str] = [
@@ -131,11 +141,18 @@ def _is_skipped_path(path: Path) -> bool:
 
 
 def _is_allowed(path: Path) -> bool:
-    """检查文件路径是否在白名单前缀中。"""
+    """检查文件路径是否在白名单前缀中。
+
+    R67 P1-08: scripts/ 细粒度判断 — 仅 GATE_SCANNERS 可跳过;
+    OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
+    """
     rel = _rel_posix(path)
     for prefix in ALLOWED_PREFIXES:
         if rel == prefix or rel.startswith(prefix):
             return True
+    # R67 P1-08: scripts/ 细粒度判断
+    if rel.startswith("scripts/") and _is_skippable_script_p1_08(rel):
+        return True
     return False
 
 

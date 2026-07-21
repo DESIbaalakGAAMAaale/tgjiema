@@ -185,6 +185,7 @@
     "i18n.locale.not_bound": "i18n export boundary violation: production code called translation API without explicit locale binding (key={key}, caller={caller}, trace_id={trace_id})",
     "i18n.parse.failed": "i18n runtime parse failed, fail-closed refusing to expose raw ICU template to user (key={key}, locale={locale}, reason={reason}, trace_id={trace_id})",
     "production.evidence.insufficient": "Production evidence insufficient for promotion: {reason} (missing/expired: {missing})",
+    "production.evidence.already_consumed": "Production evidence already consumed by another candidate, cross-candidate reuse forbidden: artifact_type={artifact_type}, consumed_candidate={consumed_candidate}, candidate_tag={candidate_tag}",
     "command.concurrent.claim": "Operation claimed by another worker or state changed (action_id={action_id})",
     "command.hash.mismatch": "Request parameters differ from last execution (anti-tamper rejected, action_id={action_id})",
     "db.cache.unavailable": "SQLite cache unavailable (component={component})",
@@ -2641,7 +2642,12 @@
         "crdb_commit_switch": "[restore_backend.crdb] commit_switch: {previous} -> {new} (operation_id={operation_id}, switch_version={switch_version})",
         "crdb_rollback_switch": "[restore_backend.crdb] rollback_switch: {current} -> {previous} (operation_id={operation_id})",
         "crdb_destroyed_schema": "[restore_backend.crdb] destroyed schema: {schema}",
-        "crdb_destroy_failed": "[restore_backend.crdb] destroy failed (ignored): {error}"
+        "crdb_destroy_failed": "[restore_backend.crdb] destroy failed (ignored): {error}",
+        "verify_authority_state_rollback_after_permissions_failed": "[restore_backends] verify_authority_state ROLLBACK after permissions probe failed: {error}",
+        "verify_authority_state_rollback_after_cas_failed": "[restore_backends] verify_authority_state ROLLBACK after CAS probe failed: {error}",
+        "verify_authority_state_temp_table_cleanup_failed": "[restore_backends] verify_authority_state temp table cleanup failed: {error}",
+        "verify_authority_state_conn_close_failed": "[restore_backends] verify_authority_state conn.close failed: {error}",
+        "verify_authority_state_crdb_test_schema_cleanup_failed": "[restore_backends] CRDB verify_authority_state test_schema cleanup failed (schema={schema}): {error}"
       },
       "p0_03": {
         "approval_cas_consumed": "[restore_capabilities] R65 P0-03 ApprovalAuthority CAS consumed approval_id={aid} approver={approver_id} action_hash={hash}...",
@@ -2659,6 +2665,23 @@
         "rollback_failed": "[restore_orchestrator] rollback {datasource} failed: {error}",
         "backend_destroy": "[restore_orchestrator] R65 P0-02 backend.destroy {datasource}: {target}",
         "backend_destroy_failed_fallback": "[restore_orchestrator] backend.destroy {datasource} failed (fallback to unlink): {error}"
+      },
+      "restore_reconciler": {
+        "persist_switch_intent_failed": "[restore_reconciler] failed to persist switch_intent (operation_id={operation_id}): {error}",
+        "update_switch_intent_status_failed": "[restore_reconciler] failed to update switch_intent status (operation_id={operation_id}): {error}",
+        "persist_backend_receipt_failed": "[restore_reconciler] failed to persist backend_receipt (operation_id={operation_id}, datasource={datasource}): {error}",
+        "get_switch_intent_failed": "[restore_reconciler] failed to read switch_intent (operation_id={operation_id}): {error}",
+        "get_incomplete_switch_intents_failed": "[restore_reconciler] failed to read incomplete switch_intents: {error}",
+        "get_backend_receipts_failed": "[restore_reconciler] failed to read backend_receipts (operation_id={operation_id}): {error}",
+        "table_missing_skip": "[restore_reconciler] restore_switch_intents table missing (migration 008 not applied) — skipping R67 P1-06 reconciler",
+        "table_existence_check_failed": "[restore_reconciler] failed to check restore_switch_intents table existence: {error}",
+        "reconcile_one_intent_exception": "[restore_reconciler] reconcile operation_id={operation_id} switch_version={switch_version} exception: {error_type}: {error}",
+        "reconcile_complete_operation_done": "[restore_reconciler] operation_id={operation_id} switch_version={switch_version} completed by reconciler (receipts={receipts_count})",
+        "reconcile_partial_rollback_switch_failed": "[restore_reconciler] operation_id={operation_id} datasource={datasource} rollback_switch failed: {error_type}: {error}",
+        "reconcile_partial_rollback_summary": "[restore_reconciler] operation_id={operation_id} switch_version={switch_version} partial receipts, rolled back {rolled_back_count}/{receipts_count} backends"
+      },
+      "restore_orchestrator": {
+        "payload_consistency_query_failed": "[restore_orchestrator] payload consistency query failed (ignored): {error}"
       }
     }
   }

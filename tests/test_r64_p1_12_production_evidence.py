@@ -71,7 +71,7 @@ class TestGenerateEvidenceModuleStructure:
         assert isinstance(module.EVIDENCE_TYPES, dict)
 
     def test_evidence_types_contains_five_types(self):
-        """EVIDENCE_TYPES 应包含 5 类证据。"""
+        """EVIDENCE_TYPES 应包含 6 类证据(R67 P0-04 新增 rc_verify_3x)。"""
         import importlib.util
         spec = importlib.util.spec_from_file_location(
             "generate_production_evidence",
@@ -79,13 +79,14 @@ class TestGenerateEvidenceModuleStructure:
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        # 5 类证据:soak / vps_recovery / chaos / ru_72h / supply_chain
+        # 6 类证据:soak / vps_recovery / chaos / ru_72h / supply_chain / rc_verify_3x
         assert "soak" in module.EVIDENCE_TYPES
         assert "vps_recovery" in module.EVIDENCE_TYPES
         assert "chaos" in module.EVIDENCE_TYPES
         assert "ru_72h" in module.EVIDENCE_TYPES
         assert "supply_chain" in module.EVIDENCE_TYPES
-        assert len(module.EVIDENCE_TYPES) == 5
+        assert "rc_verify_3x" in module.EVIDENCE_TYPES
+        assert len(module.EVIDENCE_TYPES) == 6
 
     def test_each_evidence_type_has_required_fields(self):
         """每个证据类型应包含 description/script/required_args/production_args/report_glob 字段。"""
@@ -187,7 +188,7 @@ class TestGenerateEvidenceArgparse:
             ["python3", str(script_path), "--all",
              "--skip", "soak", "--skip", "vps_recovery",
              "--skip", "chaos", "--skip", "ru_72h",
-             "--skip", "supply_chain"],
+             "--skip", "supply_chain", "--skip", "rc_verify_3x"],
             capture_output=True, text=True, timeout=30,
         )
         assert result.returncode == 0, (

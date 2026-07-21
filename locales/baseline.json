@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 1304,
+      "baseline": 1303,
       "target": 0,
       "user_visible": 0,
-      "log_only": 1304
+      "log_only": 1303
     }
   },
   "total": {
-    "baseline": 1919,
+    "baseline": 1918,
     "target": 0,
     "user_visible": 0,
-    "log_only": 1919
+    "log_only": 1918
   },
-  "last_updated": "2026-07-18",
+  "last_updated": "2026-07-20",
   "last_updated_by": "R64 audit remediation: new files (restore_orchestrator, button_ux_policy, button_ux_renderer, high_risk_policy, sink_adapters, ru_cost_center additions, crdb_ru_collector additions) add 37 log_only strings; user_visible remains 0"
 }

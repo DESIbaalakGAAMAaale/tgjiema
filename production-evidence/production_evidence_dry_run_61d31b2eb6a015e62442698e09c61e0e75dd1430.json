@@ -1,0 +1,48 @@
+{
+  "schema_version": "r64_p1_12_v1",
+  "generated_at": "2026-07-20T16:26:57.616742+00:00",
+  "started_at": "2026-07-20T16:26:57.519268+00:00",
+  "duration_seconds": 0.1,
+  "output_dir": "production-evidence",
+  "dry_run": false,
+  "evidence_mode": "dry_run",
+  "production_promotion_allowed": false,
+  "flags": {
+    "skip": [
+      "soak",
+      "vps_recovery",
+      "chaos",
+      "ru_72h",
+      "supply_chain"
+    ],
+    "dry_run": false
+  },
+  "evidence_count": 1,
+  "passed_count": 0,
+  "failed_count": 1,
+  "skipped_count": 0,
+  "error_count": 0,
+  "overall_status": "failed",
+  "results": [
+    {
+      "evidence_type": "rc_verify_3x",
+      "script": "scripts/verify_rc_3x.py",
+      "command": [
+        "python3",
+        "/workspace/scripts/verify_rc_3x.py",
+        "--output-dir",
+        "/workspace/production-evidence"
+      ],
+      "started_at": "2026-07-20T16:26:57.519293+00:00",
+      "completed_at": "2026-07-20T16:26:57.616285+00:00",
+      "duration_seconds": 0.1,
+      "exit_code": 2,
+      "stdout_tail": "",
+      "stderr_tail": "usage: verify_rc_3x.py [-h] --image-name IMAGE_NAME\n                       --image-digest IMAGE_DIGEST\n                       --expected-commit EXPECTED_COMMIT\n                       --expected-tree EXPECTED_TREE\n                       [--expected-catalog-digest EXPECTED_CATALOG_DIGEST]\n                       [--expected-release-manifest-digest EXPECTED_RELEASE_MANIFEST_DIGEST]\n                       [--expected-sbom-digest EXPECTED_SBOM_DIGEST]\n                       [--expected-provenance-digest EXPECTED_PROVENANCE_DIGEST]\n                       [--output-dir OUTPUT_DIR] [--json]\nverify_rc_3x.py: error: the following arguments are required: --image-name, --image-digest, --expected-commit, --expected-tree\n",
+      "report_path": null,
+      "report_size_bytes": 0,
+      "status": "failed",
+      "error": null
+    }
+  ]
+}

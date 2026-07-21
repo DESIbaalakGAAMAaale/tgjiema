@@ -789,6 +789,12 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
                ``ALLOW_LEGACY_RESTORE=1`` 时跳过 seal(供 tests/ 与 scripts/ 中
                需要直接调用旧 writer 的兼容场景使用)。生产部署绝不应配置此环境变量。
 
+    R67 P0-06 整改(生产镜像物理移除 legacy restore 公共入口):
+               在 capability-seal 之前增加硬守卫:生产环境(APP_ENV=production|
+               staging)无条件拒绝调用 ``restore_from_backup()``,**不允许**
+               ``ALLOW_LEGACY_RESTORE`` 解封。守卫直接读取 ``APP_ENV``,不依赖
+               Settings 实例化。
+
     Args:
         key: R2 对象 key（如 db_backup/db_backup_20240101_120000.json）
         tables: 仅恢复指定表；None 则恢复备份中的所有表
@@ -801,6 +807,16 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
         AppError(RESTORE_LEGACY_WRITER_SEALED): 生产环境直接调用本入口(capability-seal)
         AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): 旧格式 key 不支持恢复
     """
+    # R67 P0-06: 生产环境硬守卫 — 在 capability-seal 之前执行。
+    # 即使设置 ALLOW_LEGACY_RESTORE=1,生产环境(APP_ENV=production|staging)
+    # 也无条件拒绝调用本 legacy 入口。守卫直接读取 APP_ENV,不依赖
+    # Settings 实例化,避免"未加载 Settings 即可绕过"的漏洞。
+    from services._production_guard import assert_no_legacy_restore_in_production
+    assert_no_legacy_restore_in_production(
+        entry_point="db_backup.restore_from_backup()",
+        caller="db_backup.restore_from_backup",
+    )
+
     # R65 P0-07 / P1-07: capability-seal — 旧直接 restore writer 已被封存。
     # 生产环境调用 restore_from_backup() 必须 fail-closed,改走 RestoreOrchestrator
     # 蓝绿切换路径(staging → active,禁止原地覆盖)。

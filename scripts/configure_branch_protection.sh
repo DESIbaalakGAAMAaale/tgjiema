@@ -167,6 +167,8 @@ EXPECTED_RG_JOBS=(
   "trivy"
   "sign-image"
   "verify-branch-protection"
+  "verify-branch-ruleset"
+  "verify-git-source-governance"
   "rc-continuity"
   "publish-attestation"
   "attestation-semantics-verify"

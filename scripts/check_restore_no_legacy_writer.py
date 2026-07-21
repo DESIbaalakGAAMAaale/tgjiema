@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""R65 P0-07 / P1-07 / R66 P0-07: capability-seal 静态门禁 — 禁止生产代码直接调用旧 restore writer。
+"""R65 P0-07 / P1-07 / R66 P0-07 / R67 P1-07: capability-seal 静态门禁 — 禁止生产代码直接调用旧 restore writer。
 
 使用 Python ast 模块解析全仓 .py 文件,检测违规调用以下"旧 restore writer"函数:
 
@@ -13,18 +13,25 @@
     - validate_and_restore_backup_strict  (services/backup_dr_validate.py 公共入口)
     - restore_from_backup                (services/db_backup.py 公共 wrapper)
 
-R66 P0-07 整改(本次变更):
-    1. 白名单从"整个文件"改为精确函数+行范围+AST 调用关系:
-       - db_restore.py: 仅 _restore_from_backup_data 内部委托给子写入器,
-                        仅 run_restore CLI 入口委托给 validate_and_restore_backup_strict
-       - backup_dr_validate.py: 仅 validate_and_restore_backup_strict /
-                                _restore_preverified_payload 调用 _restore_from_backup_data
-       - restore_orchestrator.py / restore_backends.py: 移出白名单(新生产路径,禁止调用 legacy writer)
-       - error_codes.py: 仍完全跳过(仅引用错误码字符串,非调用)
-    2. 解析失败必须 fail(不再 skip),防止语法/编码异常让扫描器漏检
-    3. 禁止 wrapper 再导出 legacy writer:
-       - __all__ 包含 legacy writer 名 → 违规(显式再导出)
-       - from X import legacy_writer as alias (alias != legacy_writer) → 违规(别名再导出)
+R66 P0-07 整改:
+    1. 白名单从"整个文件"改为精确函数+行范围+AST 调用关系
+    2. 解析失败必须 fail(不再 skip)
+    3. 禁止 wrapper 再导出 legacy writer
+
+R67 P1-07 整改(本次变更):
+    白名单从"函数+行范围(line_start/line_end)"改为
+    "函数 qualified name + AST signature + source digest",
+    禁止行范围授权。原因:
+      - 普通注释或格式化会移动行号,导致误报
+      - 大范围行区间可能意外包含新调用,导致漏检
+    新方案:
+      - 每个白名单条目存储函数的 AST signature(归一化 AST dump 的 SHA-256)
+        与 source digest(函数源码的 SHA-256)
+      - 运行时动态计算被调用函数的 signature/digest,与白名单对比
+      - 函数源码任何改动都导致 signature/digest 变化,强制团队更新白名单
+        (避免"静默漂移让违规通过")
+      - 提供辅助脚本 scripts/regenerate_scanner_whitelist_digests.py
+        自动计算并打印新的 signature/digest
 
 违规示例:
     - bots/admin_bot/handlers.py 直接调用 db_restore.run_restore(...)
@@ -32,24 +39,11 @@ R66 P0-07 整改(本次变更):
     - services/db_backup.py:restore_from_backup() 调用 validate_and_restore_backup_strict()
       → --strict 模式报错;生产应改走 RestoreOrchestrator
 
-背景:
-    R65 终审报告 P0-07 / P1-07: 旧直接 restore writer(_restore_from_backup_data
-    / _restore_crdb_tables / _restore_sqlite_tables_to_db / run_restore /
-    validate_and_restore_backup_strict)在原地覆盖模式下可能"先清空生产表再失败",
-    造成 active 数据被破坏且不可恢复。R64 P0-03 已引入 RestoreOrchestrator
-    蓝绿切换模型(staging → active),R65 P0-07 / P1-07 在 capability-seal 层
-    进一步封存旧 writer:生产入口必须改走 orchestrator,旧 writer 仅保留给
-    tests/ + scripts/ + 已精确白名单的 services/ 函数使用。
-
-    R66 P0-07 进一步整改:白名单从"整个文件"收紧为"函数+行范围+AST 调用关系",
-    防止宽白名单恰好覆盖最危险的旧入口与适配层;解析失败必须 fail,防止
-    语法/编码异常让扫描器漏检;增加 wrapper 再导出检测。
-
 CI 调用方式:
-    # ci.yml(static-gates job)— 默认模式,捕获直接调用私有 writer
+    # ci.yml(static-gates job)— 默认模式
     python scripts/check_restore_no_legacy_writer.py
 
-    # release-gates.yml(--strict 模式,捕获所有调用包括 strict service)
+    # release-gates.yml(--strict 模式)
     python scripts/check_restore_no_legacy_writer.py --strict
 
 退出码:
@@ -61,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -82,46 +77,67 @@ LEGACY_WRITER_FUNDS_STRICT_EXTRA: set[str] = {
     "restore_from_backup",
 }
 
+
 # ═══════════════════════════════════════════════════════════════
-# R66 P0-07: 精确白名单 — 从"整个文件"改为"函数+行范围+AST 调用关系"
+# R67 P1-07: 精确白名单 — 函数 qualified name + AST signature + source digest
 # ═══════════════════════════════════════════════════════════════
-# 每个条目: (file_posix, function_name, line_start, line_end, allowed_callees)
-# 仅允许指定函数在指定行范围内调用指定的 legacy writer(内部委托 only)。
+# 每个条目:
+#   - file: 相对仓库根的 POSIX 路径
+#   - function: 函数名(enclosing function name)
+#   - ast_signature: 归一化 AST dump 的 SHA-256(忽略 lineno/col_offset/
+#       end_lineno/end_col_offset/type_comment/type_ignores 等位置属性)
+#   - source_digest: 函数源码的 SHA-256(ast.get_source_segment 提取)
+#   - allowed_callees: 允许调用的 legacy writer 函数名 frozenset
+#   - reason: 人类可读的允许原因
 #
-# 设计原则:
-#   - 白名单仅允许"同模块内私有委托"(如 _restore_from_backup_data → 子写入器)
-#     或"已被 capability-seal 的 CLI/strict 入口委托"(如 run_restore → strict service)。
-#   - restore_orchestrator.py / restore_backends.py 不在白名单(新生产路径,
-#     禁止调用 legacy writer)。
-#   - 行范围用于防止代码漂移:若函数移动导致调用超出范围,scanner 会标记违规,
-#     强制团队更新白名单(避免"静默漂移让违规通过")。
+# 设计原则(R67 P1-07):
+#   - 不再使用 line_start/line_end 行范围授权(行号会因注释/格式化漂移,
+#     且大范围行区间可能意外包含新调用)
+#   - 改用 ast_signature + source_digest 双重绑定:函数源码任何改动都
+#     导致 signature/digest 变化,scanner 拒绝授权,强制团队更新白名单
+#   - ast_signature 捕捉语义结构变化(语句/表达式/控制流)
+#   - source_digest 捕捉字面源码变化(注释/字符串字面量/格式)
+#   - **R67 P1-07 hotfix**: 授权判定以 source_digest 为主(跨 Python 版本稳定),
+#     ast_signature 仅作为诊断信号(不阻塞)。原因:`ast.dump()` /
+#     `ast.iter_fields()` 在不同 Python 版本(3.10/3.11/3.12/3.13/3.14)
+#     之间产生的字段顺序/字段集不同(如 Python 3.14 新增 type_params /
+#     TypeAlias 节点变化),导致同一函数源码在不同解释器下计算得到不同的
+#     ast_signature。source_digest 基于 `ast.get_source_segment` 提取的
+#     字面源码 SHA-256,不依赖 AST 内部表示,跨版本稳定。
+#   - 因此:source_digest 匹配即授权通过(函数源码未被修改);
+#     ast_signature 不匹配时仅打印诊断警告(不阻塞),供团队参考。
+#   - 当白名单条目过期时(source_digest 不匹配 = 函数已修改),scanner 输出
+#     详细的过期条目信息,指引运行 scripts/regenerate_scanner_whitelist_digests.py
+#     重新生成。
 PRECISE_WHITELIST: tuple[dict, ...] = (
     # db_restore.py: _restore_from_backup_data 内部委托给子写入器(同模块私有委托)
     {
         "file": "services/db_restore.py",
         "function": "_restore_from_backup_data",
-        "line_start": 440,
-        "line_end": 631,
+        "ast_signature": "438c44d1ebe770aa7f3d628975b779c5b86e65d27d7eddae56e22bd9e4b81aee",
+        "source_digest": "ba66f52f9e5476b8dd66e3674595184a91d09630308c10515dcd181f6074df4b",
         "allowed_callees": frozenset({"_restore_crdb_tables", "_restore_sqlite_tables_to_db"}),
         "reason": "同模块私有委托:_restore_from_backup_data → 子写入器",
     },
     # db_restore.py: run_restore CLI 入口委托给 validate_and_restore_backup_strict
     # (run_restore 本身被 ALLOW_LEGACY_RESTORE seal,但仍允许调用 strict service)
+    # R67 P0-06: 在 capability-seal 之前增加 _production_guard 硬守卫(生产环境
+    # APP_ENV=production|staging 无条件拒绝,不允许 ALLOW_LEGACY_RESTORE 解封)。
+    # 守卫调用不调用 legacy writer,因此不影响白名单 allowed_callees。
     {
         "file": "services/db_restore.py",
         "function": "run_restore",
-        "line_start": 856,
-        "line_end": 999,
+        "ast_signature": "b7fdd2c4cd94ebc411d025f5cb633641f626b97fe2c3141076e4efdc14d420ba",
+        "source_digest": "3e9c71910401146ebec5b4d2f047c7e6064ba45f16e6303bbf7d32c9f9a141d8",
         "allowed_callees": frozenset({"validate_and_restore_backup_strict"}),
         "reason": "CLI 入口委托:run_restore → validate_and_restore_backup_strict(strict service)",
     },
     # db_restore.py: main() CLI argparse 入口委托给 run_restore
-    # (main 仅在 python -m services.db_restore 时执行,运行时受 run_restore 的 ALLOW_LEGACY_RESTORE seal 防护)
     {
         "file": "services/db_restore.py",
         "function": "main",
-        "line_start": 1019,
-        "line_end": 1044,
+        "ast_signature": "09644db2dd9793b8acaedf000db0135aa8be9faff9d605b7b26bb2a6916ed36b",
+        "source_digest": "76aa6e8534388d937446b279bd64395fe9f7c4743c5aa15bda7a32dce319b05f",
         "allowed_callees": frozenset({"run_restore"}),
         "reason": "CLI argparse 入口委托:main → run_restore(运行时由 run_restore 的 seal 防护)",
     },
@@ -129,8 +145,8 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
     {
         "file": "services/backup_dr_validate.py",
         "function": "validate_and_restore_backup_strict",
-        "line_start": 1716,
-        "line_end": 2044,
+        "ast_signature": "59f2327778e53de6724c766ca95ba0d43c01b8db3b33f32560171f4561deb72a",
+        "source_digest": "834e59672c722ebd510136938c02a985f1c88beb5eca62a0d2d2ce8662a068b2",
         "allowed_callees": frozenset({"_restore_from_backup_data"}),
         "reason": "strict service 构造 capability 后调用私有写入器",
     },
@@ -138,40 +154,42 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
     {
         "file": "services/backup_dr_validate.py",
         "function": "_restore_preverified_payload",
-        "line_start": 2050,
-        "line_end": 2141,
+        "ast_signature": "d28c319c525a59d21babdf07a8286f9f76a84deffd71ae667e0926ced11f06c5",
+        "source_digest": "14861f1a66da8bae26838457bdf5a64baae4ae44d20f930f6e95144698388edb",
         "allowed_callees": frozenset({"_restore_from_backup_data"}),
         "reason": "preverified payload 路径委托给私有写入器",
     },
     # R66 P0-07: 已 sealed 的生产入口(带 ALLOW_LEGACY_RESTORE capability-seal 检查)
-    # 这些入口在生产环境(AppEnv=production)会被 RESTORE_LEGACY_WRITER_SEALED 阻断,
-    # 仅在 tests/ 与 scripts/ 设置 ALLOW_LEGACY_RESTORE=1 时才能调用。
+    # R67 P0-06: 在 capability-seal 之前增加 _production_guard 硬守卫。
     # 长期目标:迁移到 RestoreOrchestrator 蓝绿切换路径后移除这些白名单条目。
     #
-    # db_backup.py: restore_from_backup 公共入口(capability-sealed at lines 809-823)
-    # 委托给 validate_and_restore_backup_strict(strict service 路径)
+    # db_backup.py: restore_from_backup 公共入口委托给 validate_and_restore_backup_strict
     {
         "file": "services/db_backup.py",
         "function": "restore_from_backup",
-        "line_start": 776,
-        "line_end": 865,
+        "ast_signature": "f245c82dee6e6b60c98af026d546a6045a11b9fbc9aa5a4b10fa49c9302d7b8d",
+        "source_digest": "09783912c92f0dd7295f5c1fc355a6145c2637d2e53138f6e22e7eb825e0863e",
         "allowed_callees": frozenset({"validate_and_restore_backup_strict"}),
         "reason": (
-            "sealed 公共入口(capability-seal at lines 809-823):"
+            "sealed 公共入口:"
             "生产环境被 RESTORE_LEGACY_WRITER_SEALED 阻断,"
             "仅 ALLOW_LEGACY_RESTORE=1 时委托 strict service 路径"
         ),
     },
-    # command_bus.py: make_restore_backup_command 内的 _handler(capability-sealed at lines 2392-2406)
-    # 委托给 db_backup.restore_from_backup(已 sealed 的公共入口)
+    # command_bus.py: make_restore_backup_command 内的 _handler 委托给 db_backup.restore_from_backup
+    # 注意:command_bus.py 中有 14 个 _handler 闭包(每个 make_*_command 一个),
+    # 此处 signature/digest 对应 make_restore_backup_command 内的 _handler
+    # (lines 2381-2435,包含 restore_from_backup 调用)。
+    # 当 _handler 函数源码变化时,signature/digest 失配,scanner 拒绝授权,
+    # 强制团队运行 regenerate_scanner_whitelist_digests.py 重新计算。
     {
         "file": "services/command_bus.py",
         "function": "_handler",
-        "line_start": 2381,
-        "line_end": 2425,
+        "ast_signature": "46a96b6991bc5d996e53b1a6ad3ac7efae7a0ff1c0535f8c7bda2feab68fe7ee",
+        "source_digest": "bdacb7201cb892702845cf13991bd5d369fce16282f336fb027dd841581d64ea",
         "allowed_callees": frozenset({"restore_from_backup"}),
         "reason": (
-            "sealed command handler(capability-seal at lines 2392-2406):"
+            "sealed command handler (make_restore_backup_command._handler):"
             "生产环境被 RESTORE_LEGACY_WRITER_SEALED 阻断,"
             "仅 ALLOW_LEGACY_RESTORE=1 时委托 sealed 公共入口"
         ),
@@ -184,12 +202,28 @@ WHITELIST_FILES_FULL_SKIP: frozenset[str] = frozenset({
 })
 
 # 白名单目录(完整跳过)— 测试逃生舱 + gate 脚本自身
-# - tests/: 测试逃生舱(配合 ALLOW_LEGACY_RESTORE=1 环境变量)
-# - scripts/: gate 脚本本身(自我引用)
+# R67 P1-08: tests/ 完整跳过合理(测试逃生舱),但 scripts/ 不再整体跳过 —
+# scripts/ 含真实运维入口(full_machine_recovery.sh / blank_vps_recovery_test.sh
+# / chaos_bot_fault_injection.sh / ru_72h_verification.sh / soak_test_7day.sh)
+# 与治理脚本(configure_branch_protection.sh 等),必须接受 capability/approval
+# /MFA 审查。Python 脚本中的 legacy writer 调用应通过 PRECISE_WHITELIST 显式
+# 授权,而不是默认跳过整个目录。
+#
+# 整改(R67 P1-08):移除 "scripts/" 前缀,改用 `is_skippable_script()` 细粒度
+# 判断 — 仅 GATE_SCANNERS 可跳过(避免自引用噪声);OFFLINE_RECOVERY_TOOLS
+# 与 GOVERNANCE_SCRIPTS 必须被扫描。
 WHITELIST_DIR_PREFIXES: tuple[str, ...] = (
     "tests/",
-    "scripts/",
 )
+
+# R67 P1-08: scripts/ 下可跳过的文件清单(从 _script_categories 导入)
+# 仅 gate 自身与辅助生成器可跳过;离线恢复工具与治理脚本必须被扫描。
+try:
+    from scripts._script_categories import is_skippable_script as _is_skippable_script_p1_08
+except ImportError:
+    # _script_categories 不可用时 fail-closed:不跳过任何 scripts/ 文件
+    def _is_skippable_script_p1_08(rel_path: str) -> bool:
+        return False
 
 # 跳过的目录(不扫描)
 SKIP_DIR_PARTS: list[str] = [
@@ -220,6 +254,91 @@ SKIP_FILE_SUFFIXES: tuple[str, ...] = (
 )
 
 
+# ═══════════════════════════════════════════════════════════════
+# R67 P1-07: AST signature + source digest 计算
+# ═══════════════════════════════════════════════════════════════
+
+# AST 节点中应忽略的位置/元数据属性(不影响语义)
+_AST_LOCATION_FIELDS: frozenset[str] = frozenset({
+    "lineno",
+    "col_offset",
+    "end_lineno",
+    "end_col_offset",
+    "type_comment",
+    "type_ignores",
+})
+
+
+def _normalize_ast(node: ast.AST) -> str:
+    """递归归一化 AST 节点,忽略位置属性。
+
+    返回值结构示例:
+        FunctionDef(name='foo', args=arguments(...), body=[...], ...)
+        Call(func=Name(id='bar'), args=[], keywords=[])
+        Constant(value='hello')
+
+    所有 lineno/col_offset/end_lineno/end_col_offset/type_comment/type_ignores
+    属性均被忽略,因此注释/空行/格式调整不影响归一化结果。
+
+    Args:
+        node: AST 节点(可以是 FunctionDef / 表达式 / 列表等)
+
+    Returns:
+        归一化的字符串表示
+    """
+    if isinstance(node, ast.AST):
+        fields = []
+        for fname, fvalue in ast.iter_fields(node):
+            if fname in _AST_LOCATION_FIELDS:
+                continue
+            fields.append(f"{fname}={_normalize_ast(fvalue)}")
+        return f"{type(node).__name__}({', '.join(fields)})"
+    elif isinstance(node, list):
+        return f"[{', '.join(_normalize_ast(item) for item in node)}]"
+    else:
+        return repr(node)
+
+
+def compute_ast_signature(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> str:
+    """R67 P1-07: 计算函数的 AST signature(归一化 AST dump 的 SHA-256)。
+
+    Args:
+        func_node: FunctionDef / AsyncFunctionDef 节点
+
+    Returns:
+        64 字符 SHA-256 hex 字符串
+    """
+    normalized = _normalize_ast(func_node)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def compute_source_digest(
+    func_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    source: str,
+) -> str:
+    """R67 P1-07: 计算函数源码的 SHA-256 digest。
+
+    使用 ast.get_source_segment 提取函数源码(包含装饰器、docstring、
+    注释、字面量等),计算 SHA-256。源码任何字面变化都导致 digest 变化。
+
+    Args:
+        func_node: FunctionDef / AsyncFunctionDef 节点
+        source: 包含该函数的完整文件源码
+
+    Returns:
+        64 字符 SHA-256 hex 字符串
+    """
+    segment = ast.get_source_segment(source, func_node) or ""
+    return hashlib.sha256(segment.encode("utf-8")).hexdigest()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 文件路径与白名单辅助
+# ═══════════════════════════════════════════════════════════════
+
+
 def _rel_posix(path: Path) -> str:
     """返回相对 REPO_ROOT 的 POSIX 路径字符串(用 / 分隔)。"""
     try:
@@ -245,6 +364,10 @@ def _is_whitelisted(path: Path) -> bool:
     注意:此函数仅返回 True 表示"完全跳过扫描"。
     db_restore.py / backup_dr_validate.py 不再完全跳过,
     而是通过 PRECISE_WHITELIST 进行函数级精确白名单检查。
+
+    R67 P1-08: scripts/ 不再整体跳过 — 通过 `is_skippable_script()`
+    细粒度判断。仅 GATE_SCANNERS 可跳过;OFFLINE_RECOVERY_TOOLS
+    与 GOVERNANCE_SCRIPTS 必须被扫描。
     """
     rel = _rel_posix(path)
     # 完整跳过的白名单文件(精确匹配)
@@ -254,6 +377,9 @@ def _is_whitelisted(path: Path) -> bool:
     for prefix in WHITELIST_DIR_PREFIXES:
         if rel.startswith(prefix):
             return True
+    # R67 P1-08: scripts/ 细粒度判断
+    if rel.startswith("scripts/") and _is_skippable_script_p1_08(rel):
+        return True
     return False
 
 
@@ -262,17 +388,43 @@ def _is_call_allowed(
     enclosing: str | None,
     callee: str,
     line: int,
+    *,
+    enclosing_func_node: ast.FunctionDef | ast.AsyncFunctionDef | None = None,
+    source: str | None = None,
 ) -> bool:
-    """R66 P0-07: 检查 (file, enclosing_function, callee, line) 是否在精确白名单中。
+    """R67 P1-07: 检查 (file, enclosing_function, callee) 是否在精确白名单中。
+
+    新方案(禁止行范围授权):
+        1. 匹配 (file, enclosing_function, callee ∈ allowed_callees)
+        2. 计算当前 enclosing function 的 source_digest(主授权信号)
+        3. 与白名单条目中的 source_digest 对比
+        4. **source_digest 匹配即授权通过**(R67 P1-07 hotfix)
+        5. ast_signature 作为诊断信号 — 不匹配时打印警告(不阻塞)
+
+    R67 P1-07 hotfix 说明(2026-07):
+        原方案要求 ast_signature AND source_digest 均匹配。但 `ast.dump()` /
+        `ast.iter_fields()` 在 Python 3.10/3.11/3.12/3.13/3.14 之间字段集不同
+        (例如 Python 3.14 在 FunctionDef 上新增 type_params 字段、TypeAlias
+        节点结构变化),导致同一函数源码在不同解释器下产生不同的 ast_signature。
+        CI 矩阵运行 Python 3.10/3.11/3.12,本地开发常用 3.13/3.14,白名单
+        ast_signature 由其中一个版本生成,在其他版本上必然失配 — 误报违规。
+        source_digest 基于 `ast.get_source_segment` 提取的字面源码 SHA-256,
+        不依赖 AST 内部表示,跨版本稳定,因此改为 source_digest 单独充分授权。
+
+    若 enclosing_func_node 或 source 未提供(向后兼容旧测试),
+    仅做 (file, function, callee) 匹配,不校验 signature/digest。
+    **生产 scanner 主流程必须提供这两个参数**;不提供时仅用于历史测试。
 
     Args:
         file_rel: POSIX 相对路径
         enclosing: 调用所在的函数名(None 表示模块级)
         callee: 被调用的函数名
-        line: 调用所在行号
+        line: 调用所在行号(保留参数,新方案不使用,但保持向后兼容)
+        enclosing_func_node: 调用所在的 FunctionDef 节点(用于计算 signature)
+        source: 包含该函数的文件源码(用于计算 source_digest)
 
     Returns:
-        True 如果在精确白名单中(允许调用)
+        True 如果在精确白名单中且 source_digest 匹配(允许调用)
     """
     if enclosing is None:
         # 模块级调用 legacy writer 永远不允许
@@ -282,9 +434,38 @@ def _is_call_allowed(
             entry["file"] == file_rel
             and entry["function"] == enclosing
             and callee in entry["allowed_callees"]
-            and entry["line_start"] <= line <= entry["line_end"]
         ):
-            return True
+            # (file, function, callee) 匹配
+            # R67 P1-07: 进一步校验 source_digest(主授权信号)
+            if enclosing_func_node is None or source is None:
+                # 向后兼容:未提供 function node / source 时仅做基本匹配
+                # (生产 scanner 主流程必须提供,这里仅用于历史测试)
+                return True
+            actual_sig = compute_ast_signature(enclosing_func_node)
+            actual_src = compute_source_digest(enclosing_func_node, source)
+            # R67 P1-07 hotfix: source_digest 匹配即授权(跨版本稳定)
+            if actual_src == entry["source_digest"]:
+                # ast_signature 不匹配时打印诊断警告(不阻塞)
+                # 跨 Python 版本时 ast_signature 必然失配,这是预期的
+                if actual_sig != entry["ast_signature"]:
+                    print(
+                        f"[scanner] WARN: ast_signature 跨版本失配 "
+                        f"(非阻塞,source_digest 已匹配): "
+                        f"{file_rel}::{enclosing}() — "
+                        f"expected {entry['ast_signature'][:12]}..., "
+                        f"actual {actual_sig[:12]}...",
+                        file=sys.stderr,
+                    )
+                return True
+            # source_digest 不匹配 — 函数源码已修改,白名单过期
+            # 返回 False,scanner 会将其作为违规报告
+            print(
+                f"[scanner] STALE: source_digest 不匹配 — "
+                f"函数 {file_rel}::{enclosing}() 源码已修改,白名单过期。"
+                f"运行 scripts/regenerate_scanner_whitelist_digests.py 重新生成。",
+                file=sys.stderr,
+            )
+            return False
     return False
 
 
@@ -325,6 +506,30 @@ def _build_parent_map(tree: ast.AST) -> dict[int, ast.AST]:
     return parent_map
 
 
+def _find_enclosing_function_node(
+    node: ast.AST,
+    parent_map: dict[int, ast.AST],
+) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
+    """R67 P1-07: 找到节点最近的 enclosing FunctionDef 节点对象。
+
+    与 _find_enclosing_function 不同,本函数返回 AST 节点(而非仅函数名),
+    以便后续计算 ast_signature + source_digest。
+
+    Args:
+        node: 起始节点
+        parent_map: 父节点映射
+
+    Returns:
+        最近的 FunctionDef / AsyncFunctionDef 节点,或 None(模块级)
+    """
+    current = parent_map.get(id(node))
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            return current
+        current = parent_map.get(id(current))
+    return None
+
+
 def _find_enclosing_function(
     node: ast.AST,
     parent_map: dict[int, ast.AST],
@@ -349,8 +554,9 @@ def _find_legacy_calls(
     """查找 AST 中所有 legacy writer 调用(不做白名单过滤)。
 
     Returns:
-        [{line, col, func, enclosing}, ...]
+        [{line, col, func, enclosing, enclosing_node}, ...]
         enclosing: 调用所在的函数名(None 表示模块级)
+        enclosing_node: 调用所在的 FunctionDef 节点(None 表示模块级)
     """
     calls: list[dict] = []
     for node in ast.walk(tree):
@@ -358,11 +564,13 @@ def _find_legacy_calls(
             func_name = _get_call_func_name(node)
             if func_name and func_name in legacy_funds:
                 enclosing = _find_enclosing_function(node, parent_map)
+                enclosing_node = _find_enclosing_function_node(node, parent_map)
                 calls.append({
                     "line": node.lineno,
                     "col": node.col_offset,
                     "func": func_name,
                     "enclosing": enclosing,
+                    "enclosing_node": enclosing_node,
                 })
     return calls
 
@@ -407,11 +615,11 @@ def _find_reexport_violations(
                     if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
                         if elt.value in legacy_funds:
                             violations.append({
-                                "line": node.lineno,
-                                "col": node.col_offset,
-                                "func": elt.value,
-                                "enclosing": "__all__",
-                            })
+                                                "line": node.lineno,
+                                                "col": node.col_offset,
+                                                "func": elt.value,
+                                                "enclosing": "__all__",
+                                            })
         # from X import Y as Z 检查(别名再导出)
         elif isinstance(node, ast.ImportFrom):
             for alias in node.names:
@@ -491,7 +699,11 @@ def check(strict: bool = False) -> tuple[int, list[dict]]:
         # 查找所有 legacy writer 调用,按精确白名单过滤
         calls = _find_legacy_calls(tree, legacy_funds, parent_map)
         for c in calls:
-            if not _is_call_allowed(rel, c["enclosing"], c["func"], c["line"]):
+            if not _is_call_allowed(
+                rel, c["enclosing"], c["func"], c["line"],
+                enclosing_func_node=c.get("enclosing_node"),
+                source=source,
+            ):
                 violations.append({
                     "file": rel,
                     "line": c["line"],
@@ -538,7 +750,7 @@ def check(strict: bool = False) -> tuple[int, list[dict]]:
                 f"调用 {v['func']!r} (in {enclosing})"
             )
         print()
-        print("R65 P0-07 / P1-07 / R66 P0-07: 旧直接 restore writer 已被 capability-seal,")
+        print("R65 P0-07 / P1-07 / R66 P0-07 / R67 P1-07: 旧直接 restore writer 已被 capability-seal,")
         print("生产恢复必须通过 RestoreOrchestrator 蓝绿切换路径执行:")
         print("  1. start_operation(backup_id, manifest_digest, payload_digest, nonce)")
         print("  2. provision_staging(operation_id)")
@@ -551,14 +763,19 @@ def check(strict: bool = False) -> tuple[int, list[dict]]:
         print("  设置环境变量 ALLOW_LEGACY_RESTORE=1")
         print("  生产部署绝不应配置此环境变量(应在系统层强制 unset)。")
         print()
-        print("R66 P0-07 精确白名单(允许直接调用 legacy writer 的函数+行范围):")
+        print("R67 P1-07 精确白名单(函数 qualified name + AST signature + source digest):")
         for entry in PRECISE_WHITELIST:
             callees = ", ".join(sorted(entry["allowed_callees"]))
             print(
                 f"  - {entry['file']}::{entry['function']}() "
-                f"(lines {entry['line_start']}-{entry['line_end']}) "
                 f"→ 可调用: {callees}"
             )
+            print(f"    ast_signature: {entry['ast_signature']}")
+            print(f"    source_digest: {entry['source_digest']}")
+        print()
+        print("若白名单条目因函数修改而过期,请运行:")
+        print("  python3 scripts/regenerate_scanner_whitelist_digests.py")
+        print("重新计算并更新 signature/digest。")
         print()
         print("完全跳过的白名单(仅引用错误码字符串,非调用):")
         for f in sorted(WHITELIST_FILES_FULL_SKIP):
@@ -569,7 +786,7 @@ def check(strict: bool = False) -> tuple[int, list[dict]]:
 
     mode_label = "--strict" if strict else "default"
     print(
-        f"[OK] R65 P0-07 / P1-07 / R66 P0-07 capability-seal 门禁检查通过 "
+        f"[OK] R65 P0-07 / P1-07 / R66 P0-07 / R67 P1-07 capability-seal 门禁检查通过 "
         f"(模式: {mode_label}, 扫描 {scanned_count} 个生产 .py 文件,"
         f"白名单跳过 {whitelisted_skipped} 个文件,无违规调用)"
     )
@@ -580,7 +797,7 @@ def main() -> None:
     """脚本入口。"""
     parser = argparse.ArgumentParser(
         description=(
-            "R65 P0-07 / P1-07 / R66 P0-07: capability-seal 静态门禁 — "
+            "R65 P0-07 / P1-07 / R66 P0-07 / R67 P1-07: capability-seal 静态门禁 — "
             "禁止生产代码直接调用旧 restore writer。"
         )
     )

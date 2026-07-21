@@ -861,7 +861,7 @@ async def run_restore(
 ):
     """R63 P0-06: 执行恢复流程(CLI 入口)— 从 backup_id/COMPLETE marker 发现备份。
 
-    R65 P0-07 / P1-07 整改(capability-seal 旧直接 restore 写入器):
+    R65 P0-07 / P1-07 整改(capability-seal 旧直接 restore writer):
         - 本 CLI 入口被 capability-seal:生产环境调用 ``run_restore()`` 直接
           fail-closed,抛 ``AppError(RESTORE_LEGACY_WRITER_SEALED)``。生产恢复
           必须改走 ``RestoreOrchestrator`` 蓝绿切换路径(staging → active,
@@ -873,6 +873,16 @@ async def run_restore(
           ``_RestoreCapability``(不可伪造 sentinel 令牌)capability-seal,
           仅由 ``services/backup_dr_validate.validate_and_restore_backup_strict``
           构造并传入。本 seal 是在 CLI 入口层的额外 fail-closed 防线。
+
+    R67 P0-06 整改(生产镜像物理移除 legacy restore 公共入口):
+        - 在 capability-seal 之前增加硬守卫:生产环境(APP_ENV=production|staging)
+          无条件拒绝调用 ``run_restore()``,**不允许** ``ALLOW_LEGACY_RESTORE`` 解封。
+        - 守卫直接读取 ``APP_ENV`` 环境变量,不依赖 Settings 实例化(避免
+          "未加载 Settings 即可绕过" 的漏洞)。
+        - 生产镜像中虽包含本函数代码(因 RestoreOrchestrator 复用底层写入工具
+          如 ``_safe_val`` / ``TABLE_PK``),但本硬守卫确保 legacy 公共 CLI 入口
+          在生产环境无法被调用 — 满足 R67 P0-06 "生产镜像不得包含可调用的
+          legacy restore public entrypoint" 要求。
 
     R63 P0-06 修复(CLI 恢复路径与三段式备份发现模型一致):
         - **删除旧 ``get_latest_backup()`` 双重 loader**(该函数枚举
@@ -904,6 +914,16 @@ async def run_restore(
     from services.backup_dr_validate import (
         validate_and_restore_backup_strict,
         get_manifest_key,
+    )
+
+    # R67 P0-06: 生产环境硬守卫 — 在 capability-seal 之前执行。
+    # 即使设置 ALLOW_LEGACY_RESTORE=1,生产环境(APP_ENV=production|staging)
+    # 也无条件拒绝调用本 legacy CLI 入口。守卫直接读取 APP_ENV,不依赖
+    # Settings 实例化,避免"未加载 Settings 即可绕过"的漏洞。
+    from services._production_guard import assert_no_legacy_restore_in_production
+    assert_no_legacy_restore_in_production(
+        entry_point="run_restore()",
+        caller="run_restore",
     )
 
     # R65 P0-07 / P1-07: capability-seal — 旧直接 restore writer 已被封存。

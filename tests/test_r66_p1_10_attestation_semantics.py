@@ -102,12 +102,45 @@ _verify_mod = _load_verify_module()
 
 # 固定测试值(用例间一致,便于追踪)
 IMAGE_SHA = "a" * 64                          # 64 字符 sha256
-SOURCE_COMMIT_SHA = "b" * 40                  # 40 字符 sha1
-SOURCE_TREE_SHA = "c" * 64                    # 64 字符 sha256(git tree)
 MIGRATION_MANIFEST_DIGEST = "d" * 64          # 64 字符 sha256
 IMAGE_REF = f"ghcr.io/example/app@sha256:{IMAGE_SHA}"
 SUBJECT_NAME = "ghcr.io/example/app"
 SOURCE_REPO = "example/app"
+
+
+def _get_real_head_commit_and_tree() -> tuple[str, str]:
+    """R67 P1-12: 从当前 git 仓库获取真实 HEAD commit + tree SHA。
+
+    新增的 predicate_materials_source_tree 检查通过 `git rev-parse <commit>^{tree}`
+    验证 commit 派生的 tree SHA 与 manifest.source_tree_sha 一致。为使 CLI(subprocess)
+    测试也能通过,使用真实 git commit/tree SHA 作为测试 fixture。
+
+    Returns:
+        (commit_sha, tree_sha) — 40 字符 SHA-1 字符串
+    """
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(REPO_ROOT),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        tree = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^{tree}"],
+            cwd=str(REPO_ROOT),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        if commit and tree:
+            return commit, tree
+    except (OSError, subprocess.SubprocessError):
+        pass
+    # 回退到固定值(非 git 仓库场景)
+    return "b" * 40, "c" * 40
+
+
+# R67 P1-12: 测试用真实 HEAD commit + tree SHA(使 CLI subprocess 测试也能通过)
+SOURCE_COMMIT_SHA, SOURCE_TREE_SHA = _get_real_head_commit_and_tree()
 
 
 def _make_valid_statement() -> dict:
@@ -592,7 +625,11 @@ class TestSlsaProvenancePredicate:
         assert check["passed"]
 
     def test_predicate_materials_missing_source_tree_fails(self):
-        """materials 缺 source_tree_sha 条目应失败。"""
+        """materials 缺 source_tree_sha 条目应失败。
+
+        R67 P1-12: 检查名由 predicate_materials_source_tree_sha 重命名为
+        predicate_materials_source_commit(实际验证 source_commit)。
+        """
         statement = _make_valid_statement()
         # 移除含 source_tree_sha 的 material
         statement["predicate"]["materials"] = [
@@ -604,29 +641,40 @@ class TestSlsaProvenancePredicate:
         result = _verify_mod.verify_attestation_semantics(
             statement, _make_valid_manifest(),
         )
-        check = _check_named(result, "predicate_materials_source_tree_sha")
+        check = _check_named(result, "predicate_materials_source_commit")
         assert not check["passed"]
         assert not result["overall_passed"]
 
     def test_predicate_materials_source_tree_with_sha_prefix(self):
-        """materials 中 source_tree_sha 条目带 "sha256:" 前缀应自动剥离后通过。"""
+        """materials 中 source_tree_sha 条目带 "sha256:" 前缀应自动剥离后通过。
+
+        R67 P1-12: 检查名由 predicate_materials_source_tree_sha 重命名为
+        predicate_materials_source_commit(实际验证 source_commit)。
+        """
         statement = _make_valid_statement()
         statement["predicate"]["materials"][0]["digest"]["sha256"] = f"sha256:{SOURCE_TREE_SHA}"
         result = _verify_mod.verify_attestation_semantics(
             statement, _make_valid_manifest(),
         )
-        check = _check_named(result, "predicate_materials_source_tree_sha")
+        check = _check_named(result, "predicate_materials_source_commit")
         assert check["passed"]
 
     def test_predicate_materials_missing_migration_manifest_fails(self):
-        """manifest 提供 migration_manifest_digest 但 materials 缺该条目应通过(warning)。
+        """manifest 提供 migration_manifest_digest 但 materials 缺该条目应为 warning(R67 P0-07)。
 
         R66 P1-10 语义校正:
           标准 SLSA provenance(actions/attest-build-provenance)不会将 repo 内部文件
           (如 migration-manifest.json)作为独立 material 列出 — git source 条目已
           通过 commit SHA 绑定整个 repo 内容。因此本检查降级为 warning(不阻断):
-            - 若 attestation 含匹配条目(自定义 attestation 场景) → PASS (error severity)
-            - 若不含(标准 attestation 场景) → PASS (warning severity,不阻断)
+            - 若 attestation 含匹配条目(自定义 attestation 场景) → PASS
+            - 若不含(标准 attestation 场景) → WARN(不阻断),strict 模式升级为 error
+
+        R67 P0-07 语义校正(关键修复):
+          旧实现返回 passed=True, severity="warning"(soft-pass),但聚合器
+          `if c["passed"]: continue` 静默丢弃该 warning,strict 模式也不会升级 —
+          这是隐藏 soft-pass 漏洞。
+          新实现返回 status="warning",passed=False,确保 warning 被记录且
+          strict 模式正确升级为 error。
         """
         statement = _make_valid_statement()
         # 移除 migration material
@@ -637,14 +685,49 @@ class TestSlsaProvenancePredicate:
             statement, _make_valid_manifest(),
         )
         check = _check_named(result, "predicate_materials_migration_manifest")
-        # 标准 attestation 不含 migration material — passed=True, severity=warning
-        assert check["passed"]
+        # R67 P0-07: 不再用 passed=True 表达"未验证" — 改用 status="warning"
+        assert check["status"] == "warning"
+        assert check["passed"] is False  # 派生值:status != "passed"
         assert check["severity"] == "warning"
-        # warning 不应阻断 overall_passed
+        # warning 应被记录到 result["warnings"](R67 P0-07 关键修复)
+        warning_msgs = result.get("warnings", [])
+        assert any("migration_manifest" in w for w in warning_msgs), (
+            f"R67 P0-07: warning 必须被记录到 result['warnings'],实际: {warning_msgs}"
+        )
+        # 非 strict 模式:warning 不阻断 overall_passed
         assert result["overall_passed"]
 
+    def test_predicate_materials_missing_migration_strict_escalates(self):
+        """R67 P0-07: strict 模式下 migration material 缺失必须升级为 error 阻断。
+
+        旧 bug:passed=True, severity="warning" 被 `if c["passed"]: continue` 跳过,
+          strict 模式不会升级,attestation 仍通过 — 隐藏 soft-pass。
+        新行为:status="warning" → strict 模式升级为 error → overall_passed=False。
+        """
+        statement = _make_valid_statement()
+        statement["predicate"]["materials"] = [
+            statement["predicate"]["materials"][0]  # 仅保留 source_tree_sha material
+        ]
+        result = _verify_mod.verify_attestation_semantics(
+            statement, _make_valid_manifest(), strict=True,
+        )
+        check = _check_named(result, "predicate_materials_migration_manifest")
+        assert check["status"] == "warning"
+        # strict 模式:warning 升级为 error
+        assert not result["overall_passed"]
+        error_msgs = result.get("errors", [])
+        assert any("migration_manifest" in e for e in error_msgs), (
+            f"R67 P0-07: strict 模式应将 warning 升级为 error,实际 errors: {error_msgs}"
+        )
+
     def test_predicate_materials_migration_skipped_when_manifest_missing_field(self):
-        """manifest 未提供 migration_manifest_digest 时应跳过(通过,warning 严重级)。"""
+        """manifest 未提供 migration_manifest_digest 时应跳过(not_applicable,R67 P0-07)。
+
+        R67 P0-07 语义校正:
+          旧实现返回 passed=True, severity="warning"(soft-pass),warning 被静默丢弃。
+          新实现返回 status="not_applicable"(机器可验证理由:
+          manifest.migration_manifest_digest 字段缺失),不阻断也不升级。
+        """
         statement = _make_valid_statement()
         manifest = _make_valid_manifest()
         manifest.pop("migration_manifest_digest")
@@ -652,9 +735,39 @@ class TestSlsaProvenancePredicate:
             statement, manifest,
         )
         check = _check_named(result, "predicate_materials_migration_manifest")
-        # 跳过时 passed=True, severity=warning
-        assert check["passed"]
-        assert check["severity"] == "warning"
+        # R67 P0-07: not_applicable 状态(不再用 passed=True 表达"跳过")
+        assert check["status"] == "not_applicable"
+        assert check["passed"] is False  # 派生值:status != "passed"
+        # not_applicable 不应进入 warnings 或 errors
+        warning_msgs = result.get("warnings", [])
+        error_msgs = result.get("errors", [])
+        assert not any("migration_manifest" in w for w in warning_msgs)
+        assert not any("migration_manifest" in e for e in error_msgs)
+        # overall_passed 应为 True(不阻断)
+        assert result["overall_passed"]
+
+    def test_predicate_materials_migration_not_applicable_strict_no_escalate(self):
+        """R67 P0-07: not_applicable 在 strict 模式下不应升级为 error。
+
+        not_applicable 与 warning 区别:
+          - warning: 未直接验证,strict 模式升级为 error
+          - not_applicable: 检查不适用(机器可验证理由),strict 模式不升级
+
+        本测试提供合法 bundle,确保 strict 模式下 bundle_present 不产生 warning,
+        只验证 migration_manifest 的 not_applicable 不升级。
+        """
+        statement = _make_valid_statement()
+        manifest = _make_valid_manifest()
+        manifest.pop("migration_manifest_digest")
+        result = _verify_mod.verify_attestation_semantics(
+            statement, manifest, bundle=_make_valid_bundle(), strict=True,
+        )
+        check = _check_named(result, "predicate_materials_migration_manifest")
+        assert check["status"] == "not_applicable"
+        # strict 模式:not_applicable 不升级为 error
+        assert result["overall_passed"]
+        error_msgs = result.get("errors", [])
+        assert not any("migration_manifest" in e for e in error_msgs)
 
 
 # ════════════════════════════════════════════════════════════════
@@ -769,23 +882,45 @@ class TestOidcIssuer:
         assert check["passed"]
 
     def test_oidc_issuer_missing_is_warning(self):
-        """issuer 字段缺失时应跳过(通过,warning 严重级)。
+        """issuer 字段缺失时应跳过(not_applicable,R67 P0-07)。
 
         OIDC issuer 检查始终执行(因 issuer 可能在 statement 或 bundle 中);
-        当两者均未提供 issuer 字段时,跳过检查(passed=True, severity=warning)。
+        当两者均未提供 issuer 字段时,跳过检查 — R67 P0-07:
+          旧实现返回 passed=True, severity="warning"(soft-pass),warning 被静默丢弃;
+          新实现返回 status="not_applicable"(机器可验证理由:
+          issuer 字段在 statement 与 bundle 中均缺失),不阻断也不升级。
         """
         # 不提供 bundle,statement 也不含 issuer
         statement = _make_valid_statement()
         result = _verify_mod.verify_attestation_semantics(
             statement, _make_valid_manifest(),
         )
-        # oidc_issuer check 始终存在,但应跳过(passed=True, severity=warning)
+        # oidc_issuer check 始终存在,但应跳过(status="not_applicable")
         check = _check_named(result, "oidc_issuer")
-        assert check["passed"]
-        assert check["severity"] == "warning"
+        assert check["status"] == "not_applicable"
+        assert check["passed"] is False  # 派生值:status != "passed"
+        # not_applicable 不应进入 warnings 或 errors
+        warning_msgs = result.get("warnings", [])
+        error_msgs = result.get("errors", [])
+        assert not any("oidc_issuer" in w for w in warning_msgs)
+        assert not any("oidc_issuer" in e for e in error_msgs)
         # bundle_present 也应存在(因未提供 bundle)
         check_names = [c["name"] for c in result["checks"]]
         assert "bundle_present" in check_names
+
+    def test_oidc_issuer_not_applicable_strict_no_escalate(self):
+        """R67 P0-07: not_applicable 在 strict 模式下不升级为 error。"""
+        statement = _make_valid_statement()
+        result = _verify_mod.verify_attestation_semantics(
+            statement, _make_valid_manifest(), strict=True,
+        )
+        check = _check_named(result, "oidc_issuer")
+        assert check["status"] == "not_applicable"
+        # strict 模式:not_applicable 不升级为 error
+        # (但 bundle_present 是 warning,strict 模式会升级 — 所以 overall 可能 fail)
+        # 这里只验证 oidc_issuer 本身不进入 errors
+        error_msgs = result.get("errors", [])
+        assert not any("oidc_issuer" in e for e in error_msgs)
 
 
 # ════════════════════════════════════════════════════════════════

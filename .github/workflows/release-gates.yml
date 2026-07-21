@@ -123,17 +123,46 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
 
     # R58 P0-1: 唯一镜像 tag = ci-{sha}-{run_id} (不可变, 强引用 digest)
+    # R67 P1-14: 仅 release candidate/tag 流程推送可晋级镜像到生产命名空间;
+    #            普通 push/PR 使用临时命名空间(<repo>-ci)与短 retention。
     - name: Compute image tag
       id: meta
       run: |
         # tag 在所有 job 间共享 (rc-continuity / publish-attestation / sign-image)
         # 同一 SHA + 不同 run_id 时 tag 也会变化 (用于 RC continuity 比对)
-        IMAGE_NAME="ghcr.io/${{ github.repository }}"
+        # R67 P1-14: 命名空间选择
+        #   - 生产命名空间 ghcr.io/${{ github.repository }}:仅 release tag (v*.*.*)
+        #     或 master/main push 可推送(可晋级镜像)
+        #   - 临时命名空间 ghcr.io/${{ github.repository }}-ci:PR 与非 master 分支 push
+        #     使用短 retention(由 cleanup-ci-images job 自动清理)
+        REPO="${{ github.repository }}"
+        GITHUB_REF="${{ github.ref }}"
+        GITHUB_EVENT="${{ github.event_name }}"
+        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+          # release tag (v*.*.*) → 生产命名空间
+          IMAGE_NAME="ghcr.io/${REPO}"
+          IS_PRODUCTION_NAMESPACE="true"
+          RETENTION_DAYS="permanent"
+        elif [[ "${GITHUB_REF}" == "refs/heads/master" || "${GITHUB_REF}" == "refs/heads/main" ]]; then
+          # master/main push → 生产命名空间(候选可晋级)
+          IMAGE_NAME="ghcr.io/${REPO}"
+          IS_PRODUCTION_NAMESPACE="true"
+          RETENTION_DAYS="permanent"
+        else
+          # PR 或非 master 分支 push → 临时命名空间 + 短 retention
+          IMAGE_NAME="ghcr.io/${REPO}-ci"
+          IS_PRODUCTION_NAMESPACE="false"
+          RETENTION_DAYS="7"
+        fi
         IMAGE_TAG="ci-${{ github.sha }}-${{ github.run_id }}"
         echo "name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
         echo "tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
         echo "image_ref=${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+        echo "is_production_namespace=${IS_PRODUCTION_NAMESPACE}" >> "$GITHUB_OUTPUT"
+        echo "retention_days=${RETENTION_DAYS}" >> "$GITHUB_OUTPUT"
         echo "镜像引用: ${IMAGE_NAME}:${IMAGE_TAG}"
+        echo "命名空间类型: $([ "${IS_PRODUCTION_NAMESPACE}" = "true" ] && echo '生产(可晋级)' || echo '临时(短 retention)')"
+        echo "Retention: ${RETENTION_DAYS}"
 
     # R66 P0-02: manifest 在 docker build 前已冻结, build 后禁止修改任何
     #   声称位于镜像内的发布输入。catalog-only manifest 必须在 build 前重生,
@@ -221,24 +250,57 @@ jobs:
         # R66 P0-04 修复: GHCR 在 docker buildx build --push 后存在短暂的传播延迟,
         # 立即 docker pull @digest 可能返回 "manifest unknown"。
         # 加入指数退避重试机制(最多 6 次,累计最长 ~63s),覆盖 GHCR 传播窗口。
+        # R67 P0-04 增强: 分类重试策略 — 瞬态错误重试,非瞬态错误立即失败
+        #   瞬态(重试):manifest unknown/404, 429, 5xx, 网络瞬态(timeout/reset/EOF)
+        #   非瞬态(立即失败):401/403, TLS/证书, digest mismatch, signature mismatch,
+        #                    malformed manifest, permission/configuration error
         IMAGE_REF="${{ steps.meta.outputs.name }}@${{ steps.build.outputs.digest }}"
         echo "Pulling image by digest: ${IMAGE_REF}"
         MAX_ATTEMPTS=6
         WAIT=2
         for attempt in $(seq 1 ${MAX_ATTEMPTS}); do
           echo "--- Pull attempt ${attempt}/${MAX_ATTEMPTS} (wait=${WAIT}s) ---"
-          if docker pull "${IMAGE_REF}" >/tmp/docker_pull.log 2>&1; then
+          PULL_OUTPUT=$(docker pull "${IMAGE_REF}" 2>&1) && {
             echo "Pull succeeded on attempt ${attempt}"
+            echo "${PULL_OUTPUT}"
             break
-          fi
-          echo "Pull failed on attempt ${attempt}, tail of log:"
-          tail -n 10 /tmp/docker_pull.log || true
-          if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
-            echo "FAIL: docker pull failed after ${MAX_ATTEMPTS} attempts"
-            cat /tmp/docker_pull.log
+          }
+          PULL_EXIT=$?
+          echo "Pull failed on attempt ${attempt} (exit=${PULL_EXIT}), output:"
+          echo "${PULL_OUTPUT}"
+          # R67 P0-04: 分类错误 — 非瞬态错误立即失败
+          # 401/403/auth/permission → 立即失败
+          if echo "${PULL_OUTPUT}" | grep -iE '401|403|unauthorized|forbidden|permission denied|access denied'; then
+            echo "FAIL: 非瞬态错误(auth/permission) — 立即失败,不重试"
+            echo "  R67 P0-04: 401/403/permission 错误表示配置/权限问题,重试无意义"
             exit 1
           fi
-          echo "Sleeping ${WAIT}s before retry..."
+          # TLS/证书错误 → 立即失败
+          if echo "${PULL_OUTPUT}" | grep -iE 'TLS|x509|certificate|cert\.expired|cert\.invalid'; then
+            echo "FAIL: 非瞬态错误(TLS/证书) — 立即失败,不重试"
+            echo "  R67 P0-04: TLS/证书错误表示安全配置问题,重试无意义"
+            exit 1
+          fi
+          # digest mismatch → 立即失败
+          if echo "${PULL_OUTPUT}" | grep -iE 'digest mismatch|signature mismatch|signature verification failed'; then
+            echo "FAIL: 非瞬态错误(digest/signature mismatch) — 立即失败,不重试"
+            echo "  R67 P0-04: digest/signature 不一致表示内容被篡改或构建错误"
+            exit 1
+          fi
+          # malformed manifest → 立即失败
+          if echo "${PULL_OUTPUT}" | grep -iE 'malformed manifest|invalid manifest'; then
+            echo "FAIL: 非瞬态错误(malformed manifest) — 立即失败,不重试"
+            echo "  R67 P0-04: malformed manifest 表示 registry 数据损坏"
+            exit 1
+          fi
+          if [ "${attempt}" -eq "${MAX_ATTEMPTS}" ]; then
+            echo "FAIL: docker pull failed after ${MAX_ATTEMPTS} attempts"
+            echo "  R67 P0-04: 重试次数耗尽 — 瞬态错误未恢复"
+            echo "${PULL_OUTPUT}"
+            exit 1
+          fi
+          # 瞬态错误(manifest unknown/404/429/5xx/timeout/reset/EOF)— 重试
+          echo "  瞬态错误,将在 ${WAIT}s 后重试..."
           sleep "${WAIT}"
           WAIT=$((WAIT * 2))
         done
@@ -1451,6 +1513,58 @@ jobs:
       # 自动注入,脚本内通过 $GITHUB_REPOSITORY 引用(替代 ${{ github.repository }})。
       run: bash scripts/verify_branch_protection.sh
 
+  # ─── R67 P0-01: Branch Ruleset 验证(与 BP 互补) ─────────────
+  # R67 P0-01 整改:除了 branch protection(legacy API),还必须配置
+  # Repository Ruleset(modern API)强制:
+  #   - required_signatures(GPG 签名 commits)
+  #   - deletion / non_fast_forward / update 禁止
+  #   - pull_request 规则(2 reviewers + stale dismissal + conversation resolution)
+  #   - bypass_actors 为空(禁止 admin bypass)
+  # 本 job 在 verify-branch-protection 之后运行,验证 ruleset 配置与
+  # .github/branch_ruleset.expected.json 一致。
+  # 失败必须阻断 release-summary 和 publish-attestation(required, no skip)。
+  verify-branch-ruleset:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - name: Verify branch ruleset is configured (R67 P0-01)
+      env:
+        GH_TOKEN: ${{ secrets.BP_PAT_TOKEN }}
+      run: bash scripts/verify_branch_ruleset.sh
+
+  # ─── R67 P0-01: Git Source Governance 验证(commit + tag 签名) ─
+  # R67 P0-01 / P1-02 整改:source commit、annotated tag 必须分别验证签名,
+  # 不能用 cosign image 签名推导 Git commit 可信。
+  # 本 job 验证:
+  #   1. git verify-commit $GITHUB_SHA(本地 GPG 验证)
+  #   2. GitHub API commit.verification.verified == true(双重确认)
+  #   3. (tag push) git verify-tag + tag commit 一致性
+  #   4. (可选)祖先链签名策略
+  # R67 P0-01: 仅在 master/main push 或 release tag 时运行。
+  #   PR 场景 commit 签名可放宽(合并时通常会被重新签名或由 GitHub 自动签名);
+  #   release target 与 release tag 必须强制签名验证(fail-closed)。
+  # 失败必须阻断 release-summary 和 publish-attestation(required, no skip)。
+  verify-git-source-governance:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        fetch-depth: 0  # 需要完整历史以验证祖先链签名策略
+    - name: Verify git source governance (commit + tag signatures, R67 P0-01)
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GITHUB_SHA: ${{ github.sha }}
+        GITHUB_REF: ${{ github.ref }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        # R67 P0-01: 祖先链签名策略深度(0=不检查祖先;上线时应配置为 >=5)
+        ANCESTOR_POLICY_DEPTH: 0
+      run: bash scripts/verify_git_source_governance.sh
+
   # ─── R56 P0-5: RC 连续性真正阻断门禁(重写) ────────────────
   # R56 P0-5 整改要点:
   #   1. 历史不足直接 ALL_PASS=false + exit 1(不再 continue 放行)
@@ -1760,7 +1874,8 @@ jobs:
             schema-diff, restore-legacy-seal-gate, i18n-strict-export-boundary-gate,
             migration-manifest-gate, migration-binding-gate,
             backup-restore-drill, sbom, pip-audit, trivy,
-            verify-branch-protection, rc-continuity, sign-image]
+            verify-branch-protection, verify-branch-ruleset,
+            verify-git-source-governance, rc-continuity, sign-image]
     if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     permissions:
       contents: read
@@ -1797,21 +1912,23 @@ jobs:
         #     4. completed:success → OK
         #     5. completed:failure/cancelled/timed_out/action_required/neutral → FAIL
         #   最大轮询时长: 30 分钟 (1800 秒),轮询间隔: 30 秒 (60 轮)
+        #
+        # R67 P0-03: 取消祖先 workflow 成功结果复用
+        #   原先 PATH_FILTER_GRACE_SECONDS + git merge-base --is-ancestor 的祖先回退
+        #   逻辑已被移除:
+        #     - Deploy Check 已不再使用 paths 过滤(P0-02 整改),每个 master/tag push
+        #       都会在同 SHA 上运行。
+        #     - publish-attestation 只接受 head_sha == 当前 release SHA 的 run;
+        #       missing/queued/in_progress/skipped/neutral/cancelled/timed_out/
+        #       stale/action_required/API error/permission denied 全部视为 FAIL。
+        #     - 任何"无 run"状态只能通过轮询等待其变为 completed;超时即 FAIL。
+        #     - 不允许用祖先 SHA 的 success 代替当前 SHA 的验证结果。
         MAX_POLL_SECONDS=1800
         POLL_INTERVAL_SECONDS=30
         POLL_DEADLINE=$(( $(date +%s) + MAX_POLL_SECONDS ))
-        # R66 P0-04 path-filtered fallback: 轮询起始时间戳 + 目标 branch
-        #   PATH_FILTER_GRACE_SECONDS=60: 无 run 状态持续 60s 后开始尝试祖先回退
-        #   TARGET_BRANCH: 当前 push 的 branch (master/main),用于查询历史 run
-        POLL_START_TS=$(date +%s)
-        PATH_FILTER_GRACE_SECONDS=60
-        TARGET_BRANCH=$(echo "${{ github.ref }}" | sed 's#^refs/heads/##')
-        if [ -z "${TARGET_BRANCH}" ] || [ "${TARGET_BRANCH}" = "${{ github.ref }}" ]; then
-          TARGET_BRANCH=master
-        fi
-        echo "  poll start: $(date -u -d @${POLL_START_TS} +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r ${POLL_START_TS} +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo ${POLL_START_TS})"
-        echo "  target branch: ${TARGET_BRANCH}"
-        echo "  path-filter grace seconds: ${PATH_FILTER_GRACE_SECONDS}"
+        echo "  poll deadline: $(date -u -d @${POLL_DEADLINE} +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -r ${POLL_DEADLINE} +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo ${POLL_DEADLINE})"
+        echo "  max poll seconds: ${MAX_POLL_SECONDS}"
+        echo "  poll interval: ${POLL_INTERVAL_SECONDS}s"
 
         # R56 P0-1: 查询 Checks API,要求四个 workflow 均为 completed/success
         REQUIRED_WORKFLOWS=("CI" "Deploy Check" "Release Gates" "E2E Tests")
@@ -1866,48 +1983,24 @@ jobs:
               --jq "[.workflow_runs[] | select(.head_sha == \"${TARGET_SHA}\")] | sort_by(.created_at) | reverse | .[0]" 2>/dev/null || echo "")
 
             if [ "${LATEST_RUN}" = "null" ] || [ -z "${LATEST_RUN}" ]; then
-              # R66 P0-04: 无 run = pending (不再 SKIP)
+              # R66 P0-04 + R67 P0-03: 无 run = pending (不再 SKIP,不再祖先回退)
+              #   旧实现问题: "no run" 被视为 SKIP,ALL_GREEN 保持 true,
+              #     导致 publish-attestation 在 sibling workflow 未运行时也通过。
+              #   R66 P0-04 原始修复: "无 run" → pending 轮询 30 分钟后 FAIL。
+              #   R66 P0-04 后续修复: 60s 后接受祖先 successful run (path-filtered
+              #     workflow 在路径未变更时,前一次成功 run 仍有效)。
+              #   R67 P0-03 整改: 移除祖先回退 — 任意 missing/queued/in_progress/
+              #     skipped/neutral/cancelled/timed_out/stale/action_required/
+              #     API error/permission denied 全部视为 FAIL,不允许用祖先 SHA 的
+              #     success 代替当前 SHA 的验证结果。
+              #   原因:
+              #     1. Deploy Check 已不再使用 paths 过滤(P0-02 整改),每个 master/tag
+              #        push 都会在同 SHA 上运行,祖先回退已无必要。
+              #     2. 祖先回退违反 "所有 required checks 对同一 SHA completed+success"
+              #        的发布语义 — 祖先 SHA 的 success 不能证明当前 SHA 的代码安全。
+              #     3. 任意不确定状态必须 fail-closed,不得用历史成功掩盖当前未验证。
               echo "  PENDING: 无 ${WF} run 对应 SHA ${TARGET_SHA:0:12} (等待 workflow 创建 run)"
-              echo "    R66 P0-04: 无 run 不再视为 SKIP — 轮询直到 run 创建或超时"
-              # R66 P0-04 后续修复: path-filtered workflow 祖先回退
-              #   问题: Deploy Check 等使用 paths: 过滤的 workflow 不会在每次 push 时触发
-              #   (仅当 deploy_vps_per_bot.sh / docker-compose.yml / config/services.yaml /
-              #    .github/workflows/** 变更时才运行)。R66 P0-04 原始修复将"无 run"视为
-              #   pending 并轮询 30 分钟后 FAIL,导致仅 scripts/ 变更的 commit 永久阻塞
-              #   publish-attestation。
-              #   修复: 轮询超过 GRACE_SECONDS (60s) 后,查找 master 分支上最近的
-              #   successful run,验证其 head_sha 是当前 SHA 的祖先(git merge-base
-              #   --is-ancestor),若是则接受为 success(语义:path-filtered workflow
-              #   在路径未变更时,前一次成功 run 对当前 SHA 仍然有效)。
-              #   安全保障:
-              #     1. 必须是 completed:success (不接受 failure)
-              #     2. head_sha 必须是当前 SHA 的祖先 (确保不包含未验证的更新代码)
-              #     3. 必须在同一 branch (master/main) 上
-              #     4. 不影响非 path-filtered workflow (CI/E2E 每次都触发,
-              #        不会有"无 run"情况)
-              NOW_ELAPSED=$(( $(date +%s) - ${POLL_START_TS:-$(date +%s)} ))
-              if [ "${NOW_ELAPSED}" -ge "${PATH_FILTER_GRACE_SECONDS:-60}" ]; then
-                echo "  PROBE: ${WF} 超过 ${PATH_FILTER_GRACE_SECONDS:-60}s 无 run,尝试祖先回退 (path-filtered workflow)"
-                ANCESTOR_RUN=$(gh api \
-                  "repos/${{ github.repository }}/actions/workflows/${WF_ID}/runs?branch=${TARGET_BRANCH:-master}&per_page=30" \
-                  --jq "[.workflow_runs[] | select(.conclusion == \"success\" and .head_sha != \"${TARGET_SHA}\")] | sort_by(.created_at) | reverse | .[0]" 2>/dev/null || echo "")
-                if [ "${ANCESTOR_RUN}" = "null" ] || [ -z "${ANCESTOR_RUN}" ]; then
-                  echo "    NO_ANCESTOR: master 上无历史 successful run,继续轮询"
-                else
-                  ANCESTOR_SHA=$(echo "${ANCESTOR_RUN}" | jq -r '.head_sha')
-                  ANCESTOR_ID=$(echo "${ANCESTOR_RUN}" | jq -r '.id')
-                  echo "    CANDIDATE: run #${ANCESTOR_ID} head_sha=${ANCESTOR_SHA:0:12} conclusion=success"
-                  # 验证祖先关系: ANCESTOR_SHA 必须是 TARGET_SHA 的祖先
-                  if git -C "${GITHUB_WORKSPACE:-.}" merge-base --is-ancestor "${ANCESTOR_SHA}" "${TARGET_SHA}" 2>/dev/null; then
-                    echo "  OK: ${WF} ancestor run #${ANCESTOR_ID} (head_sha=${ANCESTOR_SHA:0:12}) is ancestor of ${TARGET_SHA:0:12}"
-                    echo "    R66 P0-04 path-filtered fallback: 接受祖先 successful run (path 未变更,前次结果仍有效)"
-                    WF_FINAL_STATE["${WF}"]="success (ancestor fallback: ${ANCESTOR_SHA:0:12})"
-                    break
-                  else
-                    echo "    NOT_ANCESTOR: ${ANCESTOR_SHA:0:12} 不是 ${TARGET_SHA:0:12} 的祖先,继续轮询"
-                  fi
-                fi
-              fi
+              echo "    R67 P0-03: 无 run 不再祖先回退 — 轮询直到 run 创建或超时"
               sleep "${POLL_INTERVAL_SECONDS}"
               continue
             fi
@@ -1917,22 +2010,24 @@ jobs:
             RUN_ID=$(echo "${LATEST_RUN}" | jq -r '.id')
             echo "  run #${RUN_ID}: status=${RUN_STATUS} conclusion=${RUN_CONCLUSION}"
 
-            # R66 P0-04: 只接受 completed:success;其他状态继续轮询或 fail
+            # R66 P0-04 + R67 P0-03: 只接受 completed:success;其他状态继续轮询或 fail
+            #   R67 P0-03 补充: skipped/stale 也必须 FAIL,不得视为 pending。
             case "${RUN_STATUS}:${RUN_CONCLUSION}" in
               completed:success)
                 echo "  OK: ${WF} completed/success"
                 WF_FINAL_STATE["${WF}"]="success"
                 break
                 ;;
-              completed:failure|completed:cancelled|completed:timed_out|completed:action_required|completed:neutral)
+              completed:failure|completed:cancelled|completed:timed_out|completed:action_required|completed:neutral|completed:skipped|completed:stale)
                 echo "  FAIL: ${WF} failed (status=${RUN_STATUS}, conclusion=${RUN_CONCLUSION})"
-                echo "    R66 P0-04: completed 非 success 状态立即 FAIL (不再 SKIP)"
+                echo "    R66 P0-04 / R67 P0-03: completed 非 success 状态立即 FAIL (不再 SKIP)"
+                echo "    R67 P0-03: skipped/stale/neutral/cancelled/timed_out/action_required 全部视为 FAIL — 不允许用未验证或被跳过的结果签发 attestation"
                 WF_FINAL_STATE["${WF}"]="failed"
                 ALL_GREEN=false
                 break
                 ;;
               *)
-                # R66 P0-04: queued/in_progress/requested/pending = 继续轮询 (不再 SKIP)
+                # R66 P0-04: queued/in_progress/requested/pending/waiting = 继续轮询 (不再 SKIP)
                 echo "  PENDING: ${WF} 未完成 (status=${RUN_STATUS}, conclusion=${RUN_CONCLUSION})"
                 echo "    R66 P0-04: 未完成状态继续轮询直到 completed 或超时 (不再 SKIP)"
                 sleep "${POLL_INTERVAL_SECONDS}"
@@ -2422,6 +2517,125 @@ jobs:
         path: attestation_semantics_result.json
         retention-days: 90
 
+  # ─── R67 P0-04: verify-only-3x (Build Once + 3x Verify Only) ────────────
+  # R67 P0-04 整改要点:
+  #   审计发现 Release Gates 最终 success 依赖 attempt 4,不能视为稳定发布证据。
+  #   同一 image digest 必须连续 3 次通过完整验证链,且 3 次都首次成功
+  #   (不允许人工 rerun 掩盖不稳定)。
+  #
+  # 本 job 对同一 image digest 连续运行 3 次完整验证链:
+  #   1. digest pull (内容地址拉取,带分类重试策略)
+  #   2. image startup (容器启动)
+  #   3. image signature (cosign 签名)
+  #   4. source identity (commit/tree 一致)
+  #   5. release manifest (release-manifest.json digest)
+  #   6. migration catalog (image 内 catalog digest)
+  #   7. SBOM (sbom digest)
+  #   8. provenance (provenance digest)
+  #   9. Rekor inclusion (Rekor inclusion proof)
+  #  10. certificate validity (signing cert 有效)
+  #  11. Compose smoke (最小 profile 启动)
+  #  12. restore contract (restore 契约验证)
+  #
+  # GHCR 重试策略(R67 P0-04):
+  #   允许重试(瞬态错误):manifest unknown/404, 429, 5xx, 网络瞬态
+  #   立即失败(非瞬态):401/403, TLS/证书, digest mismatch, signature mismatch,
+  #                    malformed manifest, permission/configuration error
+  #
+  # Registry 传播 SLI:首次可拉取时间 / 尝试次数 / 错误类型 / 总等待时间
+  # 总时间预算:180s;最大重试次数:6(指数退避 2/4/8/16/30/30s)
+  # 3 次验证必须全部首次成功 — 不允许人工 rerun 掩盖不稳定
+  verify-only-3x:
+    runs-on: ubuntu-latest
+    # R67 P0-04: 仅 release target (master/main push) 或 release tag 时运行
+    # PR 场景不运行(避免资源消耗 + PR 不需要 3x 验证)
+    if: github.event_name == 'push'
+    needs: [docker-build, sign-image, publish-attestation, attestation-semantics-verify]
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+      attestations: read
+    steps:
+    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Login to GHCR (read-only)
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: "R67 P0-04: Run 3x verify-only verification (same digest)"
+      env:
+        IMAGE_NAME: ${{ needs.docker-build.outputs.image_name }}
+        IMAGE_DIGEST: ${{ needs.docker-build.outputs.image_digest }}
+        CATALOG_DIGEST: ${{ needs.docker-build.outputs.catalog_digest }}
+        EXPECTED_COMMIT: ${{ github.sha }}
+      run: |
+        set -euo pipefail
+        echo "=== R67 P0-04: 3x Verify-Only Verification (Build Once + Verify Many) ==="
+        echo "R67 P0-04: 对同一 image digest 连续运行 3 次完整验证链"
+        echo "  image_name:   ${IMAGE_NAME}"
+        echo "  image_digest: ${IMAGE_DIGEST}"
+        echo "  commit:       ${EXPECTED_COMMIT}"
+        echo "  catalog:      ${CATALOG_DIGEST}"
+        echo ""
+        # 获取 tree SHA(用于 source identity 验证)
+        EXPECTED_TREE=$(git rev-parse HEAD^{tree})
+        echo "  tree:         ${EXPECTED_TREE}"
+        echo ""
+        # 运行 3x verify-only 脚本
+        python3 scripts/verify_rc_3x.py \
+          --image-name "${IMAGE_NAME}" \
+          --image-digest "${IMAGE_DIGEST}" \
+          --expected-commit "${EXPECTED_COMMIT}" \
+          --expected-tree "${EXPECTED_TREE}" \
+          --expected-catalog-digest "${CATALOG_DIGEST}" \
+          --output-dir ./rc-verify-3x \
+          --json > ./rc_verify_3x_result.json
+        RESULT_EXIT=$?
+        if [ ${RESULT_EXIT} -ne 0 ]; then
+          echo "FAIL: R67 P0-04 3x verify-only verification failed"
+          echo "  3 次验证必须全部首次成功 — 不允许人工 rerun 掩盖不稳定"
+          cat ./rc_verify_3x_result.json | python3 -m json.tool 2>/dev/null || true
+          exit ${RESULT_EXIT}
+        fi
+        echo ""
+        echo "PASS: R67 P0-04 3x verify-only verification succeeded"
+        # 打印摘要
+        python3 -c "
+        import json
+        with open('./rc_verify_3x_result.json') as f:
+            data = json.load(f)
+        print(f'  verifications: {data[\"actual_verifications\"]}/{data[\"required_verifications\"]}')
+        print(f'  digest: {data[\"image_digest\"][:24]}...')
+        print(f'  total_duration: {data[\"total_duration_seconds\"]:.1f}s')
+        print(f'  first_success_times: {data[\"first_success_times\"]}')
+        "
+
+    - name: Upload 3x verification report artifact
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      with:
+        name: rc-verify-3x-${{ github.sha }}-${{ github.run_id }}
+        path: |
+          rc-verify-3x/
+          rc_verify_3x_result.json
+        retention-days: 90
+      if: always()
+
   # ─── 13b. tag-ruleset-verify (R66 P1-11: 不可变 tag ruleset 校验) ────────
   # R66 P1-11 整改要点:
   #   审计发现 GitHub tag 无 ruleset 保护,管理员可删除/移动/更新已发布的 tag,
@@ -2848,7 +3062,9 @@ jobs:
     # R66 P0-05: 增加 crdb-ru-72h-attribution-gate 依赖,要求 evidence_status=production
     #   (tag-only 场景下该 job 必须运行 strict 模式并提供真实 72h 数据,
     #    evidence_status=not_applicable 不允许 — 缺证据 = failure)
-    needs: [production-evidence, crdb-ru-72h-attribution-gate]
+    # R67 P0-04: 增加 verify-only-3x 依赖,要求 release tag 前 3x verify-only 必须通过
+    # R67 P0-05: 增加 verify-only-3x 作为代码门禁 vs 生产证据门禁分离的一部分
+    needs: [production-evidence, crdb-ru-72h-attribution-gate, verify-only-3x]
     permissions:
       contents: read
       actions: read
@@ -2899,6 +3115,28 @@ jobs:
           exit 1
         fi
         echo "PASS: crdb-ru-72h-attribution-gate evidence_status=production and evidence_present=true"
+
+    # R67 P0-04/P0-05: 校验 verify-only-3x job 必须 success
+    #   production-promotion-gate (tag-only) 必须要求 verify-only-3x 通过,
+    #   即同一 image digest 连续 3 次完整验证链全部首次成功。
+    #   3 次验证必须首次成功 — 不允许人工 rerun 掩盖不稳定。
+    #   这是代码门禁 vs 生产证据门禁分离的一部分:
+    #     - 代码门禁(verify-only-3x): 同一 digest 3 次验证不可变性
+    #     - 生产证据门禁(production-evidence): 真实环境证据(SOAK/RESTORE/CHAOS/RU/SUPPLY)
+    - name: "R67 P0-04/P0-05: Verify verify-only-3x job succeeded"
+      run: |
+        set -euo pipefail
+        VERIFY_ONLY_3X_RESULT="${{ needs.verify-only-3x.result }}"
+        echo "=== R67 P0-04/P0-05: Verify verify-only-3x job result ==="
+        echo "  verify-only-3x result: ${VERIFY_ONLY_3X_RESULT}"
+        if [ "${VERIFY_ONLY_3X_RESULT}" != "success" ]; then
+          echo "FAIL: verify-only-3x job did not succeed (got: ${VERIFY_ONLY_3X_RESULT})"
+          echo "  R67 P0-04: 同一 image digest 必须连续 3 次通过完整验证链"
+          echo "  R67 P0-05: 代码门禁失败 — 不允许晋级到 production promotion"
+          echo "  3 次验证必须全部首次成功 — 不允许人工 rerun 掩盖不稳定"
+          exit 1
+        fi
+        echo "PASS: verify-only-3x job succeeded (3x verify-only verification passed)"
 
     # 下载 production-evidence job 上传的 artifact(含 production_evidence_index.json);
     # 注意:CI 自动生成的是 dry_run 模式,release tag 场景需运维通过单独的
@@ -2990,8 +3228,10 @@ jobs:
             migration-manifest-gate, migration-binding-gate,
             button-flow-real-ux-gate,
             backup-restore-drill, sbom, pip-audit, trivy,
-            sign-image, verify-branch-protection, rc-continuity, publish-attestation,
-            attestation-semantics-verify, tag-ruleset-verify,
+            sign-image, verify-branch-protection, verify-branch-ruleset,
+            verify-git-source-governance,
+            rc-continuity, publish-attestation,
+            attestation-semantics-verify, verify-only-3x, tag-ruleset-verify,
             crdb-ru-72h-attribution-gate, production-evidence,
             production-promotion-gate]
     env:
@@ -3011,10 +3251,15 @@ jobs:
       TRIVY: ${{ needs.trivy.result }}
       SIGN_IMAGE: ${{ needs.sign-image.result }}
       VERIFY_BRANCH_PROTECTION: ${{ needs.verify-branch-protection.result }}
+      # R67 P0-01: branch ruleset + git source governance(commit/tag 签名)
+      VERIFY_BRANCH_RULESET: ${{ needs.verify-branch-ruleset.result }}
+      VERIFY_GIT_SOURCE_GOVERNANCE: ${{ needs.verify-git-source-governance.result }}
       RC_CONTINUITY: ${{ needs.rc-continuity.result }}
       PUBLISH_ATTESTATION: ${{ needs.publish-attestation.result }}
       # R66 P1-10: attestation-semantics-verify (beyond cosign verify)
       ATTESTATION_SEMANTICS_VERIFY: ${{ needs.attestation-semantics-verify.result }}
+      # R67 P0-04: verify-only-3x (Build Once + 3x Verify Only)
+      VERIFY_ONLY_3X: ${{ needs.verify-only-3x.result }}
       # R66 P1-11: tag-ruleset-verify (immutable tags)
       TAG_RULESET_VERIFY: ${{ needs.tag-ruleset-verify.result }}
       CRDB_RU_72H_ATTRIBUTION_GATE: ${{ needs.crdb-ru-72h-attribution-gate.result }}
@@ -3067,9 +3312,12 @@ jobs:
           "trivy=${TRIVY}" \
           "sign-image=${SIGN_IMAGE}" \
           "verify-branch-protection=${VERIFY_BRANCH_PROTECTION}" \
+          "verify-branch-ruleset=${VERIFY_BRANCH_RULESET}" \
+          "verify-git-source-governance=${VERIFY_GIT_SOURCE_GOVERNANCE}" \
           "rc-continuity=${RC_CONTINUITY}" \
           "publish-attestation=${PUBLISH_ATTESTATION}" \
           "attestation-semantics-verify=${ATTESTATION_SEMANTICS_VERIFY}" \
+          "verify-only-3x=${VERIFY_ONLY_3X}" \
           "tag-ruleset-verify=${TAG_RULESET_VERIFY}" \
           "crdb-ru-72h-attribution-gate=${CRDB_RU_72H_ATTRIBUTION_GATE}" \
           "production-evidence=${PRODUCTION_EVIDENCE}" \
@@ -3078,10 +3326,13 @@ jobs:
           conclusion="${entry##*=}"
           echo "  ${job}: ${conclusion}"
           # sign-image / publish-attestation / migration-binding-gate /
-          # attestation-semantics-verify:
+          # attestation-semantics-verify / verify-git-source-governance / verify-only-3x:
           # master-only + tag-only job,PR 上可 skipped
           # R66 P1-10: attestation-semantics-verify 同样仅在 master/tag push 运行
-          if [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ] || [ "${job}" = "migration-binding-gate" ] || [ "${job}" = "attestation-semantics-verify" ]; then
+          # R67 P0-01: verify-git-source-governance 同样仅在 master/tag push 运行
+          #   (PR 场景 commit 签名可放宽,因 PR commit 在合并时通常会被重新签名)
+          # R67 P0-04: verify-only-3x 同样仅在 push 运行(PR 不需要 3x 验证)
+          if [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ] || [ "${job}" = "migration-binding-gate" ] || [ "${job}" = "attestation-semantics-verify" ] || [ "${job}" = "verify-git-source-governance" ] || [ "${job}" = "verify-only-3x" ]; then
             if [ "${RELEASE_TARGET}" = "true" ] || [ "${RELEASE_TAG}" = "true" ]; then
               # release target (master/main push) 或 release tag (refs/tags/v*):
               # 必须成功(skipped = 供应链断裂,P0-06 必须兜住)

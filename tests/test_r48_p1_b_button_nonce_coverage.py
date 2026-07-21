@@ -395,9 +395,15 @@ class TestScannerWhitelistSkipped:
         assert violations == []
 
     def test_scripts_directory_skipped(self, tmp_path):
-        """scripts/ 目录下的文件跳过。"""
+        """scripts/ 目录下 GATE_SCANNERS 类脚本跳过(R67 P1-08)。
+
+        R67 P1-08 整改:scripts/ 不再整体跳过,仅 GATE_SCANNERS 可跳过
+        (避免自引用噪声)。本测试使用 GATE_SCANNERS 中的
+        check_button_nonce_coverage.py 自身作为"可跳过脚本"代表。
+        """
         files = {
-            "scripts/check.py": (
+            # check_button_nonce_coverage.py 在 GATE_SCANNERS 中,应被跳过
+            "scripts/check_button_nonce_coverage.py": (
                 "from services.button_security import generate_signed_callback\n"
                 "generate_signed_callback(user_id=1, action='ban', data='x')\n"
             ),

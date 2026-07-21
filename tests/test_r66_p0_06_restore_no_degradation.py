@@ -110,21 +110,25 @@ async def _make_store_with_restore_tables(db_path: str | None = None):
 def _make_full_registry(staging_root: Path):
     """构造完整 BackendRegistry(crdb / sqlite / relay_sqlite 三者均注册)。
 
-    crdb 使用 CRDBRestoreBackend + mock crdb_client(测试不实际调用 CRDB 操作,
-    仅验证注册表完整性);sqlite / relay_sqlite 使用真实 SQLiteRestoreBackend。
+    R67 P1-05: crdb 使用 CRDBRestoreBackend + FakeCRDBClient(支持
+    verify_authority_state 的连接/schema/权限/CAS 验证);
+    sqlite / relay_sqlite 使用真实 SQLiteRestoreBackend(active_db_path
+    不存在时 verify_authority_state 视为首次部署场景,通过)。
     """
     from services.restore_backends import (
         BackendRegistry,
         CRDBRestoreBackend,
         SQLiteRestoreBackend,
     )
+    # R67 P1-05: 使用 FakeCRDBClient 替代 MagicMock,支持 verify_authority_state
+    from tests._r67_p1_05_fake_crdb import make_fake_crdb_client
 
     registry = BackendRegistry()
-    # crdb: CRDBRestoreBackend + mock client(测试不实际执行 CRDB 操作)
+    # crdb: CRDBRestoreBackend + FakeCRDBClient(健康的 CRDB 后端)
     registry.register(
         "crdb",
         CRDBRestoreBackend(
-            crdb_client=MagicMock(),
+            crdb_client=make_fake_crdb_client(),
             active_schema="public",
         ),
     )

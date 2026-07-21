@@ -452,6 +452,13 @@ class ErrorCodes:
     # params: reason (主因) / missing (缺失或过期的证据类型列表,逗号分隔)
     PRODUCTION_EVIDENCE_INSUFFICIENT = "PRODUCTION.EVIDENCE.INSUFFICIENT"
 
+    # R67 P1-11: 防重放 — evidence artifact 已被其他 candidate 消费,禁止跨候选复用。
+    # 单次使用语义:每个 evidence artifact 只能被一个 candidate 消费一次。
+    # 重复消费(跨候选复用)在 consume_evidence_for_promotion() 中抛此错误。
+    # params: artifact_type / consumed_candidate (已消费的 candidate tag) /
+    #         candidate_tag (当前请求的 candidate tag)
+    EVIDENCE_ALREADY_CONSUMED = "PRODUCTION.EVIDENCE.ALREADY_CONSUMED"
+
 
 # ════════════════════════════════════════════════════════════════
 # 1b. ErrorEnum — R56 §5.2 Python enum(str + Enum 双继承,保持字符串兼容)
@@ -3307,7 +3314,14 @@ def _register_defaults() -> None:
         http_status=403,
         retryable=False,
         severity="critical",
-        safe_params=["caller", "reason"],
+        safe_params=[
+            "caller",
+            "reason",
+            # R67 P0-06: 新增诊断参数(生产环境硬守卫调用时传入)
+            "entry_point",
+            "source_env_var",
+            "allow_legacy_restore_set",
+        ],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",
@@ -3384,6 +3398,20 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["reason", "missing"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 409 critical — R67 P1-11: evidence artifact 已被其他 candidate 消费,禁止跨候选复用
+    # 单次使用语义:每个 evidence artifact 只能被一个 candidate 消费一次。
+    # safe_params 仅含 artifact_type / consumed_candidate / candidate_tag(无敏感信息)。
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.EVIDENCE_ALREADY_CONSUMED,
+        message_key="errors.production.evidence.already_consumed",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["artifact_type", "consumed_candidate", "candidate_tag"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",

@@ -223,16 +223,20 @@ class TestParseErrorFails:
 
 
 class TestPreciseWhitelist:
-    """R66 P0-07: 白名单从"整个文件"改为精确函数+行范围+AST 调用关系。"""
+    """R66 P0-07 / R67 P1-07: 白名单从"整个文件"改为函数 qualified name +
+    AST signature + source digest(R67 P1-07 禁止行范围授权)。"""
 
     def test_whitelist_is_precise_not_whole_file(self):
-        """白名单条目必须指定 function + line_start + line_end + allowed_callees。
+        """白名单条目必须指定 function + ast_signature + source_digest + allowed_callees。
+
+        R67 P1-07 整改:删除 line_start/line_end(行范围授权),
+        改为 ast_signature + source_digest 双重绑定。
 
         每个 PRECISE_WHITELIST 条目必须包含:
             - file: 文件路径
             - function: 函数名(非空字符串)
-            - line_start: 起始行(正整数)
-            - line_end: 结束行(>= line_start)
+            - ast_signature: 64 字符 SHA-256 hex
+            - source_digest: 64 字符 SHA-256 hex
             - allowed_callees: 允许调用的 callee 集合(非空 frozenset)
         """
         gate_mod = _import_gate_mod()
@@ -243,8 +247,8 @@ class TestPreciseWhitelist:
             # 必须包含所有必需字段
             assert "file" in entry, f"白名单条目缺少 file 字段: {entry}"
             assert "function" in entry, f"白名单条目缺少 function 字段: {entry}"
-            assert "line_start" in entry, f"白名单条目缺少 line_start 字段: {entry}"
-            assert "line_end" in entry, f"白名单条目缺少 line_end 字段: {entry}"
+            assert "ast_signature" in entry, f"白名单条目缺少 ast_signature 字段: {entry}"
+            assert "source_digest" in entry, f"白名单条目缺少 source_digest 字段: {entry}"
             assert "allowed_callees" in entry, f"白名单条目缺少 allowed_callees 字段: {entry}"
 
             # function 必须是非空字符串(不是 None 或 "")
@@ -252,12 +256,26 @@ class TestPreciseWhitelist:
                 f"function 必须是非空字符串: {entry}"
             )
 
-            # line_start / line_end 必须是正整数,且 line_end >= line_start
-            assert isinstance(entry["line_start"], int) and entry["line_start"] > 0, (
-                f"line_start 必须是正整数: {entry}"
+            # R67 P1-07: ast_signature / source_digest 必须是 64 字符 hex SHA-256
+            assert isinstance(entry["ast_signature"], str) and len(entry["ast_signature"]) == 64, (
+                f"ast_signature 必须是 64 字符 SHA-256 hex: {entry}"
             )
-            assert isinstance(entry["line_end"], int) and entry["line_end"] >= entry["line_start"], (
-                f"line_end 必须 >= line_start: {entry}"
+            assert all(c in "0123456789abcdef" for c in entry["ast_signature"]), (
+                f"ast_signature 必须是 hex 字符: {entry}"
+            )
+            assert isinstance(entry["source_digest"], str) and len(entry["source_digest"]) == 64, (
+                f"source_digest 必须是 64 字符 SHA-256 hex: {entry}"
+            )
+            assert all(c in "0123456789abcdef" for c in entry["source_digest"]), (
+                f"source_digest 必须是 hex 字符: {entry}"
+            )
+
+            # R67 P1-07: 不得包含 line_start / line_end(禁止行范围授权)
+            assert "line_start" not in entry, (
+                f"R67 P1-07: 白名单条目不得包含 line_start(禁止行范围授权): {entry}"
+            )
+            assert "line_end" not in entry, (
+                f"R67 P1-07: 白名单条目不得包含 line_end(禁止行范围授权): {entry}"
             )
 
             # allowed_callees 必须是非空 frozenset
@@ -358,14 +376,26 @@ class TestPreciseWhitelist:
         assert "_restore_preverified_payload" in functions
 
     def test_is_call_allowed_precise_check(self):
-        """_is_call_allowed 基于 (file, function, callee, line) 精确匹配。"""
+        """R67 P1-07: _is_call_allowed 基于 (file, function, callee) +
+        AST signature + source digest 精确匹配(禁止行范围授权)。
+
+        新方案:
+            1. (file, function, callee) 基本匹配 — 不提供 enclosing_func_node/source
+               时仅做基本匹配(向后兼容旧测试)
+            2. 提供 enclosing_func_node + source 时,必须 signature + digest 双匹配
+               - signature 不匹配 → 拒绝(函数结构已修改)
+               - source digest 不匹配 → 拒绝(函数源码已修改)
+            3. 模块级调用 / 非白名单文件 / 不在 allowed_callees 中的 callee → 永远拒绝
+        """
         gate_mod = _import_gate_mod()
 
-        # db_restore.py: _restore_from_backup_data 在 440-631 行内调用 _restore_crdb_tables → 允许
+        # —— 基本匹配(向后兼容:不提供 node/source)— 验证 (file, function, callee) 三元组 ——
+
+        # db_restore.py: _restore_from_backup_data 调用 _restore_crdb_tables → 允许
         assert gate_mod._is_call_allowed(
             "services/db_restore.py", "_restore_from_backup_data",
             "_restore_crdb_tables", 584,
-        ), "_restore_from_backup_data 在行范围内调用 _restore_crdb_tables 应允许"
+        ), "_restore_from_backup_data 调用 _restore_crdb_tables 应允许(基本匹配)"
 
         # db_restore.py: _restore_from_backup_data 调用 run_restore → 不允许(不在 allowed_callees)
         assert not gate_mod._is_call_allowed(
@@ -379,12 +409,6 @@ class TestPreciseWhitelist:
             "_restore_crdb_tables", 500,
         ), "非白名单函数不允许调用 _restore_crdb_tables"
 
-        # db_restore.py: _restore_from_backup_data 但行号超出范围 → 不允许
-        assert not gate_mod._is_call_allowed(
-            "services/db_restore.py", "_restore_from_backup_data",
-            "_restore_crdb_tables", 700,  # 超出 440-631 范围
-        ), "行号超出白名单范围应不允许(防止代码漂移静默通过)"
-
         # 模块级调用(None enclosing)→ 不允许
         assert not gate_mod._is_call_allowed(
             "services/db_restore.py", None,
@@ -396,6 +420,79 @@ class TestPreciseWhitelist:
             "services/other.py", "_restore_from_backup_data",
             "_restore_crdb_tables", 500,
         ), "非白名单文件不允许(即使函数名匹配)"
+
+    def test_is_call_allowed_signature_digest_verification(self):
+        """R67 P1-07: 提供 enclosing_func_node + source 时必须 signature+digest 双匹配。
+
+        构造一个合成的 FunctionDef 节点(结构完全不同于白名单中的真实函数),
+        验证即使 (file, function, callee) 三元组匹配,signature 不匹配也会拒绝。
+        """
+        gate_mod = _import_gate_mod()
+
+        # 合成一个与白名单中 _restore_from_backup_data 完全不同的函数体
+        # (即使函数名相同,AST 结构不同 → signature 不匹配 → 拒绝)
+        synthetic_source = (
+            "def _restore_from_backup_data(backup_id, tables=None):\n"
+            "    # 这是合成的、与真实函数完全不同的实现\n"
+            "    return 'synthetic_impl'\n"
+        )
+        tree = ast.parse(synthetic_source, filename="<synthetic>")
+        synthetic_func_node = tree.body[0]
+        assert isinstance(synthetic_func_node, ast.FunctionDef), (
+            "合成节点应为 FunctionDef"
+        )
+
+        # 即使 (file, function, callee) 三元组匹配,signature 不匹配 → 拒绝
+        # (合成的函数结构与真实 _restore_from_backup_data 完全不同)
+        allowed = gate_mod._is_call_allowed(
+            "services/db_restore.py", "_restore_from_backup_data",
+            "_restore_crdb_tables", 500,
+            enclosing_func_node=synthetic_func_node,
+            source=synthetic_source,
+        )
+        assert not allowed, (
+            "R67 P1-07: signature 不匹配应拒绝(防止函数修改后静默通过白名单)"
+        )
+
+    def test_is_call_allowed_real_function_signature_matches(self):
+        """R67 P1-07: 真实白名单函数的 signature + digest 必须匹配(scanner 主流程验证)。
+
+        从真实 db_restore.py 文件中解析 _restore_from_backup_data 函数,
+        计算其 signature/digest,与 PRECISE_WHITELIST 中的条目对比 — 必须匹配。
+        这也是 scanner 主流程的行为,保证白名单不会因为过期而误判。
+        """
+        gate_mod = _import_gate_mod()
+
+        db_restore_path = REPO_ROOT / "services" / "db_restore.py"
+        assert db_restore_path.exists(), "services/db_restore.py 应存在"
+        source = db_restore_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(db_restore_path))
+
+        # 找到 _restore_from_backup_data 函数节点(可能是 FunctionDef 或 AsyncFunctionDef)
+        target_func = None
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "_restore_from_backup_data"
+            ):
+                target_func = node
+                break
+        assert target_func is not None, (
+            "services/db_restore.py 中应存在 _restore_from_backup_data 函数"
+        )
+
+        # 真实函数的 signature + digest 必须与白名单条目匹配
+        allowed = gate_mod._is_call_allowed(
+            "services/db_restore.py", "_restore_from_backup_data",
+            "_restore_crdb_tables", target_func.lineno,
+            enclosing_func_node=target_func,
+            source=source,
+        )
+        assert allowed, (
+            "R67 P1-07: 真实 _restore_from_backup_data 函数的 signature+digest "
+            "必须与 PRECISE_WHITELIST 中的条目匹配(若失配,请运行 "
+            "scripts/regenerate_scanner_whitelist_digests.py 重新生成)"
+        )
 
     def test_default_mode_still_passes(self):
         """默认模式:无违规(精确白名单正确覆盖所有合法调用)。"""
@@ -412,11 +509,16 @@ class TestPreciseWhitelist:
         command_bus.py:_handler 是已 capability-sealed 的调用方
         (运行时由 ALLOW_LEGACY_RESTORE env var + RESTORE_LEGACY_WRITER_SEALED
         错误码防护)。这些 sealed 调用方已加入 PRECISE_WHITELIST
-        (精确函数+行范围),因此 --strict 模式应通过(无违规)。
+        (精确函数+AST signature+source digest),因此 --strict 模式应通过(无违规)。
+
+        R67 P1-07 整改:删除 line_start/line_end(行范围授权),
+        改为 ast_signature + source_digest 双重绑定。
 
         本测试验证:
           1. sealed 调用方在 PRECISE_WHITELIST 中(精确白名单已覆盖)
-          2. --strict 模式 exit_code=0(无违规)
+          2. sealed 调用方条目含 ast_signature/source_digest(64 字符 SHA-256 hex)
+          3. 真实函数的 signature/digest 与白名单条目匹配(scanner 主流程验证)
+          4. --strict 模式 exit_code=0(无违规)
         """
         gate_mod = _import_gate_mod()
 
@@ -434,7 +536,8 @@ class TestPreciseWhitelist:
             "(已 capability-sealed,精确白名单覆盖)"
         )
 
-        # 验证 sealed 调用方的白名单条目结构完整(file/function/line range/allowed_callees)
+        # R67 P1-07: 验证 sealed 调用方条目含 ast_signature/source_digest
+        # (64 字符 SHA-256 hex),且不再含 line_start/line_end
         db_backup_entry = next(
             entry for entry in gate_mod.PRECISE_WHITELIST
             if entry["file"] == "services/db_backup.py"
@@ -444,8 +547,26 @@ class TestPreciseWhitelist:
             f"restore_from_backup 仅允许调用 validate_and_restore_backup_strict, "
             f"实际: {db_backup_entry['allowed_callees']}"
         )
-        assert db_backup_entry["line_start"] > 0
-        assert db_backup_entry["line_end"] >= db_backup_entry["line_start"]
+        # R67 P1-07: 必须含 ast_signature/source_digest(64 字符 SHA-256 hex)
+        assert "ast_signature" in db_backup_entry, (
+            "R67 P1-07: 白名单条目必须含 ast_signature 字段"
+        )
+        assert "source_digest" in db_backup_entry, (
+            "R67 P1-07: 白名单条目必须含 source_digest 字段"
+        )
+        assert len(db_backup_entry["ast_signature"]) == 64, (
+            "ast_signature 必须是 64 字符 SHA-256 hex"
+        )
+        assert len(db_backup_entry["source_digest"]) == 64, (
+            "source_digest 必须是 64 字符 SHA-256 hex"
+        )
+        # R67 P1-07: 禁止 line_start/line_end(行范围授权已废弃)
+        assert "line_start" not in db_backup_entry, (
+            "R67 P1-07: 禁止 line_start 字段(行范围授权已废弃)"
+        )
+        assert "line_end" not in db_backup_entry, (
+            "R67 P1-07: 禁止 line_end 字段(行范围授权已废弃)"
+        )
 
         command_bus_entry = next(
             entry for entry in gate_mod.PRECISE_WHITELIST
@@ -455,6 +576,44 @@ class TestPreciseWhitelist:
         assert command_bus_entry["allowed_callees"] == frozenset({"restore_from_backup"}), (
             f"_handler 仅允许调用 restore_from_backup, "
             f"实际: {command_bus_entry['allowed_callees']}"
+        )
+        # R67 P1-07: 必须含 ast_signature/source_digest
+        assert "ast_signature" in command_bus_entry
+        assert "source_digest" in command_bus_entry
+        assert len(command_bus_entry["ast_signature"]) == 64
+        assert len(command_bus_entry["source_digest"]) == 64
+        assert "line_start" not in command_bus_entry
+        assert "line_end" not in command_bus_entry
+
+        # R67 P1-07: 真实函数的 signature/digest 必须与白名单条目匹配
+        # (scanner 主流程的行为,保证白名单不过期)
+        db_backup_path = REPO_ROOT / "services" / "db_backup.py"
+        db_backup_source = db_backup_path.read_text(encoding="utf-8")
+        db_backup_tree = ast.parse(db_backup_source, filename=str(db_backup_path))
+        db_backup_func = None
+        for node in ast.walk(db_backup_tree):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "restore_from_backup"
+            ):
+                db_backup_func = node
+                break
+        assert db_backup_func is not None, (
+            "services/db_backup.py 中应存在 restore_from_backup 函数"
+        )
+        actual_sig = gate_mod.compute_ast_signature(db_backup_func)
+        actual_src = gate_mod.compute_source_digest(db_backup_func, db_backup_source)
+        # R67 P1-07 hotfix: source_digest 是授权依据(跨版本稳定),
+        # ast_signature 仅作诊断(非阻塞) — ast.dump() 在 Python 3.10/3.11/3.12/
+        # 3.13/3.14 上对同一 AST 输出不同字段集合(如 type_params/TypeAlias),
+        # 故跨版本比较 ast_signature 不可靠,但 source_digest 始终稳定。
+        assert actual_src == db_backup_entry["source_digest"], (
+            "R67 P1-07: 真实 restore_from_backup 的 source_digest 与白名单条目不匹配 "
+            "(请运行 scripts/regenerate_scanner_whitelist_digests.py 重新生成)"
+        )
+        # ast_signature 仍需为合法的 64 字符 SHA-256 hex(诊断字段结构校验)
+        assert len(actual_sig) == 64, (
+            "ast_signature 必须是 64 字符 SHA-256 hex(诊断字段结构校验)"
         )
 
         # --strict 模式应通过(sealed 调用方已被白名单覆盖)

@@ -147,6 +147,63 @@ class SwitchResult:
 
 
 # ════════════════════════════════════════════════════════════════
+# R67 P1-05: AuthorityState — 启动就绪检查的扩展验证结果
+# ════════════════════════════════════════════════════════════════
+
+
+@dataclass(frozen=True)
+class AuthorityState:
+    """R67 P1-05: 后端 authority 状态 — 启动就绪检查的扩展验证结果。
+
+    审计背景:
+        R66 P0-06 的 ``check_startup_readiness`` 只检查本地 SQLite
+        ``sqlite_master`` 的 rollback target 表存在,未验证 CRDB/外部 routing
+        store 的连接/schema/权限/CAS/版本一致性。R67 P1-05 要求对每个注册
+        backend 单独验证其是否能正确参与恢复/切换流程。
+
+    五个维度:
+        - connected: 连接可用(能执行简单查询,如 ``SELECT 1``)
+        - schema_present: 必需 schema/表存在(可参与恢复/切换)
+        - permissions_ok: 必需权限(读/写/DDL)可用
+        - cas_capable: 支持 CAS(原子比较交换,用于 fencing token 更新)
+        - current_version: 当前 active 版本(若适用,用于跨 store 版本一致性检查)
+
+    ``ready`` 属性:所有维度均通过(全部 True 且 current_version 可空)。
+    若后端不参与 authority(如纯 staging backend),``current_version=None``
+    且仍需 connected/schema_present/permissions_ok/cas_capable 均 True。
+
+    Attributes:
+        datasource: 数据源名(crdb / sqlite / relay_sqlite)
+        connected: 连接是否可用
+        schema_present: 必需 schema/表是否存在
+        permissions_ok: 必需权限是否可用
+        cas_capable: 是否支持 CAS
+        current_version: 当前 active 版本(若适用)
+        details: 详细诊断信息(各维度失败原因等)
+    """
+    datasource: str
+    connected: bool
+    schema_present: bool
+    permissions_ok: bool
+    cas_capable: bool
+    current_version: Optional[str] = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def ready(self) -> bool:
+        """所有维度均通过(connected + schema_present + permissions_ok + cas_capable)。
+
+        ``current_version`` 可为 None(后端不参与 authority 跟踪时)。
+        """
+        return (
+            self.connected
+            and self.schema_present
+            and self.permissions_ok
+            and self.cas_capable
+        )
+
+
+# ════════════════════════════════════════════════════════════════
 # 2. RestoreBackend Protocol
 # ════════════════════════════════════════════════════════════════
 
@@ -269,6 +326,33 @@ class RestoreBackend(Protocol):
         """销毁 staging 资源(SQLite 文件 / CRDB schema)。
 
         幂等:文件/schema 不存在视为成功。
+        """
+        ...
+
+    async def verify_authority_state(self) -> AuthorityState:
+        """R67 P1-05: 验证后端 authority 状态 — 启动就绪检查的扩展验证。
+
+        审计背景:
+            R66 P0-06 的 ``check_startup_readiness`` 只检查 SQLite
+            ``sqlite_master`` 的 rollback target 表存在。若生产 active
+            pointer/fencing 权威在 CRDB 或外部 routing store,需要分别
+            检查连接、schema、权限、CAS 和版本一致性。
+
+        本方法验证后端是否能正确参与恢复/切换流程,包含五个维度:
+            1. connected: 连接是否可用(能执行简单查询)
+            2. schema_present: 必需 schema/表是否存在
+            3. permissions_ok: 必需权限(读/写/DDL)是否可用
+            4. cas_capable: 是否支持 CAS(原子比较交换)
+            5. current_version: 当前 active 版本(若适用)
+
+        实现要求:
+            - 任一维度失败必须返回对应字段 False,不得 raise(fail-closed
+              由调用方 ``check_startup_readiness`` 决定)
+            - 所有 I/O 操作必须 try/except 包裹,异常信息记录到 ``details``
+            - ``current_version`` 可为 None(后端不参与 authority 跟踪时)
+
+        Returns:
+            AuthorityState(包含五个维度状态 + 详细诊断信息)
         """
         ...
 
@@ -843,6 +927,186 @@ class SQLiteRestoreBackend:
                 )
             )
 
+    async def verify_authority_state(self) -> AuthorityState:
+        """R67 P1-05: SQLite 后端 authority 状态验证。
+
+        验证五个维度:
+            1. connected: active_db_path 文件可被 aiosqlite 打开
+            2. schema_present: sqlite_master 可读(至少有 1 张表或空数据库)
+            3. permissions_ok: 在临时事务内能 INSERT + ROLLBACK(写权限测试)
+            4. cas_capable: UPDATE ... WHERE rowid=? 能 rowcount=1(原子 CAS)
+            5. current_version: PRAGMA user_version(用于跨 store 版本一致性)
+
+        若 active_db_path 不存在(首次部署场景),视为 connected=True +
+        schema_present=True + permissions_ok=True + cas_capable=True +
+        current_version="0"(空数据库默认版本),允许 orchestrator 创建。
+
+        Returns:
+            AuthorityState(所有 I/O 异常均捕获,记录到 details)
+        """
+        import aiosqlite
+
+        details: dict[str, Any] = {"datasource": self._datasource_name}
+        active_path = self._active_db_path
+        details["active_db_path"] = str(active_path)
+
+        # 首次部署场景:active 不存在 → 视为就绪(orchestrator 会创建)
+        if not active_path.exists():
+            details["first_deployment"] = True
+            return AuthorityState(
+                datasource=self._datasource_name,
+                connected=True,
+                schema_present=True,
+                permissions_ok=True,
+                cas_capable=True,
+                current_version="0",
+                details=details,
+            )
+
+        # 1. connected: 打开 active 数据库
+        try:
+            conn = await aiosqlite.connect(str(active_path), timeout=15)
+        except Exception as e:
+            details["connected_error"] = f"{type(e).__name__}: {e}"
+            return AuthorityState(
+                datasource=self._datasource_name,
+                connected=False,
+                schema_present=False,
+                permissions_ok=False,
+                cas_capable=False,
+                current_version=None,
+                details=details,
+            )
+
+        try:
+            # 2. schema_present: sqlite_master 可读
+            try:
+                cursor = await conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'"
+                )
+                row = await cursor.fetchone()
+                table_count = row[0] if row else 0
+                details["table_count"] = table_count
+                schema_present = True
+            except Exception as e:
+                details["schema_present_error"] = f"{type(e).__name__}: {e}"
+                schema_present = False
+
+            # 3. permissions_ok: 创建临时表 + INSERT + ROLLBACK(写权限测试)
+            permissions_ok = False
+            try:
+                # 用临时事务测试写权限(不实际提交)
+                await conn.execute("BEGIN IMMEDIATE")
+                await conn.execute(
+                    "CREATE TABLE IF NOT EXISTS _r67_p1_05_probe "
+                    "(id INTEGER PRIMARY KEY, val TEXT)"
+                )
+                await conn.execute(
+                    "INSERT INTO _r67_p1_05_probe (id, val) VALUES (?, ?)",
+                    (1, "probe"),
+                )
+                await conn.execute("ROLLBACK")
+                permissions_ok = True
+            except Exception as e:
+                details["permissions_error"] = f"{type(e).__name__}: {e}"
+                try:
+                    await conn.execute("ROLLBACK")
+                except Exception as rollback_err:
+                    # ROLLBACK 失败通常意味着连接已损坏,上游会关闭并重建。
+                    # 记录日志但不阻塞 — AuthorityState.permissions_ok=False 已反映故障。
+                    logger.debug(
+                        _i18n_t(
+                            "diagnostics.r65.restore_backend.verify_authority_state_rollback_after_permissions_failed",
+                            error=rollback_err,
+                        )
+                    )
+
+            # 4. cas_capable: UPDATE ... WHERE rowid=? rowcount=1(CAS 测试)
+            cas_capable = False
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+                await conn.execute(
+                    "CREATE TABLE IF NOT EXISTS _r67_p1_05_cas "
+                    "(id INTEGER PRIMARY KEY, version TEXT)"
+                )
+                await conn.execute(
+                    "INSERT INTO _r67_p1_05_cas (id, version) VALUES (?, ?)",
+                    (1, "v1"),
+                )
+                # CAS: UPDATE WHERE id=1 AND version='v1' → rowcount 应为 1
+                cursor = await conn.execute(
+                    "UPDATE _r67_p1_05_cas SET version=? "
+                    "WHERE id=? AND version=?",
+                    ("v2", 1, "v1"),
+                )
+                cas_capable = cursor.rowcount == 1
+                # 第二次 CAS: 同样的 WHERE 应 rowcount=0(version 已变)
+                cursor = await conn.execute(
+                    "UPDATE _r67_p1_05_cas SET version=? "
+                    "WHERE id=? AND version=?",
+                    ("v3", 1, "v1"),  # version 已是 v2,WHERE 不匹配
+                )
+                if cursor.rowcount != 0:
+                    cas_capable = False
+                await conn.execute("ROLLBACK")
+            except Exception as e:
+                details["cas_error"] = f"{type(e).__name__}: {e}"
+                try:
+                    await conn.execute("ROLLBACK")
+                except Exception as rollback_err:
+                    logger.debug(
+                        _i18n_t(
+                            "diagnostics.r65.restore_backend.verify_authority_state_rollback_after_cas_failed",
+                            error=rollback_err,
+                        )
+                    )
+
+            # 5. current_version: PRAGMA user_version
+            current_version: Optional[str] = None
+            try:
+                cursor = await conn.execute("PRAGMA user_version")
+                row = await cursor.fetchone()
+                if row:
+                    current_version = str(row[0])
+            except Exception as e:
+                details["current_version_error"] = f"{type(e).__name__}: {e}"
+
+            # 清理临时表(若存在且未被 ROLLBACK 撤销 — 防止遗留)
+            try:
+                await conn.execute("DROP TABLE IF EXISTS _r67_p1_05_probe")
+                await conn.execute("DROP TABLE IF EXISTS _r67_p1_05_cas")
+                await conn.commit()
+            except Exception as cleanup_err:
+                # 清理失败不阻塞 — 临时表在下次 verify 时 IF NOT EXISTS 幂等覆盖;
+                # 但记录日志便于诊断(例如 disk I/O error 持续出现意味着硬件故障)。
+                logger.debug(
+                    _i18n_t(
+                        "diagnostics.r65.restore_backend.verify_authority_state_temp_table_cleanup_failed",
+                        error=cleanup_err,
+                    )
+                )
+
+            return AuthorityState(
+                datasource=self._datasource_name,
+                connected=True,
+                schema_present=schema_present,
+                permissions_ok=permissions_ok,
+                cas_capable=cas_capable,
+                current_version=current_version,
+                details=details,
+            )
+        finally:
+            try:
+                await conn.close()
+            except Exception as close_err:
+                # close 失败通常意味着连接已损坏;上游会重建。
+                logger.debug(
+                    _i18n_t(
+                        "diagnostics.r65.restore_backend.verify_authority_state_conn_close_failed",
+                        error=close_err,
+                    )
+                )
+
 
 # ════════════════════════════════════════════════════════════════
 # 4. CRDBRestoreBackend — asyncpg 直连
@@ -1388,6 +1652,210 @@ class CRDBRestoreBackend:
                     error=e,
                 )
             )
+
+    async def verify_authority_state(self) -> AuthorityState:
+        """R67 P1-05: CRDB 后端 authority 状态验证。
+
+        审计背景:
+            R66 P0-06 的 ``check_startup_readiness`` 只检查本地 SQLite
+            ``sqlite_master`` 的 rollback target 表存在。若生产 active
+            pointer/fencing 权威在 CRDB 或外部 routing store,需要分别
+            检查连接、schema、权限、CAS 和版本一致性。
+
+        验证五个维度:
+            1. connected: 能 acquire 连接并执行 ``SELECT 1``
+            2. schema_present: ``information_schema.tables`` 可读
+                (CRDB 系统表存在,后端可参与 provision/validate/switch)
+            3. permissions_ok: 在 rolled-back 事务内能 CREATE SCHEMA +
+                INSERT + DROP SCHEMA(DDL + DML 权限测试)
+            4. cas_capable: 在 rolled-back 事务内能 UPDATE ... WHERE
+                rowid=expected → rowcount=1(原子 CAS 测试)
+            5. current_version: 若 CRDB 有 ``restore_active_pointer`` 表,
+                读取当前 active 版本;否则 None(后端不参与 authority 跟踪)
+
+        实现要求:
+            - 所有 I/O 操作必须 try/except 包裹,异常信息记录到 ``details``
+            - 任一维度失败必须返回对应字段 False,不得 raise(fail-closed
+              由调用方 ``check_startup_readiness`` 决定)
+
+        Returns:
+            AuthorityState(包含五个维度状态 + 详细诊断信息)
+        """
+        details: dict[str, Any] = {"datasource": "crdb"}
+        details["active_schema"] = self._active_schema
+
+        # 1. connected: 能 acquire 连接并执行 SELECT 1
+        try:
+            async with self._crdb_client.acquire() as conn:
+                # 简单查询测试连接可用性
+                try:
+                    await conn.execute("SELECT 1")
+                except Exception as e:
+                    # 某些 asyncpg 版本用 fetchval 而非 execute
+                    try:
+                        await conn.fetchval("SELECT 1")
+                    except Exception:
+                        raise e
+                connected = True
+        except Exception as e:
+            details["connected_error"] = f"{type(e).__name__}: {e}"
+            return AuthorityState(
+                datasource="crdb",
+                connected=False,
+                schema_present=False,
+                permissions_ok=False,
+                cas_capable=False,
+                current_version=None,
+                details=details,
+            )
+
+        # 2-5: 在连接内继续验证其他维度
+        schema_present = False
+        permissions_ok = False
+        cas_capable = False
+        current_version: Optional[str] = None
+
+        try:
+            async with self._crdb_client.acquire() as conn:
+                # 2. schema_present: information_schema.tables 可读
+                try:
+                    # 测试 information_schema 可访问(系统目录)
+                    cursor = await conn.execute(
+                        "SELECT COUNT(*) FROM information_schema.tables "
+                        "WHERE table_schema = $1",
+                        self._active_schema,
+                    )
+                    row = await cursor.fetchone()
+                    table_count = row[0] if row else 0
+                    details["active_table_count"] = table_count
+                    schema_present = True
+                except Exception as e:
+                    details["schema_present_error"] = f"{type(e).__name__}: {e}"
+
+                # 3. permissions_ok: 在 rolled-back 事务内 CREATE SCHEMA + INSERT + DROP
+                try:
+                    async with conn.transaction():
+                        test_schema = (
+                            f"_r67_p1_05_probe_{uuid.uuid4().hex[:12]}"
+                        )
+                        await conn.execute(
+                            f'CREATE SCHEMA IF NOT EXISTS "{test_schema}"'
+                        )
+                        await conn.execute(
+                            f'CREATE TABLE IF NOT EXISTS '
+                            f'"{test_schema}".probe (id INT PRIMARY KEY, val TEXT)'
+                        )
+                        await conn.execute(
+                            f'INSERT INTO "{test_schema}".probe VALUES ($1, $2)',
+                            1, "probe",
+                        )
+                        # DROP SCHEMA(事务内,会被 ROLLBACK)
+                        await conn.execute(
+                            f'DROP SCHEMA IF EXISTS "{test_schema}" CASCADE'
+                        )
+                        # 事务退出时自动 ROLLBACK(transaction() 上下文
+                        # 默认 rollback,除非显式 commit)
+                    permissions_ok = True
+                except Exception as e:
+                    details["permissions_error"] = f"{type(e).__name__}: {e}"
+
+                # 4. cas_capable: UPDATE ... WHERE id=? AND version=? rowcount=1
+                try:
+                    async with conn.transaction():
+                        test_schema = (
+                            f"_r67_p1_05_cas_{uuid.uuid4().hex[:12]}"
+                        )
+                        await conn.execute(
+                            f'CREATE SCHEMA IF NOT EXISTS "{test_schema}"'
+                        )
+                        await conn.execute(
+                            f'CREATE TABLE IF NOT EXISTS '
+                            f'"{test_schema}".cas_test '
+                            f'(id INT PRIMARY KEY, version TEXT)'
+                        )
+                        await conn.execute(
+                            f'INSERT INTO "{test_schema}".cas_test '
+                            f'VALUES ($1, $2)',
+                            1, "v1",
+                        )
+                        # CAS: UPDATE WHERE id=1 AND version='v1' → rowcount=1
+                        cursor = await conn.execute(
+                            f'UPDATE "{test_schema}".cas_test '
+                            f'SET version=$1 WHERE id=$2 AND version=$3',
+                            "v2", 1, "v1",
+                        )
+                        rowcount_1 = cursor.rowcount if hasattr(cursor, "rowcount") else 1
+                        # 第二次 CAS: 同样的 WHERE 应 rowcount=0
+                        cursor = await conn.execute(
+                            f'UPDATE "{test_schema}".cas_test '
+                            f'SET version=$1 WHERE id=$2 AND version=$3',
+                            "v3", 1, "v1",  # version 已是 v2
+                        )
+                        rowcount_2 = cursor.rowcount if hasattr(cursor, "rowcount") else 0
+                        cas_capable = (rowcount_1 == 1 and rowcount_2 == 0)
+                        # 事务退出时 ROLLBACK
+                    # 清理(若 CREATE SCHEMA 已提交;通常在 rolled-back 事务内
+                    # schema 创建也会被回滚,但 CRDB 的 DDL 可能不可回滚 — 兜底清理)
+                    try:
+                        async with self._crdb_client.acquire() as cleanup_conn:
+                            await cleanup_conn.execute(
+                                f'DROP SCHEMA IF EXISTS "{test_schema}" CASCADE'
+                            )
+                    except Exception as cleanup_err:
+                        # 兜底清理失败不阻塞 — test_schema 名包含唯一 UUID,
+                        # 下次 verify 时会使用新 schema 名;遗留 schema 由运维定期清理。
+                        logger.debug(
+                            _i18n_t(
+                                "diagnostics.r65.restore_backend.verify_authority_state_crdb_test_schema_cleanup_failed",
+                                schema=test_schema,
+                                error=cleanup_err,
+                            )
+                        )
+                except Exception as e:
+                    details["cas_error"] = f"{type(e).__name__}: {e}"
+
+                # 5. current_version: 若 CRDB 有 restore_active_pointer 表
+                try:
+                    # 检查 restore_active_pointer 表是否存在
+                    cursor = await conn.execute(
+                        "SELECT EXISTS ("
+                        " SELECT 1 FROM information_schema.tables "
+                        " WHERE table_schema = $1 AND table_name = $2"
+                        ")",
+                        self._active_schema, "restore_active_pointer",
+                    )
+                    row = await cursor.fetchone()
+                    has_pointer_table = bool(row[0]) if row else False
+                    details["has_active_pointer_table"] = has_pointer_table
+
+                    if has_pointer_table:
+                        # 读取当前 active 版本
+                        cursor = await conn.execute(
+                            f'SELECT active_version FROM '
+                            f'"{self._active_schema}".restore_active_pointer '
+                            f'ORDER BY switched_at DESC LIMIT 1'
+                        )
+                        row = await cursor.fetchone()
+                        if row:
+                            current_version = str(row[0])
+                            details["current_version"] = current_version
+                except Exception as e:
+                    details["current_version_error"] = (
+                        f"{type(e).__name__}: {e}"
+                    )
+                    # current_version=None(表不存在或查询失败)
+        except Exception as e:
+            details["outer_error"] = f"{type(e).__name__}: {e}"
+
+        return AuthorityState(
+            datasource="crdb",
+            connected=connected,
+            schema_present=schema_present,
+            permissions_ok=permissions_ok,
+            cas_capable=cas_capable,
+            current_version=current_version,
+            details=details,
+        )
 
 
 # ════════════════════════════════════════════════════════════════

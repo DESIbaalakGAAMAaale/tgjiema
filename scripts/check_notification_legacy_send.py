@@ -28,7 +28,8 @@ R53 P1-1 背景:
 允许的调用方(白名单):
 - services/notifications.py  (定义文件本身,send() 内部委托)
 - tests/                     (测试代码)
-- scripts/                   (运维脚本)
+- scripts/ (R67 P1-08 细粒度) — 仅 GATE_SCANNERS 类脚本可跳过自检;
+                              OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描
 
 CI 调用方式:
     python scripts/check_notification_legacy_send.py
@@ -59,13 +60,22 @@ NOTIFICATION_ALIASES: list[str] = [
 
 # 允许直接调用 send() 的文件路径前缀(相对 REPO_ROOT,使用 POSIX 路径)
 # 命中任一前缀的文件将被跳过
+# R67 P1-08: scripts/ 不再整体跳过 — 通过 `is_skippable_script()` 细粒度判断。
+# 仅 GATE_SCANNERS 可跳过;OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
 ALLOWED_PREFIXES: list[str] = [
     # notifications.py 自身(send 定义 + 内部委托)
     "services/notifications.py",
-    # 测试与运维脚本
+    # 测试代码
     "tests/",
-    "scripts/",
 ]
+
+# R67 P1-08: scripts/ 下可跳过的文件清单(从 _script_categories 导入)
+try:
+    from scripts._script_categories import is_skippable_script as _is_skippable_script_p1_08
+except ImportError:
+    # _script_categories 不可用时 fail-closed:不跳过任何 scripts/ 文件
+    def _is_skippable_script_p1_08(rel_path: str) -> bool:
+        return False
 
 # 跳过的目录(不扫描)
 SKIP_DIR_PARTS: list[str] = [
@@ -104,11 +114,18 @@ def _is_skipped_path(path: Path) -> bool:
 
 
 def _is_allowed(path: Path) -> bool:
-    """检查文件路径是否在白名单前缀中。"""
+    """检查文件路径是否在白名单前缀中。
+
+    R67 P1-08: scripts/ 细粒度判断 — 仅 GATE_SCANNERS 可跳过;
+    OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
+    """
     rel = _rel_posix(path)
     for prefix in ALLOWED_PREFIXES:
         if rel == prefix or rel.startswith(prefix):
             return True
+    # R67 P1-08: scripts/ 细粒度判断
+    if rel.startswith("scripts/") and _is_skippable_script_p1_08(rel):
+        return True
     return False
 
 

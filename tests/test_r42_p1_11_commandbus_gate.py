@@ -211,9 +211,16 @@ class TestAllowedCallers:
         assert violations == []
 
     def test_allows_scripts(self, tmp_path):
-        """scripts/ 目录允许调用高风险 API。"""
+        """scripts/ 目录下 GATE_SCANNERS 类脚本允许调用高风险 API(R67 P1-08)。
+
+        R67 P1-08 整改:scripts/ 不再整体跳过,仅 GATE_SCANNERS 可跳过
+        (避免自引用噪声)。OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
+        本测试使用 GATE_SCANNERS 中的 check_commandbus_gate.py 自身作为
+        "可跳过脚本"代表,验证 gate scanner 文件不被自引用扫描。
+        """
         files = {
-            "scripts/run_migration.py": (
+            # check_commandbus_gate.py 在 GATE_SCANNERS 中,应被跳过
+            "scripts/check_commandbus_gate.py": (
                 "def migrate():\n"
                 "    rbac.revoke_role(user_id, 'admin')\n"
             ),

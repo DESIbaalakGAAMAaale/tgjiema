@@ -118,18 +118,29 @@ EVIDENCE_TYPES = {
         "estimated_duration_minutes": 5,
         "report_glob": "supply_chain_report_*.json",
     },
+    "rc_verify_3x": {
+        "description": "R67 P0-04: 同候选 3 次 verify-only 验证(同 digest 不可变性)",
+        "script": "scripts/verify_rc_3x.py",
+        "required_args": ["--image-name", "--image-digest",
+                          "--expected-commit", "--expected-tree"],
+        "production_args": [],
+        "estimated_duration_minutes": 15,  # 3 次 × ~5 分钟
+        "report_glob": "rc_verify_3x_*.json",
+    },
 }
 
 
 # ─── R65 P0-04: 生产证据 artifact 严格门禁 ──────────────────────
 # 5 类必需的 production artifact 类型(evidence_type → artifact_type 映射)。
 # 任一缺失/过期/dry_run/未签名即阻断 production promotion。
+# R67 P0-04: 增加 RC_VERIFY_3X artifact 类型(同候选 3 次验证)
 EVIDENCE_TYPE_TO_ARTIFACT_TYPE = {
     "soak": "SOAK_7DAY",
     "vps_recovery": "RESTORE_3X",
     "chaos": "OUTBOX_FAULT_INJECTION",
     "ru_72h": "RU_72H",
     "supply_chain": "SUPPLY_CHAIN",
+    "rc_verify_3x": "RC_VERIFY_3X",
 }
 
 # production artifact 必需字段(每个 artifact 必须包含全部字段)
@@ -145,15 +156,22 @@ REQUIRED_ARTIFACT_FIELDS = (
     "executed_by",
     "approved_by",
     "signature",
+    # R67 P1-11: 防重放字段 — 每份证据必须含 nonce + attestation_digest +
+    # time_window,确保跨候选不可复用。consumed 字段记录 promotion 消费状态。
+    "nonce",
+    "attestation_digest",
+    "time_window",
+    "consumed",
 )
 
-# 5 类必需 artifact 类型(任一缺失即阻断)
+# R67 P0-04: 6 类必需 artifact 类型(任一缺失即阻断,新增 RC_VERIFY_3X)
 REQUIRED_ARTIFACT_TYPES = (
     "SOAK_7DAY",
     "RESTORE_3X",
     "OUTBOX_FAULT_INJECTION",
     "RU_72H",
     "SUPPLY_CHAIN",
+    "RC_VERIFY_3X",
 )
 
 # 默认 artifact 过期时间(天) — production artifact 7 天后过期
@@ -678,6 +696,221 @@ def verify_production_promotion(evidence_path: Path | str) -> dict:
 
     # 校验通过 — 标记 production_promotion_allowed 并返回
     evidence["production_promotion_allowed"] = True
+    return evidence
+
+
+# ════════════════════════════════════════════════════════════════
+# R67 P1-11: 防重放(replay protection)— promotion 消费 + 单次使用
+# ════════════════════════════════════════════════════════════════
+#
+# 审计背景(R67 终审报告 P1-11):
+#     每份证据加入 nonce、environment ID、commit/tree/image/attestation digest、
+#     时间窗、执行器和审批者;promotion 消费后标记 consumed,禁止跨候选复用。
+#
+# 实现要点:
+#     1. 每个 artifact 在生成时由调用方填充 nonce(随机 hex)、attestation_digest
+#        (cosign attestation digest)、time_window({started_at, ended_at})。
+#        verify_production_promotion() 通过 REQUIRED_ARTIFACT_FIELDS 强制校验存在。
+#
+#     2. consume_evidence_for_promotion() 在 promotion 实际执行时调用:
+#        - 检查每个 artifact 的 consumed=false(未消费)
+#        - 检查 environment_id 匹配当前部署环境
+#        - 检查 attestation_digest 与当前 release manifest 一致
+#        - 标记每个 artifact consumed=true + consumed_at + consumed_by + consumed_candidate
+#        - 将更新后的 evidence 写回文件(原子写入)
+#
+#     3. 一旦 consumed=true,再次调用 consume 会抛
+#        AppError(EVIDENCE_ALREADY_CONSUMED),禁止跨候选复用。
+
+
+def consume_evidence_for_promotion(
+    evidence_path: Path | str,
+    *,
+    candidate_tag: str,
+    consumed_by: str,
+    expected_environment_id: str,
+    expected_attestation_digest: str,
+) -> dict:
+    """R67 P1-11: 消费 production evidence 用于指定 candidate 的 promotion。
+
+    单次使用语义:每个 evidence artifact 只能被一个 candidate 消费一次。
+    重复消费(跨候选复用)会抛 ``AppError(EVIDENCE_ALREADY_CONSUMED)``。
+
+    Args:
+        evidence_path: evidence JSON 文件路径
+        candidate_tag: 当前 candidate 的 tag(如 "rc-2025-07-21-v1")
+        consumed_by: 执行 promotion 的用户/服务账号
+        expected_environment_id: 当前部署环境 ID(必须与 artifact 中一致)
+        expected_attestation_digest: 当前 release manifest attestation digest
+            (必须与 artifact 中一致,确保证据是该 candidate 生成的)
+
+    Returns:
+        更新后的 evidence dict(每个 artifact 含 consumed=true +
+        consumed_at + consumed_by + consumed_candidate)。
+
+    Raises:
+        AppError(EVIDENCE_ALREADY_CONSUMED): 任一 artifact 已被其他 candidate 消费
+        AppError(PRODUCTION_EVIDENCE_INSUFFICIENT): 校验失败(字段缺失/环境不匹配/
+            attestation 不一致/artifact 已过期)
+    """
+    from services.error_codes import AppError, ErrorCodes
+
+    path = Path(evidence_path)
+    if not path.exists():
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": f"证据文件不存在: {path}",
+                "missing": "ALL",
+            },
+        )
+
+    try:
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": f"证据文件无法解析: {e}",
+                "missing": "ALL",
+            },
+        ) from e
+
+    if not isinstance(evidence, dict):
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": "证据文件根对象必须为 dict",
+                "missing": "ALL",
+            },
+        )
+
+    artifacts = evidence.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": "证据文件缺少 artifacts 数组",
+                "missing": ",".join(REQUIRED_ARTIFACT_TYPES),
+            },
+        )
+
+    now_iso = _now_iso()
+    consumed_at = now_iso
+    failures: list[str] = []
+
+    for art in artifacts:
+        if not isinstance(art, dict):
+            failures.append(f"artifact 不是 dict: {art!r}")
+            continue
+        atype = art.get("artifact_type", "<unknown>")
+
+        # 1. 检查 consumed 状态
+        consumed = art.get("consumed")
+        if consumed is True:
+            consumed_candidate = art.get("consumed_candidate", "<unknown>")
+            if consumed_candidate != candidate_tag:
+                # 已被其他 candidate 消费 — 跨候选复用,违反 P1-11
+                raise AppError(
+                    ErrorCodes.EVIDENCE_ALREADY_CONSUMED,
+                    params={
+                        "artifact_type": atype,
+                        "consumed_candidate": consumed_candidate,
+                        "candidate_tag": candidate_tag,
+                    },
+                )
+            # 已被同一 candidate 消费 — 幂等(返回当前 evidence)
+            continue
+
+        # 2. 校验 environment_id 匹配
+        art_env = art.get("environment_id", "")
+        if art_env != expected_environment_id:
+            failures.append(
+                f"{atype} environment_id={art_env!r} 不匹配 "
+                f"expected={expected_environment_id!r}"
+            )
+            continue
+
+        # 3. 校验 attestation_digest 匹配(防跨候选复用)
+        art_digest = art.get("attestation_digest", "")
+        if art_digest != expected_attestation_digest:
+            failures.append(
+                f"{atype} attestation_digest={art_digest!r} 不匹配 "
+                f"expected={expected_attestation_digest!r} — "
+                f"证据不属于当前 candidate"
+            )
+            continue
+
+        # 4. 校验 nonce 存在(防重放基础)
+        nonce = art.get("nonce", "")
+        if not nonce:
+            failures.append(f"{atype} 缺少 nonce(防重放必需)")
+            continue
+
+        # 5. 校验 time_window 存在(时间窗约束)
+        time_window = art.get("time_window", {})
+        if not isinstance(time_window, dict) or not time_window:
+            failures.append(f"{atype} 缺少 time_window")
+            continue
+
+        # 6. 校验未过期(expires_at)
+        expires_at = art.get("expires_at", "")
+        if expires_at:
+            try:
+                expires_dt = datetime.fromisoformat(
+                    expires_at.replace("Z", "+00:00")
+                )
+                now_dt = datetime.fromisoformat(
+                    now_iso.replace("Z", "+00:00")
+                )
+                if expires_dt < now_dt:
+                    failures.append(
+                        f"{atype} 已过期(expires_at={expires_at})"
+                    )
+                    continue
+            except (ValueError, TypeError) as e:
+                failures.append(
+                    f"{atype} expires_at 解析失败: {e}"
+                )
+                continue
+
+        # 全部校验通过 — 标记 consumed
+        art["consumed"] = True
+        art["consumed_at"] = consumed_at
+        art["consumed_by"] = consumed_by
+        art["consumed_candidate"] = candidate_tag
+
+    if failures:
+        brief = failures[0]
+        if len(brief) > 90:
+            brief = brief[:87] + "..."
+        print(
+            f"R67 P1-11: evidence 消费失败\n"
+            f"  brief: {brief}\n"
+            f"  failures ({len(failures)}):",
+            file=sys.stderr,
+        )
+        for f in failures[:10]:
+            print(f"    - {f}", file=sys.stderr)
+        raise AppError(
+            ErrorCodes.PRODUCTION_EVIDENCE_INSUFFICIENT,
+            params={
+                "reason": brief,
+                "missing": "REPLAY_PROTECTION_VALIDATION",
+            },
+        )
+
+    # 原子写入更新后的 evidence(防部分写入竞争)
+    evidence["last_consumed_at"] = consumed_at
+    evidence["last_consumed_by"] = consumed_by
+    evidence["last_consumed_candidate"] = candidate_tag
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(
+        json.dumps(evidence, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    tmp_path.replace(path)
+
     return evidence
 
 

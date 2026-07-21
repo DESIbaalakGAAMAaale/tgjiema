@@ -44,6 +44,7 @@
       "sbom",
       "pip-audit",
       "trivy",
+      "verify-branch-ruleset",
       "rc-continuity",
       "crdb-ru-72h-attribution-gate",
       "release-summary"

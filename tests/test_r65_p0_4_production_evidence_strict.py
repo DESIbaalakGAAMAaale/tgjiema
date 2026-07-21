@@ -80,7 +80,10 @@ def _past_iso(days: int = 1) -> str:
 
 
 def _make_valid_artifact(artifact_type: str) -> dict:
-    """构造一个合法的、未过期的、已签名的 production artifact。"""
+    """构造一个合法的、未过期的、已签名的 production artifact。
+
+    R67 P1-11: 防重放字段 — nonce / attestation_digest / time_window / consumed。
+    """
     return {
         "artifact_type": artifact_type,
         "environment_id": f"prod-env-{artifact_type.lower()}",
@@ -93,6 +96,14 @@ def _make_valid_artifact(artifact_type: str) -> dict:
         "executed_by": "release-manager@example.com",
         "approved_by": "approver@example.com",
         "signature": "cosign-signature-base64-encoded-payload",
+        # R67 P1-11: 防重放字段
+        "nonce": f"nonce-{artifact_type.lower()}-{_past_iso(days=2)}",
+        "attestation_digest": "sha256:attestation0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        "time_window": {
+            "started_at": _past_iso(days=2),
+            "ended_at": _past_iso(days=1),
+        },
+        "consumed": False,
     }
 
 
@@ -103,7 +114,10 @@ def _make_valid_production_evidence() -> dict:
     - evidence_mode="production"
     - 顶层 signature 块(cosign, verified=true)
     - flags.skip 为空
-    - artifacts 数组含全部 5 类必需 artifact(均未过期、字段完整)
+    - artifacts 数组含全部 6 类必需 artifact(均未过期、字段完整)
+      R67 P0-04 新增 RC_VERIFY_3X
+    - R67 P1-11: 每个 artifact 含防重放字段(nonce / attestation_digest /
+      time_window / consumed)
     """
     artifact_types = [
         "SOAK_7DAY",
@@ -111,6 +125,7 @@ def _make_valid_production_evidence() -> dict:
         "OUTBOX_FAULT_INJECTION",
         "RU_72H",
         "SUPPLY_CHAIN",
+        "RC_VERIFY_3X",
     ]
     return {
         "schema_version": "r64_p1_12_v1",
@@ -429,10 +444,11 @@ class TestVerifyProductionPromotionAccepts:
     def test_each_artifact_has_all_required_fields(self, tmp_path):
         """场景 12:每个 artifact 含全部必需字段。
 
-        REQUIRED_ARTIFACT_FIELDS:
+        REQUIRED_ARTIFACT_FIELDS(15 个,R67 P1-11 新增 4 个防重放字段):
             artifact_type / environment_id / commit_sha / image_digest /
             started_at / ended_at / expires_at / raw_data_digest /
             executed_by / approved_by / signature
+            + nonce / attestation_digest / time_window / consumed  # R67 P1-11
 
         本测试同时验证:
         - 模块暴露 REQUIRED_ARTIFACT_FIELDS 常量
@@ -451,13 +467,15 @@ class TestVerifyProductionPromotionAccepts:
             "artifact_type", "environment_id", "commit_sha", "image_digest",
             "started_at", "ended_at", "expires_at", "raw_data_digest",
             "executed_by", "approved_by", "signature",
+            # R67 P1-11: 防重放字段
+            "nonce", "attestation_digest", "time_window", "consumed",
         }
         assert set(required) == expected_fields, (
-            f"REQUIRED_ARTIFACT_FIELDS 必须含全部 11 个字段,实际: {set(required)}"
+            f"REQUIRED_ARTIFACT_FIELDS 必须含全部 15 个字段,实际: {set(required)}"
         )
-        # 必须有 11 个字段
-        assert len(required) == 11, (
-            f"REQUIRED_ARTIFACT_FIELDS 应有 11 个字段,实际 {len(required)} 个"
+        # 必须有 15 个字段
+        assert len(required) == 15, (
+            f"REQUIRED_ARTIFACT_FIELDS 应有 15 个字段,实际 {len(required)} 个"
         )
 
         # 12b: 合法 fixture 每个 artifact 含全部字段

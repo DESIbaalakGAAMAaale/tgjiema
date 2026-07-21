@@ -241,15 +241,25 @@ USER_FACING_PATTERNS = [
 ]
 
 # 白名单目录/文件
+# R67 P1-08: scripts/ 不再整体跳过 — 通过 `is_skippable_script()` 细粒度判断。
+# 仅 GATE_SCANNERS 可跳过(避免自引用噪声);OFFLINE_RECOVERY_TOOLS
+# 与 GOVERNANCE_SCRIPTS 必须被扫描。
 SKIP_PATTERNS = [
     'tests/',
     'docs/',
-    'scripts/',
     '__pycache__',
     '.git/',
     'node_modules/',
     '.claude/',  # Claude IDE 工作目录(worktrees/sessions),非项目代码
 ]
+
+# R67 P1-08: scripts/ 下可跳过的文件清单(从 _script_categories 导入)
+try:
+    from scripts._script_categories import is_skippable_script as _is_skippable_script_p1_08
+except ImportError:
+    # _script_categories 不可用时 fail-closed:不跳过任何 scripts/ 文件
+    def _is_skippable_script_p1_08(rel_path: str) -> bool:
+        return False
 
 # 模块基线文件
 MODULE_BASELINE_FILE = Path(__file__).parent.parent / 'locales' / 'baseline.json'
@@ -382,9 +392,24 @@ def _is_protocol_constant(text: str) -> bool:
 # === 工具函数 ===
 
 def is_skipped(path: Path) -> bool:
+    """R67 P1-08: 检查路径是否应跳过扫描。
+
+    1. SKIP_PATTERNS 中的目录前缀跳过(tests/, docs/, __pycache__ 等)
+    2. scripts/ 下细粒度判断 — 仅 GATE_SCANNERS 可跳过;
+       OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描
+    """
+    path_str = str(path)
     for pattern in SKIP_PATTERNS:
-        if pattern in str(path):
+        if pattern in path_str:
             return True
+    # R67 P1-08: scripts/ 细粒度判断
+    # 标准化为相对仓库根的 POSIX 路径
+    try:
+        rel = path.resolve().relative_to(Path(__file__).resolve().parent.parent).as_posix()
+    except (ValueError, OSError):
+        rel = path_str
+    if rel.startswith("scripts/") and _is_skippable_script_p1_08(rel):
+        return True
     return False
 
 

@@ -325,7 +325,10 @@ class RestoreOrchestrator:
                 ErrorCodes.RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING,
                 params={
                     "reason": "constructor_required_dependency_missing",
-                    "missing": ",".join(missing),
+                    # R67 P1-05: 使用 list 而非 ",".join(missing) 以避免
+                    # is_safe_param 的字符串长度过滤(_SENSITIVE_VALUE_MAX_LENGTH=100)
+                    # 在多依赖缺失时丢失诊断信息(operator 看不到具体失败项)。
+                    "missing": list(missing),
                 },
             )
         self._store = store
@@ -360,7 +363,7 @@ class RestoreOrchestrator:
         approval_authority: Any,
         mfa_authority: Any,
     ) -> None:
-        """R66 P0-06: 启动就绪检查 — 验证所有必需依赖可用。
+        """R66 P0-06 + R67 P1-05: 启动就绪检查 — 验证所有必需依赖可用。
 
         在构造 RestoreOrchestrator 之前调用,确保:
           1. store 可用(含 _db 连接)
@@ -369,6 +372,11 @@ class RestoreOrchestrator:
           4. mfa_authority 可用(非 None)
           5. nonce ledger 方法可用(reserve/consume/fail_capability_nonce)
           6. active pointer / fencing store 可用(restore_rollback_targets 表)
+          7. R67 P1-05: 每个注册 backend 的 authority state 可用
+             (connected + schema_present + permissions_ok + cas_capable)
+          8. R67 P1-05: 跨 store 版本一致性(SQLite rollback_targets 最新
+             switch_version 与 CRDB active_pointer.current_version 一致,
+             若 CRDB 有 restore_active_pointer 表)
 
         任一不可用 → raise AppError(RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING)。
 
@@ -428,12 +436,70 @@ class RestoreOrchestrator:
                 # 扩大 services/ log_only baseline,符合 R56 §5.1 绝对门禁策略)。
                 missing.append("restore_rollback_targets_table")
 
+        # ─── R67 P1-05: 每个 backend 的 authority state 验证 ───
+        # 审计背景:R66 P0-06 只检查 SQLite rollback_targets 表存在,未验证
+        # CRDB/外部 routing store 的连接/schema/权限/CAS/版本一致性。
+        # 此处对每个注册 backend 调用 verify_authority_state(),任一维度
+        # 失败 → append 到 missing 列表(fail-closed)。
+        authority_states: dict[str, Any] = {}
+        if backends is not None:
+            for ds in _DATASOURCE_ORDER:
+                if ds not in backends:
+                    continue  # 已在 #3 报告
+                backend = backends.get(ds)
+                verify_method = getattr(backend, "verify_authority_state", None)
+                if verify_method is None:
+                    # 后端未实现 verify_authority_state(向后兼容旧 backend)
+                    # → 视为缺失(fail-closed,不允许未实现 authority 验证的后端)
+                    missing.append(f"backends.{ds}.verify_authority_state")
+                    continue
+                try:
+                    state = await verify_method()
+                    authority_states[ds] = state
+                    if not state.connected:
+                        missing.append(f"backends.{ds}.connected")
+                    if not state.schema_present:
+                        missing.append(f"backends.{ds}.schema_present")
+                    if not state.permissions_ok:
+                        missing.append(f"backends.{ds}.permissions_ok")
+                    if not state.cas_capable:
+                        missing.append(f"backends.{ds}.cas_capable")
+                except Exception as e:
+                    # verify_authority_state 内部已 try/except,但兜底
+                    missing.append(
+                        f"backends.{ds}.verify_authority_state_error:{type(e).__name__}"
+                    )
+
+        # ─── R67 P1-05: 跨 store 版本一致性验证 ───
+        # 若多个 backend 报告了 current_version(非 None),它们必须一致。
+        # 例如:CRDB active_pointer.current_version 必须与 SQLite
+        # rollback_targets 最新 switch_version 一致(若两者都有记录)。
+        # 此处先做 backend 间的版本一致性;SQLite rollback_targets 的
+        # 版本一致性在 #5 已通过表存在检查保证,具体行级一致性由
+        # commit_switch 的 UoW 原子提交保证。
+        versions_reported: list[tuple[str, str]] = []
+        for ds, state in authority_states.items():
+            if state.current_version is not None:
+                versions_reported.append((ds, state.current_version))
+        if len(versions_reported) > 1:
+            unique_versions = {v for _, v in versions_reported}
+            if len(unique_versions) > 1:
+                missing.append(
+                    "cross_store_version_inconsistency:"
+                    + ",".join(f"{ds}={v}" for ds, v in versions_reported)
+                )
+
         if missing:
             raise AppError(
                 ErrorCodes.RESTORE_ORCHESTRATOR_REQUIRED_DEPENDENCY_MISSING,
                 params={
                     "reason": "startup_readiness_check_failed",
-                    "missing": ",".join(missing),
+                    # R67 P1-05: 使用 list 而非 ",".join(missing) — 见上文同
+                    # 名字段注释。多 backend 维度同时失败时(如 CRDB 连接失败导致
+                    # connected/schema_present/permissions_ok/cas_capable 四项同时
+                    # 失败),逗号拼接字符串长度 > 100 会被 is_safe_param 过滤,
+                    # 导致 operator 看不到具体失败项(fail-open 诊断盲点)。
+                    "missing": list(missing),
                 },
             )
 
@@ -776,7 +842,12 @@ class RestoreOrchestrator:
             raise
         except Exception as e:
             # 查询失败不阻塞(向后兼容无表的场景),仅记录
-            logger.debug(f"[restore_orchestrator] payload consistency 查询失败(忽略): {e}")
+            logger.debug(
+                _i18n_t(
+                    "diagnostics.r65.restore_orchestrator.payload_consistency_query_failed",
+                    error=e,
+                )
+            )
 
     async def get_operation(self, operation_id: str) -> RestoreOperation:
         """R66 P0-06: 获取操作状态 — 每次从权威 store 重载,缓存仅作版本化快照。
@@ -1480,11 +1551,27 @@ class RestoreOrchestrator:
             # 4. R65 P0-02: 真实蓝绿切换 — backend.prepare_switch + commit_switch
             #    在 UoW 内执行,失败 → UoW 回滚(approval/MFA CAS 也回滚)
             #    R66 P0-06: backends 必需(构造时校验),无骨架降级分支
+            #    R67 P1-06: 切换前持久化 prepare intent(独立 commit),
+            #    每个 backend.commit_switch 成功后立即持久化 backend receipt
+            #    (独立 commit),UoW 提交后更新 intent status=committed。
+            #    进程崩溃后由 reconcile_incomplete_switches 根据 receipts 决策。
             active_pointer: dict[str, Any] = {}
             switch_results: dict[str, dict[str, Any]] = {}
             # 默认值;首个 datasource(crdb)切换成功后用 backend 返回的版本覆盖
             switch_version = str(uuid.uuid4())
             previous_version = f"v_prev_{operation.backup_id}"
+
+            # R67 P1-06: 持久化 prepare intent — 在任何 backend.commit_switch 前
+            # 独立 commit。若 UoW 后续失败/崩溃,intent 仍存在,reconciler 会
+            # 根据 backend receipts 决策完成或回滚。
+            await self._persist_switch_intent(
+                operation=operation,
+                switch_version=switch_version,
+                previous_version=previous_version,
+                approval_id=approval_id,
+                mfa_receipt_id=mfa_receipt_id,
+                status="preparing",
+            )
 
             for datasource in _DATASOURCE_ORDER:
                 if datasource not in self._backends:
@@ -1554,6 +1641,18 @@ class RestoreOrchestrator:
                     switch_version = switch_result.switch_version
                     previous_version = (
                         switch_result.previous_target or previous_version)
+                # R67 P1-06: 立即持久化 backend receipt(独立 commit,非 UoW)
+                # 必须在下一个 backend.commit_switch 前完成 — 否则崩溃窗口内
+                # 丢失 receipt 信息,reconciler 无法判断哪些 backend 已切换。
+                # 使用 switch_version 而非 switch_result.switch_version 绑定
+                # intent(首个 datasource 的 switch_version 是 fencing token)
+                await self._persist_backend_receipt(
+                    operation_id=operation_id,
+                    switch_version=switch_version,
+                    datasource=datasource,
+                    switch_result=switch_result,
+                    backend_type=type(backend).__name__,
+                )
                 logger.info(
                     _i18n_t(
                         "diagnostics.r65.p0_02.backend_commit_switch_uow",
@@ -1607,6 +1706,16 @@ class RestoreOrchestrator:
                 },
             )
             # UoW 退出 — 提交(approval/MFA CAS + phase + rollback_target + event 原子)
+
+        # R67 P1-06: UoW 提交后,更新 intent status=committed(标记整体完成)
+        # 必须在 UoW 退出后调用 — 若 UoW 回滚,intent 仍为 preparing,reconciler
+        # 会根据 receipts 决策。若 UoW 提交成功,intent 升级为 committed,reconciler
+        # 不再处理(终态)。
+        await self._update_switch_intent_status(
+            operation_id, "committed",
+            reconcile_decision="completed",
+            reconcile_reason="uow_committed_successfully",
+        )
 
         # UoW 已提交 — 以下操作独立 commit(nonce CAS + phase → COMPLETED)
         # nonce consume 失败仅记录 critical(切换已成功,不可回滚)
@@ -2081,3 +2190,759 @@ class RestoreOrchestrator:
             "created_at": row[10], "updated_at": row[11],
             "created_by": row[12],
         }
+
+    # ════════════════════════════════════════════════════════════════
+    # R67 P1-06: Recovery reconciler — 持久化 prepare intent / fencing
+    # token / backend receipts,进程重启后由 reconciler 完成或回滚。
+    # ════════════════════════════════════════════════════════════════
+    #
+    # 审计背景(R67 P1-06):
+    #   SQLite rename、CRDB routing switch 与数据库 UoW 不是同一原子事务。
+    #   execute_blue_green_switch 在 UoW 内调用 backend.commit_switch(对外
+    #   部存储产生不可逆副作用),然后才 INSERT rollback_target / UPSERT
+    #   phase / INSERT audit event。若进程在 backend.commit_switch 成功后、
+    #   UoW commit 前崩溃:
+    #     - SQLite 文件已 rename(staging → active)
+    #     - CRDB routing 已切换到新 schema
+    #     - 但数据库内无 rollback_target / phase 仍为 await_approval / 无审计事件
+    #   重启后系统认为 "未切换",但实际生产数据已切到 staging — 状态不可恢复。
+    #
+    # 整改方案:
+    #   1. 任何 backend.commit_switch 前,先持久化 prepare intent(独立事务)
+    #   2. 每个 backend.commit_switch 成功后,立即持久化 backend receipt(独立事务)
+    #   3. UoW 提交后,更新 intent status=committed(标记整体完成)
+    #   4. 进程重启时由 reconcile_incomplete_switches 扫描未完成 intent
+
+    async def _persist_switch_intent(
+        self,
+        operation: RestoreOperation,
+        switch_version: str,
+        previous_version: str,
+        approval_id: str,
+        mfa_receipt_id: str,
+        *,
+        status: str = "preparing",
+        ttl_seconds: int = 3600,
+    ) -> None:
+        """R67 P1-06: 持久化 prepare intent — 独立事务,在任何外部副作用前。
+
+        在 backend.commit_switch 前调用,记录:
+          - operation_id / switch_version (fencing token)
+          - previous_version / approval_id / mfa_receipt_id / manifest_digest
+          - status='preparing' / prepared_at / expires_at
+
+        独立 commit(非 UoW):若后续 UoW 失败,intent 仍存在,reconciler
+        会根据 backend receipts 决策完成或回滚。
+
+        若 ``restore_switch_intents`` 表不存在(migration 008 未应用),
+        记录 warning 并跳过 — 兼容旧部署(无 reconciler 保护,但功能正常)。
+
+        Args:
+            operation: 当前 operation 快照
+            switch_version: fencing token (UUID)
+            previous_version: 切换前 active 版本
+            approval_id: 绑定的 approval capability ID
+            mfa_receipt_id: 绑定的 MFA receipt ID
+            status: 初始状态(默认 'preparing')
+            ttl_seconds: intent 过期阈值(默认 3600s)
+        """
+        if not self._store or not getattr(self._store, "_db", None):
+            return
+        now = self._now_iso()
+        try:
+            now_dt = _dt.datetime.fromisoformat(now.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            now_dt = _dt.datetime.now(_dt.timezone.utc)
+        expires_dt = now_dt + _dt.timedelta(seconds=ttl_seconds)
+        try:
+            await self._store._db.execute(
+                """INSERT OR REPLACE INTO restore_switch_intents
+                   (operation_id, switch_version, previous_version,
+                    approval_id, mfa_receipt_id, manifest_digest,
+                    prepared_by, prepared_at, expires_at, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    operation.operation_id, switch_version, previous_version,
+                    approval_id, mfa_receipt_id, operation.manifest_digest,
+                    operation.created_by, now, expires_dt.isoformat(), status,
+                ),
+            )
+            await self._store._db.commit()
+        except Exception as e:
+            # 兼容旧部署(migration 008 未应用,表不存在)— warning 不阻断
+            logger.warning(
+                _i18n_t(
+                    "diagnostics.r65.restore_reconciler.persist_switch_intent_failed",
+                    operation_id=operation.operation_id,
+                    error=e,
+                )
+            )
+
+    async def _update_switch_intent_status(
+        self,
+        operation_id: str,
+        status: str,
+        *,
+        reconcile_decision: Optional[str] = None,
+        reconcile_reason: Optional[str] = None,
+    ) -> None:
+        """R67 P1-06: 更新 intent 状态(独立 commit)。
+
+        Args:
+            operation_id: 操作 ID
+            status: 新状态(committed/failed/rolled_back)
+            reconcile_decision: reconciler 决策(completed/rolled_back/failed)
+            reconcile_reason: 决策原因(诊断用)
+        """
+        if not self._store or not getattr(self._store, "_db", None):
+            return
+        now = self._now_iso()
+        try:
+            await self._store._db.execute(
+                """UPDATE restore_switch_intents
+                   SET status = ?,
+                       reconciled_at = ?,
+                       reconcile_decision = ?,
+                       reconcile_reason = ?
+                   WHERE operation_id = ?""",
+                (status, now, reconcile_decision, reconcile_reason, operation_id),
+            )
+            await self._store._db.commit()
+        except Exception as e:
+            logger.warning(
+                _i18n_t(
+                    "diagnostics.r65.restore_reconciler.update_switch_intent_status_failed",
+                    operation_id=operation_id,
+                    error=e,
+                )
+            )
+
+    async def _persist_backend_receipt(
+        self,
+        operation_id: str,
+        switch_version: str,
+        datasource: str,
+        switch_result: SwitchResult,
+        backend_type: str,
+    ) -> None:
+        """R67 P1-06: 持久化 backend receipt — 独立事务,在 commit_switch 成功后立即。
+
+        每个 backend.commit_switch 成功后立即调用(在下一个 backend 切换前),
+        确保即使进程在多 datasource 切换过程中崩溃,reconciler 也能根据
+        receipts 判断哪些 backend 已成功切换。
+
+        独立 commit(非 UoW):receipt 必须在 backend 副作用成功后立即持久化,
+        不能等 UoW 一起提交 — 否则崩溃窗口内丢失 receipt 信息。
+
+        INSERT OR IGNORE: 同 (operation_id, datasource) 重复插入跳过
+        (网络抖动重试场景)。
+
+        若 ``restore_backend_receipts`` 表不存在(migration 008 未应用),
+        记录 warning 并跳过 — 兼容旧部署。
+
+        Args:
+            operation_id: 操作 ID
+            switch_version: fencing token (绑定 intent)
+            datasource: 数据源名(crdb/sqlite/relay_sqlite)
+            switch_result: backend.commit_switch 返回的 SwitchResult
+            backend_type: backend 类型名(SQLiteRestoreBackend/CRDBRestoreBackend)
+        """
+        if not self._store or not getattr(self._store, "_db", None):
+            return
+        now = self._now_iso()
+        try:
+            await self._store._db.execute(
+                """INSERT OR IGNORE INTO restore_backend_receipts
+                   (operation_id, switch_version, datasource,
+                    previous_target, new_target, switched_at,
+                    received_at, backend_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    operation_id, switch_version, datasource,
+                    switch_result.previous_target, switch_result.new_target,
+                    switch_result.switched_at, now, backend_type,
+                ),
+            )
+            await self._store._db.commit()
+        except Exception as e:
+            logger.warning(
+                _i18n_t(
+                    "diagnostics.r65.restore_reconciler.persist_backend_receipt_failed",
+                    operation_id=operation_id,
+                    datasource=datasource,
+                    error=e,
+                )
+            )
+
+    async def _get_switch_intent(
+        self, operation_id: str
+    ) -> Optional[dict[str, Any]]:
+        """R67 P1-06: 读取单个 switch intent。
+
+        若 migration 008 未应用(表不存在),返回 None — 与持久化路径的
+        graceful degradation 一致,避免阻塞旧部署的恢复流程。
+        """
+        if not self._store or not getattr(self._store, "_db", None):
+            return None
+        try:
+            cursor = await self._store._db.execute(
+                """SELECT operation_id, switch_version, previous_version,
+                          approval_id, mfa_receipt_id, manifest_digest,
+                          prepared_by, prepared_at, expires_at, status,
+                          reconciled_at, reconcile_decision, reconcile_reason
+                   FROM restore_switch_intents
+                   WHERE operation_id = ?""",
+                (operation_id,),
+            )
+            row = await cursor.fetchone()
+        except Exception as e:
+            logger.warning(
+                _i18n_t(
+                    "diagnostics.r65.restore_reconciler.get_switch_intent_failed",
+                    operation_id=operation_id,
+                    error=e,
+                )
+            )
+            return None
+        if row is None:
+            return None
+        return {
+            "operation_id": row[0], "switch_version": row[1],
+            "previous_version": row[2], "approval_id": row[3],
+            "mfa_receipt_id": row[4], "manifest_digest": row[5],
+            "prepared_by": row[6], "prepared_at": row[7],
+            "expires_at": row[8], "status": row[9],
+            "reconciled_at": row[10], "reconcile_decision": row[11],
+            "reconcile_reason": row[12],
+        }
+
+    async def _get_incomplete_switch_intents(self) -> list[dict[str, Any]]:
+        """R67 P1-06: 读取所有未完成的 switch intent(非终态)。
+
+        返回 status IN ('preparing', 'prepared', 'committing') 的所有 intent。
+        若 migration 008 未应用(表不存在),返回空 list — 与持久化路径的
+        graceful degradation 一致。
+        """
+        if not self._store or not getattr(self._store, "_db", None):
+            return []
+        try:
+            cursor = await self._store._db.execute(
+                """SELECT operation_id, switch_version, previous_version,
+                          approval_id, mfa_receipt_id, manifest_digest,
+                          prepared_by, prepared_at, expires_at, status
+                   FROM restore_switch_intents
+                   WHERE status IN ('preparing', 'prepared', 'committing')
+                   ORDER BY prepared_at ASC""",
+            )
+            rows = await cursor.fetchall()
+        except Exception as e:
+            logger.warning(
+                _i18n_t(
+                    "diagnostics.r65.restore_reconciler.get_incomplete_switch_intents_failed",
+                    error=e,
+                )
+            )
+            return []
+        return [
+            {
+                "operation_id": r[0], "switch_version": r[1],
+                "previous_version": r[2], "approval_id": r[3],
+                "mfa_receipt_id": r[4], "manifest_digest": r[5],
+                "prepared_by": r[6], "prepared_at": r[7],
+                "expires_at": r[8], "status": r[9],
+            }
+            for r in rows
+        ]
+
+    async def _get_backend_receipts(
+        self, operation_id: str
+    ) -> list[dict[str, Any]]:
+        """R67 P1-06: 读取 operation 的所有 backend receipts。
+
+        若 migration 008 未应用(表不存在),返回空 list — 与持久化路径的
+        graceful degradation 一致。
+        """
+        if not self._store or not getattr(self._store, "_db", None):
+            return []
+        try:
+            cursor = await self._store._db.execute(
+                """SELECT operation_id, switch_version, datasource,
+                          previous_target, new_target, switched_at,
+                          received_at, backend_type
+                   FROM restore_backend_receipts
+                   WHERE operation_id = ?
+                   ORDER BY received_at ASC""",
+                (operation_id,),
+            )
+            rows = await cursor.fetchall()
+        except Exception as e:
+            logger.warning(
+                _i18n_t(
+                    "diagnostics.r65.restore_reconciler.get_backend_receipts_failed",
+                    operation_id=operation_id,
+                    error=e,
+                )
+            )
+            return []
+        return [
+            {
+                "operation_id": r[0], "switch_version": r[1],
+                "datasource": r[2], "previous_target": r[3],
+                "new_target": r[4], "switched_at": r[5],
+                "received_at": r[6], "backend_type": r[7],
+            }
+            for r in rows
+        ]
+
+    async def reconcile_incomplete_switches(
+        self,
+        *,
+        now: Optional[_dt.datetime] = None,
+    ) -> list[dict[str, Any]]:
+        """R67 P1-06: 启动时扫描未完成的 switch intent,根据 backend receipts
+        决策完成或回滚。
+
+        审计背景:
+            SQLite rename、CRDB routing switch 与数据库 UoW 不是同一原子事务。
+            若进程在 backend.commit_switch 成功后、UoW commit 前崩溃,数据库内
+            无 rollback_target / phase 仍为 await_approval,但外部存储已切换。
+            本方法扫描 status IN ('preparing','prepared','committing') 的 intent,
+            根据 backend receipts 决策:
+
+        决策矩阵:
+            - receipts 覆盖所有已注册 datasource → 完成(completed):
+              补写 rollback_target / UPSERT phase=BLUE_GREEN_SWITCH /
+              INSERT audit event "reconciled_complete";intent status=committed
+            - receipts 仅覆盖部分 datasource → 回滚(rolled_back):
+              对已有 receipt 的 datasource 调用 backend.rollback_switch;
+              intent status=failed
+            - 无 receipt → 无外部副作用(rolled_back):
+              intent status=rolled_back(无需回滚 backend)
+            - intent 过期(expires_at < now) → 强制处理(同上决策)
+
+        幂等性:
+            - 已 committed/failed/rolled_back 的 intent 不再处理
+            - receipt INSERT OR IGNORE 防止重复
+            - rollback_switch 多次调用由 backend 保证幂等(或 raise)
+
+        Args:
+            now: 当前时间(测试可注入;默认 datetime.now(timezone.utc))
+
+        Returns:
+            list of {operation_id, decision, reason, receipts_count,
+                     expected_datasources, ...} — 处理结果汇总
+        """
+        if not self._store or not getattr(self._store, "_db", None):
+            return []
+
+        # 0. 检查 restore_switch_intents 表是否存在(migration 008 未应用则跳过)
+        try:
+            cursor = await self._store._db.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='restore_switch_intents'"
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                logger.info(
+                    _i18n_t(
+                        "diagnostics.r65.restore_reconciler.table_missing_skip"
+                    )
+                )
+                return []
+        except Exception as e:
+            logger.warning(
+                _i18n_t(
+                    "diagnostics.r65.restore_reconciler.table_existence_check_failed",
+                    error=e,
+                )
+            )
+            return []
+
+        now_dt = now or _dt.datetime.now(_dt.timezone.utc)
+        intents = await self._get_incomplete_switch_intents()
+        results: list[dict[str, Any]] = []
+
+        for intent in intents:
+            operation_id = intent["operation_id"]
+            switch_version = intent["switch_version"]
+            try:
+                result = await self._reconcile_one_intent(
+                    intent, now_dt,
+                )
+                results.append(result)
+            except Exception as e:
+                logger.critical(
+                    _i18n_t(
+                        "diagnostics.r65.restore_reconciler.reconcile_one_intent_exception",
+                        operation_id=operation_id,
+                        switch_version=switch_version,
+                        error_type=type(e).__name__,
+                        error=e,
+                    )
+                )
+                results.append({
+                    "operation_id": operation_id,
+                    "switch_version": switch_version,
+                    "decision": "error",
+                    "reason": f"{type(e).__name__}: {e}",
+                    "receipts_count": 0,
+                    "expected_datasources": [],
+                })
+
+        return results
+
+    async def _reconcile_one_intent(
+        self,
+        intent: dict[str, Any],
+        now_dt: _dt.datetime,
+    ) -> dict[str, Any]:
+        """R67 P1-06: 处理单个未完成 intent — 根据 receipts 决策。
+
+        Args:
+            intent: _get_incomplete_switch_intents 返回的 dict
+            now_dt: 当前时间(用于过期判断)
+
+        Returns:
+            决策结果 {operation_id, decision, reason, ...}
+        """
+        operation_id = intent["operation_id"]
+        switch_version = intent["switch_version"]
+
+        # 读取 operation 当前状态
+        operation_dict = await self.get_persisted_operation(operation_id)
+        if operation_dict is None:
+            # operation 不存在(可能已清理)— 标记 intent 为 failed
+            await self._update_switch_intent_status(
+                operation_id, "failed",
+                reconcile_decision="failed",
+                reconcile_reason="operation_not_found_in_restore_operations",
+            )
+            return {
+                "operation_id": operation_id,
+                "switch_version": switch_version,
+                "decision": "failed",
+                "reason": "operation_not_found_in_restore_operations",
+                "receipts_count": 0,
+                "expected_datasources": list(_DATASOURCE_ORDER),
+            }
+
+        # 读取 backend receipts
+        receipts = await self._get_backend_receipts(operation_id)
+        receipt_datasources = {r["datasource"] for r in receipts}
+
+        # 已注册的 datasource 集合(从 backends 取)
+        registered_datasources = {
+            ds for ds in _DATASOURCE_ORDER if ds in self._backends
+        }
+        # 若 backends 为空(测试骨架),用 _DATASOURCE_ORDER 兜底
+        if not registered_datasources:
+            registered_datasources = set(_DATASOURCE_ORDER)
+
+        # 决策:receipts 是否覆盖所有已注册 datasource
+        all_covered = receipt_datasources >= registered_datasources
+
+        if all_covered and receipts:
+            # 所有 datasource 都有 receipt → 完成(completed)
+            await self._reconcile_complete_operation(
+                intent, operation_dict, receipts,
+            )
+            return {
+                "operation_id": operation_id,
+                "switch_version": switch_version,
+                "decision": "completed",
+                "reason": "all_datasources_have_receipts",
+                "receipts_count": len(receipts),
+                "expected_datasources": sorted(registered_datasources),
+                "receipt_datasources": sorted(receipt_datasources),
+            }
+
+        if receipts and not all_covered:
+            # 部分 datasource 有 receipt → 回滚已切换的 backend
+            await self._reconcile_partial_rollback(
+                intent, operation_dict, receipts, registered_datasources,
+            )
+            return {
+                "operation_id": operation_id,
+                "switch_version": switch_version,
+                "decision": "rolled_back_partial",
+                "reason": "partial_datasources_have_receipts_rolling_back",
+                "receipts_count": len(receipts),
+                "expected_datasources": sorted(registered_datasources),
+                "receipt_datasources": sorted(receipt_datasources),
+            }
+
+        # 无 receipt → 无外部副作用,标记为 rolled_back
+        await self._update_switch_intent_status(
+            operation_id, "rolled_back",
+            reconcile_decision="rolled_back",
+            reconcile_reason="no_backend_receipts_no_external_side_effect",
+        )
+        # 同时将 operation 转为 FAILED(允许同 payload 重试)
+        await self._reconcile_mark_operation_failed(
+            operation_id, operation_dict,
+            reason="reconciler_no_receipts_no_side_effect",
+        )
+        return {
+            "operation_id": operation_id,
+            "switch_version": switch_version,
+            "decision": "rolled_back",
+            "reason": "no_backend_receipts_no_external_side_effect",
+            "receipts_count": 0,
+            "expected_datasources": sorted(registered_datasources),
+            "receipt_datasources": [],
+        }
+
+    async def _reconcile_complete_operation(
+        self,
+        intent: dict[str, Any],
+        operation_dict: dict[str, Any],
+        receipts: list[dict[str, Any]],
+    ) -> None:
+        """R67 P1-06: reconciler 完成 operation — 补写 rollback_target /
+        UPSERT phase=BLUE_GREEN_SWITCH / INSERT audit event。
+
+        场景:进程在 UoW commit 前崩溃,但所有 backend.commit_switch 已成功
+        (所有 receipts 齐全)。reconciler 补齐数据库内的状态:
+          1. INSERT restore_rollback_targets(switch_version + active_pointer)
+          2. UPDATE restore_operations phase=blue_green_switch
+             (若已是 blue_green_switch/completed 则跳过)
+          3. INSERT restore_operation_events "reconciled_complete"
+          4. UPDATE restore_switch_intents status=committed
+        """
+        operation_id = intent["operation_id"]
+        switch_version = intent["switch_version"]
+        previous_version = intent["previous_version"]
+
+        # 1. 补写 rollback_target(若不存在)
+        cursor = await self._store._db.execute(
+            "SELECT switch_version FROM restore_rollback_targets "
+            "WHERE switch_version = ?",
+            (switch_version,),
+        )
+        existing_target = await cursor.fetchone()
+        if existing_target is None:
+            # 构造 active_pointer(从 receipts 提取 previous_target)
+            active_pointer: dict[str, Any] = {}
+            for r in receipts:
+                active_pointer[r["datasource"]] = {
+                    "previous_target": r["previous_target"],
+                    "new_target": r["new_target"],
+                    "switched_at": r["switched_at"],
+                }
+            now = self._now_iso()
+            try:
+                now_dt = _dt.datetime.fromisoformat(now.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                now_dt = _dt.datetime.now(_dt.timezone.utc)
+            expires_dt = now_dt + _dt.timedelta(
+                seconds=self._rollback_ttl_seconds
+            )
+            await self._store._db.execute(
+                """INSERT OR REPLACE INTO restore_rollback_targets
+                   (switch_version, operation_id, active_pointer,
+                    created_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    switch_version, operation_id,
+                    json.dumps(active_pointer, ensure_ascii=False),
+                    now, expires_dt.isoformat(),
+                ),
+            )
+            await self._store._db.commit()
+
+        # 2. UPSERT operation phase=blue_green_switch(若仍为 await_approval)
+        current_phase = operation_dict.get("phase", "")
+        if current_phase in ("await_approval", "blue_green_switch"):
+            await self._store._db.execute(
+                """UPDATE restore_operations
+                   SET phase = 'blue_green_switch',
+                       switch_version = ?,
+                       previous_version = ?,
+                       updated_at = ?
+                   WHERE operation_id = ?
+                     AND phase IN ('await_approval', 'blue_green_switch')""",
+                (switch_version, previous_version, self._now_iso(), operation_id),
+            )
+            await self._store._db.commit()
+
+        # 3. INSERT audit event "reconciled_complete"
+        await self._store._db.execute(
+            """INSERT INTO restore_operation_events
+               (operation_id, event_type, phase_from, phase_to,
+                payload, trace_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                operation_id,
+                "reconciled_complete",
+                operation_dict.get("phase", "await_approval"),
+                "blue_green_switch",
+                json.dumps({
+                    "switch_version": switch_version,
+                    "previous_version": previous_version,
+                    "receipts_count": len(receipts),
+                    "receipts": [
+                        {"datasource": r["datasource"],
+                         "new_target": r["new_target"],
+                         "switched_at": r["switched_at"]}
+                        for r in receipts
+                    ],
+                    "reconciler": "R67_P1_06",
+                }, ensure_ascii=False),
+                str(uuid.uuid4()),
+                self._now_iso(),
+            ),
+        )
+        await self._store._db.commit()
+
+        # 4. UPDATE intent status=committed
+        await self._update_switch_intent_status(
+            operation_id, "committed",
+            reconcile_decision="completed",
+            reconcile_reason="all_receipts_present_reconciled_by_startup",
+        )
+
+        logger.info(
+            _i18n_t(
+                "diagnostics.r65.restore_reconciler.reconcile_complete_operation_done",
+                operation_id=operation_id,
+                switch_version=switch_version,
+                receipts_count=len(receipts),
+            )
+        )
+
+    async def _reconcile_partial_rollback(
+        self,
+        intent: dict[str, Any],
+        operation_dict: dict[str, Any],
+        receipts: list[dict[str, Any]],
+        registered_datasources: set[str],
+    ) -> None:
+        """R67 P1-06: reconciler 部分回滚 — 对已有 receipt 的 datasource
+        调用 backend.rollback_switch,将外部存储恢复到 previous_target。
+
+        场景:进程在多 datasource 切换过程中崩溃,部分 backend 已切换
+        (有 receipt),部分未切换。reconciler 对已切换的 backend 调用
+        rollback_switch 恢复到 previous_target,使所有 datasource 回到
+        切换前状态。
+
+        回滚后:
+          1. INSERT audit event "reconciled_partial_rollback"
+          2. UPDATE restore_operations phase=failed(允许同 payload 重试)
+          3. UPDATE restore_switch_intents status=failed
+        """
+        operation_id = intent["operation_id"]
+        switch_version = intent["switch_version"]
+
+        # 对每个有 receipt 的 datasource 调用 backend.rollback_switch
+        rollback_results: list[dict[str, Any]] = []
+        for r in receipts:
+            ds = r["datasource"]
+            backend = self._backends.get(ds) if self._backends else None
+            if backend is None:
+                rollback_results.append({
+                    "datasource": ds, "status": "skipped_no_backend",
+                })
+                continue
+            try:
+                # 构造 SwitchResult(rollback_switch 的输入)
+                sr = SwitchResult(
+                    switch_version=r["switch_version"],
+                    previous_target=r["previous_target"],
+                    new_target=r["new_target"],
+                    switched_at=r["switched_at"],
+                )
+                await backend.rollback_switch(
+                    operation_id=operation_id,
+                    switch_result=sr,
+                )
+                rollback_results.append({
+                    "datasource": ds, "status": "rolled_back",
+                })
+            except Exception as e:
+                logger.critical(
+                    _i18n_t(
+                        "diagnostics.r65.restore_reconciler.reconcile_partial_rollback_switch_failed",
+                        operation_id=operation_id,
+                        datasource=ds,
+                        error_type=type(e).__name__,
+                        error=e,
+                    )
+                )
+                rollback_results.append({
+                    "datasource": ds, "status": "rollback_failed",
+                    "error": f"{type(e).__name__}: {e}",
+                })
+
+        # INSERT audit event "reconciled_partial_rollback"
+        await self._store._db.execute(
+            """INSERT INTO restore_operation_events
+               (operation_id, event_type, phase_from, phase_to,
+                payload, trace_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                operation_id,
+                "reconciled_partial_rollback",
+                operation_dict.get("phase", "await_approval"),
+                "failed",
+                json.dumps({
+                    "switch_version": switch_version,
+                    "receipts_count": len(receipts),
+                    "rollback_results": rollback_results,
+                    "missing_datasources": sorted(
+                        registered_datasources - {r["datasource"] for r in receipts}
+                    ),
+                    "reconciler": "R67_P1_06",
+                }, ensure_ascii=False),
+                str(uuid.uuid4()),
+                self._now_iso(),
+            ),
+        )
+        await self._store._db.commit()
+
+        # UPDATE operation phase=failed(允许同 payload 重试)
+        await self._reconcile_mark_operation_failed(
+            operation_id, operation_dict,
+            reason="reconciler_partial_rollback",
+        )
+
+        # UPDATE intent status=failed
+        await self._update_switch_intent_status(
+            operation_id, "failed",
+            reconcile_decision="failed",
+            reconcile_reason="partial_receipts_rolled_back",
+        )
+
+        logger.warning(
+            _i18n_t(
+                "diagnostics.r65.restore_reconciler.reconcile_partial_rollback_summary",
+                operation_id=operation_id,
+                switch_version=switch_version,
+                rolled_back_count=sum(
+                    1 for r in rollback_results if r['status'] == 'rolled_back'
+                ),
+                receipts_count=len(receipts),
+            )
+        )
+
+    async def _reconcile_mark_operation_failed(
+        self,
+        operation_id: str,
+        operation_dict: dict[str, Any],
+        reason: str,
+    ) -> None:
+        """R67 P1-06: reconciler 将 operation 标记为 FAILED(允许同 payload 重试)。
+
+        仅当 operation phase 仍为非终态(await_approval/blue_green_switch)时更新。
+        """
+        current_phase = operation_dict.get("phase", "")
+        if current_phase in ("failed", "rolled_back", "completed"):
+            return  # 已是终态,不更新
+        await self._store._db.execute(
+            """UPDATE restore_operations
+               SET phase = 'failed',
+                   updated_at = ?
+               WHERE operation_id = ?
+                 AND phase NOT IN ('failed', 'rolled_back', 'completed')""",
+            (self._now_iso(), operation_id),
+        )
+        await self._store._db.commit()

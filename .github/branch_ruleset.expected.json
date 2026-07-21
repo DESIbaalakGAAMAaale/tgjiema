@@ -1,0 +1,44 @@
+{
+  "_comment": "R67 P0-01: Branch Ruleset 期望配置(checked-in 基线)。本文件由 scripts/configure_branch_ruleset.sh 在生产环境应用,任何修改都需同步更新本基线。审计要求:为 master/main branch 配置强制签名 commits、禁止 force push、禁止删除、禁止 admin bypass(与 required_pull_request_reviews 配合实现 PR-only 流程)。本 ruleset 与 branch_protection.expected.json 互补:BP 提供基本 required_status_checks / required_reviews;Ruleset 提供签名强制 + 不可变历史。",
+  "_schema": "github_repository_ruleset_api_response",
+  "_r67_p0_01_requirements": {
+    "target": "branch — ruleset 针对分支引用",
+    "source_type": "Repository — 仓库级 ruleset",
+    "enforcement": "active — 规则强制执行(非 evaluate / disabled)",
+    "conditions.ref_name.include": "[\"refs/heads/master\", \"refs/heads/main\"] — 覆盖 master 与 main",
+    "creation": "允许(分支已存在),不限制创建",
+    "deletion": "false — 禁止删除 master/main",
+    "non_fast_forward": "false — 禁止 force push(历史不可变)",
+    "update": "false — 禁止直接 update(必须走 PR)",
+    "required_signatures": "true — 所有推送 commit 必须经过 GPG 签名验证",
+    "bypass_actors": "[] — 空:禁止任何角色 bypass(包括 admin,符合 R67 P0-01 '禁止 admin bypass')"
+  },
+  "description": "R67 P0-01: master/main branch 不可变 ruleset — 强制 GPG 签名 commits、禁止 force push/delete、禁止 admin bypass。所有变更必须通过 PR(由 branch protection required_pull_request_reviews 强制 2 名独立 reviewer + conversation resolution)。",
+  "name": "R67 P0-01 Branch Immutability Ruleset",
+  "target": "branch",
+  "source_type": "Repository",
+  "enforcement": "active",
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/heads/master", "refs/heads/main"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {"type": "deletion"},
+    {"type": "non_fast_forward"},
+    {"type": "update"},
+    {"type": "required_signatures"},
+    {
+      "type": "pull_request",
+      "parameters": {
+        "required_reviewers": 2,
+        "dismiss_stale_reviews_on_push": true,
+        "require_code_owner_review": false,
+        "require_last_push_approval": false,
+        "required_review_thread_resolution": true
+      }
+    }
+  ],
+  "bypass_actors": []
+}

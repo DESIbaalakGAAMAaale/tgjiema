@@ -185,6 +185,7 @@
     "i18n.locale.not_bound": "i18n 出口边界违规:生产代码调用翻译接口未显式绑定 locale(key={key}, caller={caller}, trace_id={trace_id})",
     "i18n.parse.failed": "i18n 运行时解析失败,已 fail-closed 拒绝向用户暴露原始 ICU 模板(key={key}, locale={locale}, reason={reason}, trace_id={trace_id})",
     "production.evidence.insufficient": "生产证据不足,无法晋级: {reason} (缺失/过期: {missing})",
+    "production.evidence.already_consumed": "生产证据已被其他候选消费,禁止跨候选复用: 证据类型={artifact_type}, 已消费候选={consumed_candidate}, 当前候选={candidate_tag}",
     "command.concurrent.claim": "操作已被其他 worker 抢占或状态已变更(action_id={action_id})",
     "command.hash.mismatch": "请求参数与上次执行不一致(防篡改拒绝,action_id={action_id})",
     "db.cache.unavailable": "SQLite 缓存不可用(component={component})",
@@ -2641,7 +2642,12 @@
         "crdb_commit_switch": "[restore_backend.crdb] commit_switch: {previous} → {new} (operation_id={operation_id}, switch_version={switch_version})",
         "crdb_rollback_switch": "[restore_backend.crdb] rollback_switch: {current} → {previous} (operation_id={operation_id})",
         "crdb_destroyed_schema": "[restore_backend.crdb] 已销毁 schema: {schema}",
-        "crdb_destroy_failed": "[restore_backend.crdb] 销毁失败 (已忽略): {error}"
+        "crdb_destroy_failed": "[restore_backend.crdb] 销毁失败 (已忽略): {error}",
+        "verify_authority_state_rollback_after_permissions_failed": "[restore_backends] verify_authority_state 权限探测后回滚失败: {error}",
+        "verify_authority_state_rollback_after_cas_failed": "[restore_backends] verify_authority_state CAS 探测后回滚失败: {error}",
+        "verify_authority_state_temp_table_cleanup_failed": "[restore_backends] verify_authority_state 临时表清理失败: {error}",
+        "verify_authority_state_conn_close_failed": "[restore_backends] verify_authority_state 连接关闭失败: {error}",
+        "verify_authority_state_crdb_test_schema_cleanup_failed": "[restore_backends] CRDB verify_authority_state 测试 schema 清理失败 (schema={schema}): {error}"
       },
       "p0_03": {
         "approval_cas_consumed": "[restore_capabilities] R65 P0-03 审批权威 CAS 消费成功 approval_id={aid} 审批人={approver_id} action_hash={hash}...",
@@ -2659,6 +2665,23 @@
         "rollback_failed": "[restore_orchestrator] 回滚 {datasource} 失败: {error}",
         "backend_destroy": "[restore_orchestrator] R65 P0-02 后端.销毁 {datasource}: {target}",
         "backend_destroy_failed_fallback": "[restore_orchestrator] 后端.销毁 {datasource} 失败 (回退到文件删除): {error}"
+      },
+      "restore_reconciler": {
+        "persist_switch_intent_failed": "[restore_reconciler] 持久化 switch_intent 失败 (operation_id={operation_id}): {error}",
+        "update_switch_intent_status_failed": "[restore_reconciler] 更新 switch_intent status 失败 (operation_id={operation_id}): {error}",
+        "persist_backend_receipt_failed": "[restore_reconciler] 持久化后端回执失败 (operation_id={operation_id}, 数据源={datasource}): {error}",
+        "get_switch_intent_failed": "[restore_reconciler] 读取 switch_intent 失败 (operation_id={operation_id}): {error}",
+        "get_incomplete_switch_intents_failed": "[restore_reconciler] 读取未完成 switch_intents 失败: {error}",
+        "get_backend_receipts_failed": "[restore_reconciler] 读取 backend_receipts 失败 (operation_id={operation_id}): {error}",
+        "table_missing_skip": "[restore_reconciler] restore_switch_intents 表不存在 (迁移 008 未应用)— 跳过 R67 P1-06 对账器",
+        "table_existence_check_failed": "[restore_reconciler] 检查 restore_switch_intents 表失败: {error}",
+        "reconcile_one_intent_exception": "[restore_reconciler] 对账 operation_id={operation_id} switch_version={switch_version} 异常: {error_type}: {error}",
+        "reconcile_complete_operation_done": "[restore_reconciler] operation_id={operation_id} switch_version={switch_version} 已由对账器完成 (回执数={receipts_count})",
+        "reconcile_partial_rollback_switch_failed": "[restore_reconciler] operation_id={operation_id} 数据源={datasource} 回滚切换失败: {error_type}: {error}",
+        "reconcile_partial_rollback_summary": "[restore_reconciler] operation_id={operation_id} switch_version={switch_version} 部分回执,已回滚 {rolled_back_count}/{receipts_count} 个后端"
+      },
+      "restore_orchestrator": {
+        "payload_consistency_query_failed": "[restore_orchestrator] 负载一致性查询失败(忽略): {error}"
       }
     }
   }

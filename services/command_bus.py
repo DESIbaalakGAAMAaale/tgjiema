@@ -2384,6 +2384,16 @@ def make_restore_backup_command(
         # 让 restore() 通过 approval_action_id 反查 principal_id 并校验审批状态
         approval_action_id = params.get("approval_action_id")
 
+        # R67 P0-06: 生产环境硬守卫 — 在 capability-seal 之前执行。
+        # 即使设置 ALLOW_LEGACY_RESTORE=1,生产环境(APP_ENV=production|staging)
+        # 也无条件拒绝调用本 legacy 入口。守卫直接读取 APP_ENV,不依赖
+        # Settings 实例化,避免"未加载 Settings 即可绕过"的漏洞。
+        from services._production_guard import assert_no_legacy_restore_in_production
+        assert_no_legacy_restore_in_production(
+            entry_point="command_bus.make_restore_backup_command handler",
+            caller="command_bus.make_restore_backup_command",
+        )
+
         # R65 P0-07 / P1-07: capability-seal — 旧直接 restore writer 已被封存。
         # 生产恢复必须改走 RestoreOrchestrator 蓝绿切换路径(staging → active,
         # 禁止原地覆盖生产数据)。逃生舱:ALLOW_LEGACY_RESTORE=1 仅限 tests/ 与

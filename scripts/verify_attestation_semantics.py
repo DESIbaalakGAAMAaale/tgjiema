@@ -18,7 +18,12 @@
           (与 release_manifest.source_repository 对齐)
         - predicate.invocation.configSource.digest.sha1 == release_manifest.source_commit
           (兼容 source_commit_sha 别名)
-        - predicate.materials[] 含 digest.sha256 == release_manifest.source_tree_sha 条目
+        - predicate.materials[] 含 git source 条目,其 commit digest(sha1/gitCommit)
+          == release_manifest.source_commit (R67 P1-12: 重命名为
+          predicate_materials_source_commit,因其实际验证 source commit 而非 tree)
+        - R67 P1-12: 新增 predicate_materials_source_tree 独立检查,通过
+          `git rev-parse <commit>^{tree}` 验证 commit 派生的 tree SHA 与
+          release_manifest.source_tree_sha 一致
         - 若 release_manifest.migration_manifest_digest 存在,
           predicate.materials[] 须含对应 digest 条目
     f. 若 bundle 提供(Rekor bundle JSON):
@@ -57,12 +62,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+# ════════════════════════════════════════════════════════════════
+# R67 P1-12: 仓库根目录(用于 git rev-parse <commit>^{tree} 验证)
+# ════════════════════════════════════════════════════════════════
+_REPO_ROOT: Path = Path(__file__).resolve().parent.parent
 
 # ════════════════════════════════════════════════════════════════
 # 常量定义
@@ -222,25 +233,135 @@ def _make_check(
     actual: str,
     message: str,
     severity: str = "error",
+    status: str | None = None,
 ) -> dict:
     """构造单条检查结果字典。
 
+    R67 P0-07 整改:引入互斥 status 字段,消除 passed+warning 混合表达。
+
+    旧模型问题:
+      - passed(bool) + severity("error"/"warning") 组合可表达"soft-pass"
+        (passed=True, severity="warning"),但聚合器 `if c["passed"]: continue`
+        会跳过这类条目,warning 被静默丢弃,strict 模式也不会升级。
+      - "未验证但不阻断"与"已验证通过"被同一个 passed=True 编码,无法区分。
+
+    新模型(R67 P0-07):
+      - status(str) 互斥状态,优先级高于 passed:
+          "passed"          已直接验证通过
+          "failed"          验证失败,阻断
+          "warning"         未直接验证但有可解释理由(soft warning,strict 模式升级为 error)
+          "not_applicable"  检查不适用(字段缺失/无 bundle),机器可验证理由
+      - passed(bool) 保留向后兼容,由 status 派生:
+          status == "passed" → passed=True
+          其它 → passed=False
+      - severity(str) 保留向后兼容,由 status 派生:
+          status == "failed" → severity="error"
+          其它 → severity="warning"
+
     Args:
         name: 检查项名称(用于报告显示与 JSON 字段)
-        passed: 是否通过
+        passed: (向后兼容)若未提供 status,用于推断 status
         expected: 期望值描述
         actual: 实际值描述
         message: 人类可读的详细信息
-        severity: 失败时的严重级别 "error" 或 "warning"
+        severity: (向后兼容)若未提供 status,与 passed 一起推断 status
+        status: 显式状态(推荐),覆盖 passed/severity 推断
     """
+    if status is None:
+        # 由 passed + severity 推断 status
+        if passed:
+            # 旧行为下 passed=True 配 severity="warning" 即为 soft-pass —
+            # R67 P0-07 要求不得用 passed=True 表达"未验证",因此映射为 warning。
+            if severity == "warning":
+                status = "warning"
+            else:
+                status = "passed"
+        else:
+            if severity == "warning":
+                status = "warning"
+            else:
+                status = "failed"
+    # 派生 passed / severity 以保持向后兼容
+    passed_derived = (status == "passed")
+    if status == "failed":
+        severity_derived = "error"
+    else:
+        severity_derived = "warning"
     return {
         "name": name,
-        "passed": passed,
+        "passed": passed_derived,
+        "status": status,
         "expected": expected,
         "actual": actual,
         "message": message,
-        "severity": severity,
+        "severity": severity_derived,
     }
+
+
+def _make_not_applicable(name: str, *, expected: str, actual: str, message: str) -> dict:
+    """构造 not_applicable 检查结果(R67 P0-07)。
+
+    用于"检查不适用"场景:例如 manifest 缺少某字段、bundle 未提供等。
+    not_applicable 状态:
+      - 不阻断 overall_passed
+      - strict 模式下不升级为 error(因为有机器可验证的"不适用"理由)
+      - 必须在 message 中给出"不适用"的机器可验证理由
+    """
+    return _make_check(
+        name,
+        passed=False,  # 由 status 覆盖
+        expected=expected,
+        actual=actual,
+        message=message,
+        severity="warning",  # 由 status 覆盖
+        status="not_applicable",
+    )
+
+
+def _make_warning(name: str, *, expected: str, actual: str, message: str) -> dict:
+    """构造 warning 检查结果(R67 P0-07)。
+
+    用于"未直接验证但有可解释理由"场景(soft warning)。
+    warning 状态:
+      - 不阻断 overall_passed(非 strict 模式)
+      - strict 模式下升级为 error
+      - 不同于 not_applicable:warning 表示"未验证",not_applicable 表示"检查不适用"
+    """
+    return _make_check(
+        name,
+        passed=False,  # 由 status 覆盖
+        expected=expected,
+        actual=actual,
+        message=message,
+        severity="warning",  # 由 status 覆盖
+        status="warning",
+    )
+
+
+def _make_passed(name: str, *, expected: str, actual: str, message: str) -> dict:
+    """构造 passed 检查结果(R67 P0-07)。"""
+    return _make_check(
+        name,
+        passed=True,
+        expected=expected,
+        actual=actual,
+        message=message,
+        severity="error",
+        status="passed",
+    )
+
+
+def _make_failed(name: str, *, expected: str, actual: str, message: str) -> dict:
+    """构造 failed 检查结果(R67 P0-07)。"""
+    return _make_check(
+        name,
+        passed=False,
+        expected=expected,
+        actual=actual,
+        message=message,
+        severity="error",
+        status="failed",
+    )
 
 
 def _safe_get(statement: dict, *keys: str, default: Any = None) -> Any:
@@ -620,17 +741,25 @@ def _check_predicate_config_source_digest(predicate: dict, manifest: dict, versi
     )
 
 
-def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict, version: str = "v0.2") -> dict:
-    """(e5) materials/resolvedDependencies 含 git source,其 commit digest 与 source_commit 一致。
+def _check_predicate_materials_source_commit(predicate: dict, manifest: dict, version: str = "v0.2") -> dict:
+    """(e5a) materials/resolvedDependencies 含 git source,其 commit digest 与 source_commit 一致。
 
-    R66 P1-10 语义校正:
+    R67 P1-12 命名语义校正:
+      原 _check_predicate_materials_tree_sha(返回 check name
+      "predicate_materials_source_tree_sha")实际验证的是 source_commit SHA,
+      而非 source_tree_sha。R67 P1-12 将其重命名为
+      predicate_materials_source_commit 以反映真实语义,并新增独立的
+      predicate_materials_source_tree 检查通过 `git rev-parse <commit>^{tree}`
+      验证 tree SHA。
+
+    R66 P1-10 语义校正(保留):
       原 v0.2 检查期望 materials[] 含 digest.sha256 == source_tree_sha 条目,
       但标准 SLSA provenance(actions/attest-build-provenance)不会单独列出
       git tree SHA — git source 条目只携带 commit SHA(v0.2: digest.sha1;
       v1: digest.gitCommit)。git tree SHA 是 commit 的确定性派生量,验证 commit
       即隐式验证 tree。
 
-      新语义:
+      本检查语义:
         - v1: resolvedDependencies[] 中 git+https:// 条目的 digest.gitCommit
               (或 sha1) == release_manifest.source_commit
         - v0.2: materials[] 中 git source 条目的 digest.sha1
@@ -644,7 +773,7 @@ def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict, version
     expected_tree = str(manifest.get("source_tree_sha", "") or "")
     if not expected_commit and not expected_tree:
         return _make_check(
-            "predicate_materials_source_tree_sha",
+            "predicate_materials_source_commit",
             passed=False,
             expected="release_manifest.source_commit 或 source_tree_sha",
             actual="(manifest 缺失该字段)",
@@ -666,13 +795,13 @@ def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict, version
                 candidate = _strip_sha_prefix(str(digests.get(key, "") or ""))
                 if candidate and candidate == expected_norm:
                     return _make_check(
-                        "predicate_materials_source_tree_sha",
+                        "predicate_materials_source_commit",
                         passed=True,
                         expected=f"source_commit={expected_commit}",
                         actual=f"materials git source {key}={candidate}",
                         message=(
                             f"materials 含 git source 条目,commit digest ({key}) "
-                            f"与 source_commit 一致: {candidate} (tree SHA 隐式验证)"
+                            f"与 source_commit 一致: {candidate}"
                         ),
                         severity="error",
                     )
@@ -689,15 +818,18 @@ def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict, version
                 candidate = _strip_sha_prefix(str(digests.get(algo, "") or ""))
                 if candidate and candidate == expected_tree_norm:
                     return _make_check(
-                        "predicate_materials_source_tree_sha",
+                        "predicate_materials_source_commit",
                         passed=True,
                         expected=f"source_tree_sha={expected_tree}",
                         actual=f"materials {algo}={candidate}",
-                        message=f"materials 含 source_tree_sha 条目: {expected_tree}",
+                        message=(
+                            f"materials 含 source_tree_sha 条目: {expected_tree} "
+                            f"(R67 P1-12: 由 predicate_materials_source_commit 回退路径匹配)"
+                        ),
                         severity="error",
                     )
     return _make_check(
-        "predicate_materials_source_tree_sha",
+        "predicate_materials_source_commit",
         passed=False,
         expected=f"source_commit={expected_commit!r} 或 source_tree_sha={expected_tree!r}",
         actual="not found in materials",
@@ -705,6 +837,121 @@ def _check_predicate_materials_tree_sha(predicate: dict, manifest: dict, version
             f"materials 未含 git source commit/tree 条目: "
             f"期望 source_commit={expected_commit!r}"
             + (f" 或 source_tree_sha={expected_tree!r}" if expected_tree else "")
+        ),
+        severity="error",
+    )
+
+
+def _resolve_tree_sha_for_commit(commit_sha: str, repo_root: Path | None = None) -> str | None:
+    """R67 P1-12: 通过 `git rev-parse <commit>^{tree}` 派生 commit 的 tree SHA。
+
+    Args:
+        commit_sha: 40 字符 SHA-1 commit hash
+        repo_root: git 仓库根目录(默认 _REPO_ROOT)
+
+    Returns:
+        40 字符 tree SHA(成功),None(失败 — commit 不存在/非 git 仓库/超时)
+    """
+    if not commit_sha:
+        return None
+    cwd = repo_root if repo_root is not None else _REPO_ROOT
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", f"{commit_sha}^{{tree}}"],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            tree_sha = result.stdout.strip()
+            # tree SHA 是 40 字符 SHA-1(git rev-parse <commit>^{tree} 返回完整 hash)
+            if tree_sha and len(tree_sha) >= 7:
+                return tree_sha
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def _check_predicate_materials_source_tree(
+    predicate: dict,
+    manifest: dict,
+    version: str = "v0.2",
+    repo_root: Path | None = None,
+) -> dict:
+    """(e5b) R67 P1-12: 通过 `git rev-parse <commit>^{tree}` 验证 source_tree_sha。
+
+    与 _check_predicate_materials_source_commit 互补:
+      - source_commit 检查:验证 attestation materials[] 中的 commit digest
+        与 release_manifest.source_commit 一致(attestation 内嵌证据)
+      - source_tree 检查(本检查):验证 release_manifest.source_commit 派生的
+        tree SHA 与 release_manifest.source_tree_sha 一致(本地 git 仓库证据)
+
+    本检查独立运行,不依赖 predicate 内容。验证流程:
+      1. 取 release_manifest.source_commit(支持 source_commit_sha 别名)
+      2. 取 release_manifest.source_tree_sha
+      3. 若 source_commit 缺失 → not_applicable(机器可验证理由:字段缺失)
+      4. 若 source_tree_sha 缺失 → not_applicable(机器可验证理由:字段缺失)
+      5. 运行 `git rev-parse <source_commit>^{tree}` 获取派生 tree SHA
+      6. 若 git 命令失败(commit 不存在/非 git 仓库) → 失败(error)
+      7. 比较派生 tree SHA 与 release_manifest.source_tree_sha
+         - 一致 → 通过
+         - 不一致 → 失败(error)
+    """
+    expected_commit = str(
+        manifest.get("source_commit") or manifest.get("source_commit_sha") or ""
+    )
+    expected_tree = str(manifest.get("source_tree_sha", "") or "")
+
+    if not expected_commit:
+        return _make_not_applicable(
+            "predicate_materials_source_tree",
+            expected="(release_manifest.source_commit 缺失,跳过 tree 派生验证)",
+            actual="(skip)",
+            message=(
+                "release_manifest.source_commit 缺失,跳过 git rev-parse <commit>^{tree} 验证"
+                " [not_applicable 理由: manifest.source_commit 字段缺失]"
+            ),
+        )
+    if not expected_tree:
+        return _make_not_applicable(
+            "predicate_materials_source_tree",
+            expected="(release_manifest.source_tree_sha 缺失,跳过 tree 派生验证)",
+            actual="(skip)",
+            message=(
+                "release_manifest.source_tree_sha 缺失,跳过 git rev-parse <commit>^{tree} 验证"
+                " [not_applicable 理由: manifest.source_tree_sha 字段缺失]"
+            ),
+        )
+
+    # 派生 tree SHA — 通过 git rev-parse <commit>^{tree}
+    derived_tree = _resolve_tree_sha_for_commit(expected_commit, repo_root)
+    if derived_tree is None:
+        return _make_check(
+            "predicate_materials_source_tree",
+            passed=False,
+            expected=f"git rev-parse {expected_commit}^{{tree}} == {expected_tree}",
+            actual="(git rev-parse 失败)",
+            message=(
+                f"git rev-parse {expected_commit}^{{tree}} 失败 — "
+                f"commit 不存在/非 git 仓库/git 不可用"
+            ),
+            severity="error",
+        )
+
+    expected_tree_norm = _strip_sha_prefix(expected_tree)
+    derived_tree_norm = _strip_sha_prefix(derived_tree)
+    passed = derived_tree_norm == expected_tree_norm
+    return _make_check(
+        "predicate_materials_source_tree",
+        passed=passed,
+        expected=f"git rev-parse {expected_commit}^{{tree}} == {expected_tree}",
+        actual=derived_tree,
+        message=(
+            f"git rev-parse {expected_commit}^{{tree}} 与 source_tree_sha 一致: {derived_tree}"
+            if passed
+            else f"git rev-parse {expected_commit}^{{tree}} 与 source_tree_sha 不一致: "
+                 f"derived={derived_tree!r}, manifest={expected_tree!r}"
         ),
         severity="error",
     )
@@ -721,17 +968,26 @@ def _check_predicate_materials_migration(predicate: dict, manifest: dict, versio
         - 若 attestation 含匹配条目(自定义 attestation 场景) → PASS
         - 若不含(标准 attestation 场景) → WARN(不阻断),依赖 git source
           commit SHA 间接绑定
+
+    R67 P0-07 语义校正:
+      - manifest 未提供 migration_manifest_digest → not_applicable
+        (机器可验证理由:manifest 字段缺失)
+      - materials 未含 migration 条目 → warning
+        (未直接验证,strict 模式升级为 error)
+      - 不再返回 passed=True 表达"未验证"。
     """
     expected_mig = str(manifest.get("migration_manifest_digest", "") or "")
     if not expected_mig:
-        # manifest 未提供该字段,本检查不适用 — 跳过(passed=True, severity=info)
-        return _make_check(
+        # manifest 未提供该字段,本检查不适用 — not_applicable(R67 P0-07)
+        # 机器可验证理由:release_manifest.migration_manifest_digest 缺失
+        return _make_not_applicable(
             "predicate_materials_migration_manifest",
-            passed=True,
             expected="(release_manifest 未提供 migration_manifest_digest,跳过)",
             actual="(skip)",
-            message="release_manifest 未提供 migration_manifest_digest,跳过 migration material 检查",
-            severity="warning",
+            message=(
+                "release_manifest 未提供 migration_manifest_digest,跳过 migration material 检查"
+                " [not_applicable 理由: manifest.migration_manifest_digest 字段缺失]"
+            ),
         )
     expected_mig_norm = _strip_sha_prefix(expected_mig)
     materials = _get_materials(predicate, version)
@@ -751,27 +1007,25 @@ def _check_predicate_materials_migration(predicate: dict, manifest: dict, versio
         if found:
             break
     if found:
-        return _make_check(
+        return _make_passed(
             "predicate_materials_migration_manifest",
-            passed=True,
             expected=expected_mig,
             actual="found",
             message=f"materials 含 migration_manifest_digest 条目: {expected_mig}",
-            severity="error",
         )
-    # 标准 attestation 不含 migration_manifest 作为独立 material — 降级为 warning
+    # 标准 attestation 不含 migration_manifest 作为独立 material — warning(R67 P0-07)
     # (migration_manifest 通过 git source commit SHA 间接绑定)
-    return _make_check(
+    # R67 P0-07: 不再用 passed=True 表达"未验证",改用 warning 状态
+    return _make_warning(
         "predicate_materials_migration_manifest",
-        passed=True,  # 不阻断(soft warning)
         expected=expected_mig,
         actual="not found in materials (standard attestation)",
         message=(
             f"materials 未含 migration_manifest_digest 条目: 期望 {expected_mig!r}"
             f" — 标准 SLSA attestation 不单独列出 repo 内部文件,"
             f"migration_manifest 通过 git source commit SHA 间接绑定"
+            f" [strict 模式将升级为 error]"
         ),
-        severity="warning",
     )
 
 
@@ -843,29 +1097,39 @@ def _find_issuer(statement: dict, bundle: dict | None) -> str | None:
 
 
 def _check_oidc_issuer(statement: dict, bundle: dict | None) -> dict:
-    """(g) 若 statement 或 bundle 中存在 OIDC issuer,必须为 GitHub Actions issuer。"""
+    """(g) 若 statement 或 bundle 中存在 OIDC issuer,必须为 GitHub Actions issuer。
+
+    R67 P0-07 语义校正:
+      - issuer 字段未提供 → not_applicable
+        (机器可验证理由:statement 与 bundle 均未含 issuer 字段)
+      - 不再返回 passed=True 表达"未验证"。
+    """
     found_issuer = _find_issuer(statement, bundle)
     if found_issuer is None:
-        # 未找到 issuer 字段 — 视为 warning(可选字段)
-        return _make_check(
+        # 未找到 issuer 字段 — not_applicable(R67 P0-07)
+        # 机器可验证理由:statement 与 bundle 均未提供 issuer 字段
+        return _make_not_applicable(
             "oidc_issuer",
-            passed=True,
             expected=EXPECTED_OIDC_ISSUER,
             actual="(issuer 字段未提供,跳过)",
-            message="statement 与 bundle 均未提供 issuer 字段,跳过 OIDC issuer 检查",
-            severity="warning",
+            message=(
+                "statement 与 bundle 均未提供 issuer 字段,跳过 OIDC issuer 检查"
+                " [not_applicable 理由: issuer 字段在 statement 与 bundle 中均缺失]"
+            ),
         )
     passed = found_issuer == EXPECTED_OIDC_ISSUER
-    return _make_check(
+    if passed:
+        return _make_passed(
+            "oidc_issuer",
+            expected=EXPECTED_OIDC_ISSUER,
+            actual=found_issuer,
+            message=f"OIDC issuer 合法: {found_issuer}",
+        )
+    return _make_failed(
         "oidc_issuer",
-        passed=passed,
         expected=EXPECTED_OIDC_ISSUER,
         actual=found_issuer,
-        message=(
-            f"OIDC issuer 合法: {found_issuer}" if passed
-            else f"OIDC issuer 非法: {found_issuer!r},期望: {EXPECTED_OIDC_ISSUER}"
-        ),
-        severity="error",
+        message=f"OIDC issuer 非法: {found_issuer!r},期望: {EXPECTED_OIDC_ISSUER}",
     )
 
 
@@ -979,6 +1243,7 @@ def verify_attestation_semantics(
     manifest: dict,
     bundle: dict | None = None,
     strict: bool = False,
+    repo_root: Path | None = None,
 ) -> dict:
     """对 cosign verify 输出的 statement 执行 R66 P1-10 语义断言。
 
@@ -987,6 +1252,8 @@ def verify_attestation_semantics(
         manifest: release manifest JSON
         bundle: 可选 Rekor bundle JSON
         strict: 严格模式,警告转为错误
+        repo_root: R67 P1-12 — git 仓库根目录,用于 `git rev-parse <commit>^{tree}`
+            验证 source_tree_sha(默认为脚本所在仓库的根目录)
 
     Returns:
         {
@@ -1020,7 +1287,10 @@ def verify_attestation_semantics(
         checks.append(_check_predicate_build_type(predicate, slsa_version))
         checks.append(_check_predicate_config_source_uri(predicate, manifest, slsa_version))
         checks.append(_check_predicate_config_source_digest(predicate, manifest, slsa_version))
-        checks.append(_check_predicate_materials_tree_sha(predicate, manifest, slsa_version))
+        # R67 P1-12: 重命名 predicate_materials_source_tree_sha → predicate_materials_source_commit
+        # 新增独立 predicate_materials_source_tree 检查(git rev-parse <commit>^{tree})
+        checks.append(_check_predicate_materials_source_commit(predicate, manifest, slsa_version))
+        checks.append(_check_predicate_materials_source_tree(predicate, manifest, slsa_version, repo_root))
         checks.append(_check_predicate_materials_migration(predicate, manifest, slsa_version))
     else:
         # predicate 缺失 — 非 strict 模式下为 warning
@@ -1055,17 +1325,31 @@ def verify_attestation_semantics(
             severity="warning",
         ))
 
-    # 汇总 errors / warnings
+    # R67 P0-07: 使用互斥 status 字段聚合,不再用 passed+severity 混合表达
+    #   - passed          → 跳过(已直接验证通过)
+    #   - failed          → errors(阻断)
+    #   - warning         → warnings(strict 模式升级为 error)
+    #   - not_applicable  → 跳过(检查不适用,有机器可验证理由,strict 模式不升级)
     for c in checks:
-        if c["passed"]:
+        st = c.get("status")
+        # 向后兼容:若旧 check 缺失 status,从 passed/severity 推断
+        if st is None:
+            if c["passed"]:
+                st = "passed"
+            elif c.get("severity") == "warning":
+                st = "warning"
+            else:
+                st = "failed"
+        if st == "passed" or st == "not_applicable":
             continue
         msg = f"[{c['name']}] {c['message']}"
-        if c["severity"] == "warning":
+        if st == "warning":
             warnings.append(msg)
-        else:
+        else:  # failed
             errors.append(msg)
 
-    # strict 模式:警告升级为错误
+    # strict 模式:警告升级为错误(R67 P0-07 要求:strict production 模式下
+    #   所有 warning 必须升级为 error,除非该检查明确 not_applicable 且有机器可验证理由)
     if strict and warnings:
         errors.extend(f"[strict] {w}" for w in warnings)
 
@@ -1087,23 +1371,34 @@ def verify_attestation_semantics(
 # ════════════════════════════════════════════════════════════════
 
 def _print_human_report(result: dict) -> None:
-    """以人类可读格式打印验证报告。"""
+    """以人类可读格式打印验证报告。
+
+    R67 P0-07: 显示互斥 status 字段(passed/failed/warning/not_applicable),
+      不再用 passed+severity 混合表达。
+    """
     print("═" * 72)
-    print("R66 P1-10: 供应链 attestation statement 语义验证报告")
+    print("R66 P1-10 / R67 P0-07: 供应链 attestation statement 语义验证报告")
     print("═" * 72)
     print(f"验证时间: {result.get('verified_at', '')}")
     print(f"严格模式: {'是' if result.get('strict_mode') else '否'}")
     print()
-    print(f"{'检查项':<40} {'结果':<10} {'严重级':<8} 详情")
+    print(f"{'检查项':<40} {'状态':<16} {'严重级':<8} 详情")
     print("─" * 72)
     for c in result.get("checks", []):
-        status = "✓ PASS" if c["passed"] else "✗ FAIL"
+        st = c.get("status", "passed" if c.get("passed") else "failed")
+        # R67 P0-07: 状态符号
+        status_label = {
+            "passed": "✓ PASS",
+            "failed": "✗ FAIL",
+            "warning": "⚠ WARN",
+            "not_applicable": "○ N/A",
+        }.get(st, "? UNKNOWN")
         severity = c.get("severity", "error")
         # 截断过长的 message
         msg = c.get("message", "")
         if len(msg) > 80:
             msg = msg[:77] + "..."
-        print(f"  {c['name']:<38} {status:<10} {severity:<8} {msg}")
+        print(f"  {c['name']:<38} {status_label:<16} {severity:<8} {msg}")
     print("─" * 72)
     errors = result.get("errors", [])
     warnings = result.get("warnings", [])

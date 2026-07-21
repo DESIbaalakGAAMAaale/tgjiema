@@ -125,8 +125,8 @@ class TestManifestContent:
             (e for e in data["migrations"] if str(e.get("migration_id", "")).strip()),
             key=lambda e: str(e.get("migration_id", "")),
         )
-        # 期望 7 个 migration
-        assert len(entries) == 7, f"期望 7 个 migration,实际 {len(entries)}"
+        # 期望 8 个 migration (R67 P1-06 新增 008_restore_switch_reconciler.sql)
+        assert len(entries) == 8, f"期望 8 个 migration,实际 {len(entries)}"
         # 001 是首个,predecessor 必须为 null
         assert entries[0]["migration_id"] == "001"
         first_pred = entries[0].get("predecessor")

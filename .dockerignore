@@ -2,13 +2,58 @@ __pycache__
 *.pyc
 *.pyo
 .env
+.env.*
+!.env.example
+!.env.shared.example
 .venv
 venv
 .git
 .gitignore
-*.md
+.github
+.vscode
+.DS_Store
+*.db
+*.log
 logs/
 data/
-.DS_Store
-.vscode
-*.db
+
+# R67 P0-06: 测试代码不得进入生产镜像
+#   测试文件可能包含 legacy restore 兼容入口的调用,通过 ALLOW_LEGACY_RESTORE
+#   逃生舱解封旧 writer。生产镜像必须物理隔离测试代码。
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.tox
+.mypy_cache
+.ruff_cache
+
+# R67 P0-06: 运维脚本不得进入生产镜像
+#   scripts/ 含 run_restore / restore_from_backup 等旧 CLI 入口,
+#   生产恢复必须通过 RestoreOrchestrator,不允许 legacy CLI。
+scripts/
+
+# R67 P0-06: 文档/审计报告不得进入生产镜像(减小镜像体积 + 避免敏感信息泄露)
+docs/
+*.md
+tgjiema R*.md
+
+# R67 P0-06: CI/CD 配置不得进入生产镜像
+#   .github 已在上方排除,这里再次显式声明以防遗漏
+.gitlab-ci.yml
+.circleci/
+
+# R67 P0-06: IDE / 编辑器配置不得进入生产镜像
+.idea/
+*.swp
+*.swo
+*~
+
+# R67 P0-06: 临时文件与构建产物不得进入生产镜像
+*.tmp
+*.bak
+*.orig
+build/
+dist/
+*.egg-info/

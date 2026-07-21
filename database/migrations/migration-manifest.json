@@ -107,6 +107,20 @@
       "schema_fingerprint_before": "DDL_VERSION=11",
       "schema_fingerprint_after": "DDL_VERSION=11",
       "r64_p0_03_note": "R64 P0-03: 新增 restore_operations / restore_operation_events / restore_rollback_targets 三表 — 恢复编排状态机持久化 + 蓝绿切换审计事件 + 限时回滚点. 解决 restore 跨数据源混合时间点问题:恢复只写入 staging,验证后版本化切换,失败只销毁 staging 不影响 active. DDL_VERSION unchanged (新表,无 schema 版本 bump)."
+    },
+    {
+      "order": 8,
+      "migration_id": "008",
+      "version": "008_restore_switch_reconciler.sql",
+      "filename": "008_restore_switch_reconciler.sql",
+      "sha256": "6253380379fae9286471222dfbdaa35135dbfffa801f388cf41dcfee3f42a46a",
+      "predecessor": "007",
+      "predecessor_filename": "007_restore_operations_ledger.sql",
+      "ddl_version": 11,
+      "rollback_strategy": "DROP TABLE restore_switch_intents, DROP TABLE restore_backend_receipts (reverts R67 P1-06 recovery reconciler persistence; in-flight switch intents must be reconciled or manually cleaned before rollback)",
+      "schema_fingerprint_before": "DDL_VERSION=11",
+      "schema_fingerprint_after": "DDL_VERSION=11",
+      "r67_p1_06_note": "R67 P1-06: 新增 restore_switch_intents (prepare intent + fencing token + 状态机) + restore_backend_receipts (每个 backend 的 switch receipt, 独立提交) 两表 — 解决 SQLite rename / CRDB routing switch / DB UoW 不是同一原子事务导致的崩溃恢复状态丢失问题. reconciler 启动时扫描未完成 intent, 根据 backend receipts 决策完成/回滚. DDL_VERSION unchanged (新表,无 schema 版本 bump)."
     }
   ]
 }

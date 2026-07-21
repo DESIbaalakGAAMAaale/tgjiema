@@ -29,7 +29,9 @@
     - ``services/user_message.py``      — UserMessage 定义模块(render_for_send)
     - ``utils/flood_waiter.py``         — FloodWait 退避包装(adapter 内部调用)
     - ``tests/``                        — 测试代码
-    - ``scripts/``                      — 运维脚本(含本门禁脚本自身)
+    - ``scripts/`` (R67 P1-08 细粒度)   — 仅 GATE_SCANNERS 类脚本可跳过自检;
+                                          OFFLINE_RECOVERY_TOOLS 与
+                                          GOVERNANCE_SCRIPTS 必须被扫描
     - ``admin/``                        — FastAPI 路由(暂豁免,后续 PR 迁移)
 
 Baseline 机制(类似 ``check_error_protocol.py``):
@@ -74,14 +76,23 @@ SKIP_DIR_PARTS: list[str] = [
 
 # 白名单前缀(允许直接调用第三方 sink 的文件/目录,相对 REPO_ROOT,POSIX 路径)
 # 命中任一前缀的文件将被跳过(允许直接调用)
+# R67 P1-08: scripts/ 不再整体跳过 — 通过 `is_skippable_script()` 细粒度判断。
+# 仅 GATE_SCANNERS 可跳过;OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
 ALLOWED_PREFIXES: list[str] = [
     "services/sink_adapters/",       # adapter 包本身(原生 sink 的唯一调用方)
     "services/user_message.py",      # UserMessage / render_for_send 定义
     "utils/flood_waiter.py",         # FloodWait 退避包装(adapter 内部调用)
     "tests/",                        # 测试代码
-    "scripts/",                      # 运维脚本(含本门禁脚本自身)
     "admin/",                        # FastAPI 路由(暂豁免,后续 PR 迁移)
 ]
+
+# R67 P1-08: scripts/ 下可跳过的文件清单(从 _script_categories 导入)
+try:
+    from scripts._script_categories import is_skippable_script as _is_skippable_script_p1_08
+except ImportError:
+    # _script_categories 不可用时 fail-closed:不跳过任何 scripts/ 文件
+    def _is_skippable_script_p1_08(rel_path: str) -> bool:
+        return False
 
 # Rule 1: import 违规配置
 # 第三方 sink 包的 import 只允许出现在指定文件中
@@ -134,11 +145,18 @@ def _is_skipped_path(path: Path) -> bool:
 
 
 def _is_allowed(path: Path) -> bool:
-    """检查文件路径是否在白名单前缀中(允许直接调用第三方 sink)。"""
+    """检查文件路径是否在白名单前缀中(允许直接调用第三方 sink)。
+
+    R67 P1-08: scripts/ 细粒度判断 — 仅 GATE_SCANNERS 可跳过;
+    OFFLINE_RECOVERY_TOOLS 与 GOVERNANCE_SCRIPTS 必须被扫描。
+    """
     rel = _rel_posix(path)
     for prefix in ALLOWED_PREFIXES:
         if rel == prefix or rel.startswith(prefix):
             return True
+    # R67 P1-08: scripts/ 细粒度判断
+    if rel.startswith("scripts/") and _is_skippable_script_p1_08(rel):
+        return True
     return False
 
 
