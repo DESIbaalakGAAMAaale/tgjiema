@@ -138,30 +138,18 @@ if [ -z "$RULESET_ID" ]; then
 fi
 
 if [ -z "$RULESET_ID" ]; then
-  # R67 P0-01 PR 宽松模式:PR 场景下 ruleset 不存在时 WARN 但 exit 0
-  # 原因:ruleset 是仓库级 admin 配置,PR 无法创建(需 admin PAT);
-  #       ruleset 应在 merge 到 master 前由管理员手动配置。
-  #       push 到 master 时严格 fail-closed(下方 else 分支)。
-  if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
-    echo "WARN: [R67 P0-01] 未找到 branch ruleset(PR 宽松模式 — 不阻断)"
-    echo ""
-    echo "当前仓库 rulesets 列表:"
-    echo "$LIST_RESPONSE" | jq '[.[] | {id, name, target, enforcement}]'
-    echo ""
-    echo "WARNING: merge 到 master 前,管理员必须运行:"
-    echo "  OWNER=${OWNER} REPO=${REPO} ./scripts/configure_branch_ruleset.sh"
-    echo "  (需 admin PAT with repo scope)"
-    echo ""
-    echo "PASS (PR lenient mode): ruleset 未配置,但不阻断 PR。"
-    echo "master push 时将严格验证(fail-closed)。"
-    exit 0
-  fi
-  echo "FAIL: [R67 P0-01] 未找到 branch ruleset(期望 name='${RULESET_NAME}' 或 target=branch + refs/heads/master)"
+  # R68 P0-02: 删除 PR 宽松模式 — 治理配置必须在合并前完成。
+  # 无论 PR 还是 master push,ruleset 不存在均 fail-closed。
+  # 仓库 admin 必须先运行 configure_branch_ruleset.sh,再开整改 PR。
+  echo "FAIL: [R68 P0-02] 未找到 branch ruleset(期望 name='${RULESET_NAME}' 或 target=branch + refs/heads/master)"
   echo ""
   echo "当前仓库 rulesets 列表:"
   echo "$LIST_RESPONSE" | jq '[.[] | {id, name, target, enforcement}]'
   echo ""
-  echo "修复:运行 OWNER=${OWNER} REPO=${REPO} ./scripts/configure_branch_ruleset.sh"
+  echo "修复:管理员必须运行(需 admin PAT with administration:write scope):"
+  echo "  OWNER=${OWNER} REPO=${REPO} ./scripts/configure_branch_ruleset.sh"
+  echo ""
+  echo "此 PR 将保持失败,直到 ruleset 配置完成。这是 R68 P0-02 要求的 fail-closed 行为。"
   exit 1
 fi
 

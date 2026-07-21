@@ -34,6 +34,12 @@ coverage.xml
 #   生产恢复必须通过 RestoreOrchestrator,不允许 legacy CLI。
 scripts/
 
+# R68 P0-07: legacy restore CLI 物理排除(Dockerfile allowlist + .dockerignore 双重)
+#   services/db_restore.py 含 run_restore() / _restore_from_backup_data() 等
+#   legacy writer,未被 run_all.py 引用,仅用于 admin CLI。
+#   生产环境通过 _production_guard 硬守卫禁止,此处物理排除作为纵深防御。
+services/db_restore.py
+
 # R67 P0-06: 文档/审计报告不得进入生产镜像(减小镜像体积 + 避免敏感信息泄露)
 docs/
 *.md

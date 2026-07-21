@@ -65,20 +65,28 @@ COMMIT_SIG_STATUS=$(git log --pretty='%G?' -1 "${GITHUB_SHA}" 2>/dev/null || ech
 case "$COMMIT_SIG_STATUS" in
   G) echo "  ✓ commit 已签名且验证通过(G)" ;;
   B) fail "commit 签名验证失败(B — bad signature)" ;;
-  U) fail "commit 签名未知(U — unknown validity,无公钥)" ;;
-  X) fail "commit 无签名(U/X — unsigned)" ;;
+  U) echo "  ⚠ commit 签名未知(U — unknown validity,无公钥)— 将以 GitHub API 验证为准" ;;
+  X) echo "  ⚠ commit 无签名(X)— 将以 GitHub API 验证为准" ;;
   Y) echo "  ✓ commit 已签名且验证通过(Y)" ;;
   R) fail "commit 签名已撤销(R — revoked)" ;;
   E) fail "commit 签名无法验证(E — expired key)" ;;
   *) fail "commit 签名状态未知: ${COMMIT_SIG_STATUS}" ;;
 esac
 
-# git verify-commit 显式调用(再次确认)
-if git verify-commit "${GITHUB_SHA}" >/dev/null 2>&1; then
-  echo "  ✓ git verify-commit 显式验证通过"
-else
-  fail "git verify-commit ${GITHUB_SHA} 失败"
-fi
+# git verify-commit 显式调用(G/B/R/E 状态才视为硬失败,U/X 留给 GitHub API 裁决)
+case "$COMMIT_SIG_STATUS" in
+  G|Y|U|X)
+    # U/X:本地无公钥,不视为硬失败,由检查 2 的 GitHub API 验证裁决
+    if git verify-commit "${GITHUB_SHA}" >/dev/null 2>&1; then
+      echo "  ✓ git verify-commit 显式验证通过"
+    else
+      echo "  ⚠ git verify-commit 本地验证失败(可能缺 GPG 公钥)— 将以 GitHub API 验证为准"
+    fi
+    ;;
+  *)
+    fail "git verify-commit ${GITHUB_SHA} 失败(签名状态=${COMMIT_SIG_STATUS})"
+    ;;
+esac
 
 # ════════════════════════════════════════════════════════════════
 # 2. GitHub API commit verification 双重确认
@@ -98,9 +106,16 @@ else
   SIGNATURE=$(echo "$API_RESPONSE" | jq -r '.commit.verification.signature // "(none)"')
   if [ "$VERIFIED" = "true" ]; then
     echo "  ✓ GitHub API verification.verified=true (reason=${REASON})"
+    # R68 P0-05: 当本地 git verify-commit 因缺 GPG 公钥失败(U/X),
+    # GitHub API verification.verified=true 即为权威源(GitHub 持有公钥)。
+    # 这不是 fail-open — GitHub API 是签名验证的权威源。
+    if [ "$COMMIT_SIG_STATUS" = "U" ] || [ "$COMMIT_SIG_STATUS" = "X" ]; then
+      echo "  ✓ 本地无 GPG 公钥(U/X),但 GitHub API 验证通过 — 视为签名有效"
+    fi
   else
     fail "GitHub API verification.verified=false (reason=${REASON})"
     echo "    签名: ${SIGNATURE:0:60}..."
+    echo "    R68 P0-05: commit 签名验证失败,GitHub API 是权威源,verified=false 即硬失败"
   fi
 fi
 

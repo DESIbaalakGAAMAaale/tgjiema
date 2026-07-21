@@ -217,40 +217,22 @@ if ! python scripts/check_branch_protection_contexts.py \
       --bp-config "$BP_CONTEXTS_FILE" \
       --workflows-dir .github/workflows \
       --json > "$WORKFLOW_JOBS_FILE"; then
-  # R65 P1-12 PR 宽松模式:PR 场景下 BP contexts 与 workflow 不一致时 WARN 但不阻断
-  # 原因:BP 是仓库级 admin 配置,PR 无法更新(需 admin PAT);
-  #       contexts 不一致应由管理员在 merge 前运行 configure_branch_protection.sh 修复。
-  #       push 到 master 时严格 fail-closed。
-  if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
-    echo "::warning::R65 P1-12 动态一致性检查失败(PR 宽松模式 — 不阻断)"
-    echo "  BP required contexts 与 .github/workflows/*.yml job 名不一致"
-    echo "  修复: bash scripts/configure_branch_protection.sh"
-    echo "  (需 admin PAT with administration:write scope)"
-    echo "  PR lenient mode: 不阻断 PR,master push 时将严格验证。"
-    rm -f "$BP_CONTEXTS_FILE" "$WORKFLOW_JOBS_FILE"
-    echo "PASS (PR lenient mode): BP contexts 不一致,但不阻断 PR。"
-    exit 0
-  fi
+  # R68 P0-02: 删除 PR 宽松模式 — BP contexts 不一致均 fail-closed。
+  # 仓库 admin 必须先运行 configure_branch_protection.sh 修复 contexts,再开整改 PR。
   echo "::error::R65 P1-12 动态一致性检查失败"
   echo "  BP required contexts 与 .github/workflows/*.yml job 名不一致"
-  echo "  修复: bash scripts/configure_branch_protection.sh"
+  echo "  修复: 管理员运行 bash scripts/configure_branch_protection.sh (需 admin PAT)"
   rm -f "$BP_CONTEXTS_FILE" "$WORKFLOW_JOBS_FILE"
-  fail_diag "BP contexts 与 workflow job 名不一致 (R65 P1-12)"
+  fail_diag "BP contexts 与 workflow job 名不一致 (R65 P1-12, R68 P0-02 删除宽松模式)"
 fi
 # 校验 consistent 字段(双重保险)
 WORKFLOW_CONSISTENT=$(jq -r '.consistent // false' "$WORKFLOW_JOBS_FILE")
 if [ "$WORKFLOW_CONSISTENT" != "true" ]; then
-  if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
-    echo "::warning::R65 P1-12 consistent != true(PR 宽松模式 — 不阻断)"
-    cat "$WORKFLOW_JOBS_FILE"
-    rm -f "$BP_CONTEXTS_FILE" "$WORKFLOW_JOBS_FILE"
-    echo "PASS (PR lenient mode): BP contexts 不一致,但不阻断 PR。"
-    exit 0
-  fi
+  # R68 P0-02: 删除 PR 宽松模式 — consistent != true 均 fail-closed。
   echo "::error::R65 P1-12 动态一致性检查失败 (consistent != true)"
   cat "$WORKFLOW_JOBS_FILE"
   rm -f "$BP_CONTEXTS_FILE" "$WORKFLOW_JOBS_FILE"
-  fail_diag "BP contexts 与 workflow job 名不一致 (R65 P1-12)"
+  fail_diag "BP contexts 与 workflow job 名不一致 (R65 P1-12, R68 P0-02 删除宽松模式)"
 fi
 rm -f "$BP_CONTEXTS_FILE"
 echo "✓ R65 P1-12: BP contexts 与 workflow job 名动态一致"

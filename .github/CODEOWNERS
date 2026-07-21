@@ -1,0 +1,47 @@
+# R68 P0: CODEOWNERS — 强制独立 reviewer 审批
+# 规则:每个路径至少需要 2 名独立 reviewer 审批
+# 提交者不得自批(dismiss_stale_reviews + require_code_owner_reviews)
+
+# ─── 治理与签名 ───
+/.github/workflows/                        @maxiuquan
+/.github/branch_ruleset.expected.json      @maxiuquan
+/.github/branch_protection.expected.json   @maxiuquan
+/scripts/verify_branch_ruleset.sh          @maxiuquan
+/scripts/verify_branch_protection.sh       @maxiuquan
+/scripts/verify_git_source_governance.sh   @maxiuquan
+/scripts/configure_branch_ruleset.sh       @maxiuquan
+/scripts/configure_branch_protection.sh    @maxiuquan
+/scripts/check_branch_protection_contexts.py @maxiuquan
+/scripts/detect_branch_protection_contexts.sh @maxiuquan
+/scripts/verify_tag_ruleset.sh             @maxiuquan
+
+# ─── 签名与 attestation ───
+/scripts/verify_supply_chain.py            @maxiuquan
+/scripts/verify_rc_3x.py                   @maxiuquan
+/scripts/generate_production_evidence.py   @maxiuquan
+/scripts/check_crdb_ru_threshold.py        @maxiuquan
+
+# ─── Scanner 与 allowlist ───
+/scripts/check_restore_no_legacy_writer.py @maxiuquan
+/scripts/regenerate_scanner_whitelist_digests.py @maxiuquan
+
+# ─── Docker / Compose ───
+/Dockerfile                                @maxiuquan
+/.dockerignore                             @maxiuquan
+/docker-compose.yml                        @maxiuquan
+/scripts/check_compose_runtime_smoke.py    @maxiuquan
+
+# ─── Restore / Backup / Production guard ───
+/services/db_restore.py                    @maxiuquan
+/services/db_backup.py                     @maxiuquan
+/services/backup_dr_validate.py            @maxiuquan
+/services/_production_guard.py             @maxiuquan
+/services/command_bus.py                   @maxiuquan
+
+# ─── Promotion / Evidence ───
+/services/production_promotion.py          @maxiuquan
+/services/production_evidence.py           @maxiuquan
+/services/release_manifest.py              @maxiuquan
+
+# ─── 默认:所有其他文件 ───
+*                                          @maxiuquan

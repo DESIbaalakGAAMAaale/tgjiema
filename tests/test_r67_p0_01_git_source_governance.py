@@ -205,9 +205,25 @@ class TestVerifyGitSourceGovernanceScript:
         )
 
     def test_script_returns_nonzero_on_unsigned_commit(self):
-        """未签名 commit 必须失败(不能仅 warning)。"""
+        """未签名 commit 必须失败(不能仅 warning)。
+
+        R68 P0-05 更新:X(本地无签名/U)状态不再直接 fail,
+        而是以 GitHub API verification 为权威源。
+        - 本地 X/U + GitHub API verified=false → fail
+        - 本地 X/U + GitHub API verified=true  → pass(GitHub 持有公钥)
+        - 本地 B/R/E(明确签名错误)            → 直接 fail
+
+        本测试验证 B(bad signature)状态仍直接 fail(不软化)。
+        """
         content = GIT_GOVERNANCE_SH.read_text(encoding="utf-8")
-        assert 'X) fail "commit 无签名' in content
+        # B(bad signature)状态仍必须直接 fail
+        assert 'B) fail "commit 签名验证失败' in content
+        # R(revoked)状态仍必须直接 fail
+        assert 'R) fail "commit 签名已撤销' in content
+        # E(expired key)状态仍必须直接 fail
+        assert 'E) fail "commit 签名无法验证' in content
+        # GitHub API verified=false 必须 fail(权威源)
+        assert 'GitHub API verification.verified=false' in content
 
 
 # ════════════════════════════════════════════════════════════════

@@ -44,8 +44,20 @@ RUN apt-get update && \
 COPY --from=builder /app/venv /app/venv
 ENV PATH=/app/venv/bin:$PATH
 
-# 项目代码
-COPY . .
+# 项目代码 — R68 P0-07: 显式 allowlist COPY(不再使用全量复制)
+# 物理排除 legacy restore CLI(services/db_restore.py) — 未被 run_all.py 引用,
+# 仅用于 admin CLI 恢复,生产环境通过 _production_guard 硬守卫禁止。
+# .dockerignore 同时排除 services/db_restore.py 作为纵深防御。
+COPY run_all.py ./
+COPY services/ ./services/
+COPY bots/ ./bots/
+COPY admin/ ./admin/
+COPY config/ ./config/
+COPY database/ ./database/
+COPY locales/ ./locales/
+COPY utils/ ./utils/
+COPY storage/ ./storage/
+COPY requirements.txt ./
 
 # R64 P0-02: 生产镜像默认启用 migration manifest 验证 + APP_ENV=production
 #   - MIGRATION_MANIFEST_VERIFY=1: 强制 cosign verify-blob + HEAD/Tree 绑定 + 集合一致性
