@@ -57,6 +57,10 @@ docs/*评估报告*.md
 docs/CockroachDB*.md
 docs/CODE_REVIEW_REPORT.md
 CODE_REVIEW_REPORT.md
+# 根目录审查报告（含 tgjiema R* 前缀的终审/整改建议报告）
+tgjiema R*.md
+tgjiema*R*.md
+tgjiema*R*整改*.md
 .workbuddy/
 
 # R41 P0-2: 已恢复推送 .github/workflows/(PAT workflow scope 已补齐)
