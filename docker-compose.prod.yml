@@ -1,55 +1,35 @@
-# TG文件解码器 — Docker Compose 多服务部署（开发版本）
-# R36 H8: 从 config/services.yaml 派生,与 systemd 一致的服务清单
-# 环形冗余 v2 架构(up / idx / dsp / mon / admin_bot / admin / db_writer / crdb_sync / db_backup)
+# TG文件解码器 — 生产 Compose（不可变镜像 digest）
+# R70 Wave 4: 不可变生产 Compose
 #
-# ════════════════════════════════════════════════════════════════════════
-# R70 Wave 4: 这是开发版本（docker-compose.yml），仅供本地开发/测试使用
-# ════════════════════════════════════════════════════════════════════════
-# 生产部署必须使用 docker-compose.prod.yml：
-#   docker compose -f docker-compose.prod.yml up -d
+# 与 docker-compose.yml（开发版本）的关键差异：
+#   1. 所有应用服务使用 `image: ${TGJIEMA_IMAGE:?...}` 而非 `build: .`
+#      - TGJIEMA_IMAGE 必须指向不可变 digest：
+#        ghcr.io/maxiuquan/tgjiema@sha256:<64 hex>
+#      - 禁止 mutable tag（latest / master / staging / v1.2.3 无 digest）
+#   2. 移除 `./config:/app/config` 代码 bind mount
+#      - Python 代码（config/__init__.py, environment.py, registry.py, settings.py）
+#        必须来自镜像，禁止 host 覆盖
+#      - 只挂载运行时配置数据文件（文件级挂载，非目录级）
+#   3. 硬编码 APP_ENV=production（在 .env.shared 中也应为 production）
+#   4. 显式 unset 所有测试逃生舱变量（I18N_ALLOW_FALLBACK / ALLOW_LEGACY_RESTORE 等）
+#   5. Build Once / Verify Many / Deploy Same Digest：
+#      所有服务运行同一个候选 digest，禁止部署阶段重新 build
 #
-# 开发版本与生产版本的关键差异：
-#   - 开发版本使用 `build: .`（本地构建镜像）
-#   - 生产版本使用 `image: ${TGJIEMA_IMAGE:?...}`（不可变 digest）
-#   - 开发版本挂载 `./config:/app/config`（便于代码热重载）
-#   - 生产版本禁止代码 bind mount（只挂载配置数据文件）
+# 部署步骤：
+#   1. 在 .env 中配置 REDIS_*_PASSWORD（4 个）和 TGJIEMA_IMAGE
+#      TGJIEMA_IMAGE=ghcr.io/maxiuquan/tgjiema@sha256:<64 hex>
+#   2. 准备 config/groups.yaml（账号频道配置）
+#   3. docker compose -f docker-compose.prod.yml up -d
+#      - 所有服务使用同一个不可变镜像 digest
+#      - 拓扑自动初始化（run_all.py 启动时自动执行 seed_topology）
 #
-# 校验生产 compose 不可变性：
+# 校验：
 #   python scripts/check_compose_static_rules.py --compose docker-compose.prod.yml --immutable
-# ════════════════════════════════════════════════════════════════════════
-#
-# ┌──────────────────────────────────────────────────────────────────────┐
-# │ R41 P0-3 醒目说明: 首次启动前必须准备 .env 中的 REDIS_*_PASSWORD   │
-# │ ─────────────────────────────────────────────────────────────────── │
-# │   首次 `docker compose up` 前,需在 .env 中配置以下 4 个变量:       │
-# │     REDIS_HEALTH_PASSWORD=...   (healthcheck 用户,仅 PING 权限)     │
-# │     REDIS_WRITER_PASSWORD=...   (tgjiema_writer 用户,业务写权限)    │
-# │     REDIS_READER_PASSWORD=...   (tgjiema_reader 用户,只读权限)      │
-# │     REDIS_ADMIN_PASSWORD=...     (tgjiema_admin 用户,管理权限)       │
-# │   R41 P0-3 fail-closed: 任一变量缺失 → docker compose 启动失败,    │
-# │   redis-acl-init/render_acl.sh 也会 exit 1(不再随机生成密码)。     │
-# │   R41 P1-9: mon_bot / admin_bot / admin 后台使用 tgjiema_admin。     │
-# │   ACL 模板: config/redis/users.acl.template                         │
-# │   渲染脚本: config/redis/render_acl.sh                               │
-# │   校验: render_acl.sh 拒绝含 '<' 或默认密码占位符的输出,失败 exit 1│
-# └──────────────────────────────────────────────────────────────────────┘
-#
-# 部署步骤(开发):
-#   1. 创建 .env 文件(从 .env.example 复制并填写,务必设置 REDIS_*_PASSWORD)
-#   2. 编辑 config/groups.yaml(填写 15 组的 channel_id)
-#   3. docker-compose up -d --build
-#      - redis-acl-init 先于 redis 启动,渲染 /data/users.acl
-#      - redis 主容器以 --aclfile /data/users.acl 加载渲染后的 ACL
-#   4. 拓扑已自动初始化(run_all.py 启动时自动执行 seed_topology)
-#
-# R36 H8: 每个服务使用最小 secrets 注入(.env.secrets.<service>),
-#         不再共享完整 .env,与 systemd 模型一致。
+#   （--immutable 启用不可变性校验：禁止 build:、要求 image digest、禁止代码 bind mount）
 
 services:
   # ── redis-acl-init (一次性,渲染 ACL 文件到共享卷) ──
-  # R40 P0-3: 先于 redis 启动,从 REDIS_*_PASSWORD 环境变量渲染 users.acl
-  # 渲染流程: sed 替换 <REDIS_*_PASSWORD> 占位符 → /data/users.acl
-  # 校验: 输出文件不得含 '<' 或未替换的默认密码,否则 exit 1
+  # 基础设施服务,使用官方 redis 镜像,不需要应用镜像
   redis-acl-init:
     image: redis:7-alpine
     container_name: tgjiema-redis-acl-init
@@ -58,15 +38,15 @@ services:
       - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:?REDIS_HEALTH_PASSWORD must be set in .env}
       - REDIS_WRITER_PASSWORD=${REDIS_WRITER_PASSWORD:?REDIS_WRITER_PASSWORD must be set in .env}
       - REDIS_READER_PASSWORD=${REDIS_READER_PASSWORD:?REDIS_READER_PASSWORD must be set in .env}
-      # R41 P1-9: tgjiema_admin 用户密码(mon_bot/admin_bot/admin 后台使用)
       - REDIS_ADMIN_PASSWORD=${REDIS_ADMIN_PASSWORD:?REDIS_ADMIN_PASSWORD must be set in .env}
       - ACL_TEMPLATE_PATH=/app/config/redis/users.acl.template
       - ACL_OUTPUT_PATH=/data/users.acl
     volumes:
       - redis_data:/data
-      - ./config/redis:/app/config/redis:ro
+      # 文件级挂载：只挂载 ACL 模板（配置数据,非 Python 代码）
+      - ./config/redis/users.acl.template:/app/config/redis/users.acl.template:ro
+      - ./config/redis/render_acl.sh:/app/config/redis/render_acl.sh:ro
     entrypoint: ["/bin/sh", "/app/config/redis/render_acl.sh"]
-    # R37 P2-4: 镜像安全加固(init 容器短任务,资源限制放宽)
     read_only: true
     tmpfs:
       - /tmp
@@ -84,14 +64,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    # R40 P0-3: 从 redis_data 共享卷加载渲染后的 ACL(/data/users.acl 由 redis-acl-init 生成)
-    # R38 P1-8: 启用 ACL(--aclfile),各服务使用独立用户连接 Redis
     command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction --aclfile /data/users.acl
     volumes:
       - redis_data:/data
     ports:
       - "127.0.0.1:6379:6379"
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -99,11 +76,6 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
-    # R39 P0-1: healthcheck 改用专用 health 用户(仅允许 PING),
-    # 不再使用被禁用的 default 用户导致认证失败。
-    # R40 P0-3: REDIS_HEALTH_PASSWORD 由 .env 顶层注入(由 redis-acl-init 同样读取)。
-    # R41 P0-3: fail-closed — 缺失 REDIS_HEALTH_PASSWORD 时 compose 启动失败(不再回退默认健康密码)。
-    # 注意: $$ 转义避免 Compose 插值,运行时由 shell 展开 $REDIS_HEALTH_PASSWORD。
     environment:
       - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:?REDIS_HEALTH_PASSWORD must be set in .env}
     depends_on:
@@ -121,9 +93,9 @@ services:
           memory: 512M
 
   # ── migration (oneshot,DDL 执行) ──
-  # R37 P0-1: migration 必须加载 .env.secrets.migration(含 COCKROACHDB_URL)
+  # R70 Wave 4: 使用不可变 image digest,禁止 build:
   migration:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-migration
     restart: "no"
     env_file:
@@ -131,17 +103,25 @@ services:
       - .env.secrets.migration
     environment:
       - SERVICE_ROLE=migration
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
+      # R70 Wave 3: 显式 unset 所有测试逃生舱（防止 .env 误设）
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
-    # R37 P1-8: 调用 migration_runner 执行 DDL(唯一允许的 DDL/TTL/版本写入入口)
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=migration
-    # 映射到 `python -m services.migration_runner`
+      # 文件级挂载：只挂载运行时配置数据文件（非 Python 代码）
+      - ./config/groups.yaml:/app/config/groups.yaml:ro
+      - ./config/topology.yaml:/app/config/topology.yaml:ro
     depends_on:
       redis:
         condition: service_healthy
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -157,26 +137,31 @@ services:
 
   # ── db_writer (Redis Stream 消费 → CRDB 写入) ──
   db_writer:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-db_writer
     restart: on-failure
     env_file:
       - .env.shared
     environment:
       - SERVICE_ROLE=db_writer
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
-      - ./logs:/app/logs  # R38 P2-4: 只读容器需要可写日志挂载
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=db_writer
-    # 映射到 `python run_all.py --standalone db_writer`
+      - ./logs:/app/logs
     depends_on:
       redis:
         condition: service_healthy
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -189,7 +174,6 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
-    # R38 P1-7: 角色专属 healthcheck — 检查 cache_store.db 近 10 分钟有写入(活跃写入证明进程存活)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os,time; f='/app/data/cache_store.db'; exit(0 if os.path.exists(f) and (time.time()-os.path.getmtime(f))<600 else 1)\" || exit 1"]
       interval: 30s
@@ -198,9 +182,8 @@ services:
       start_period: 60s
 
   # ── crdb_sync (单一 CRDB 同步服务) ──
-  # R37 P0-1: 使用标准 env_file 字段加载 secrets(不再使用非标准字段)
   crdb_sync:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-crdb_sync
     restart: on-failure
     env_file:
@@ -208,18 +191,23 @@ services:
       - .env.secrets.crdb_sync
     environment:
       - SERVICE_ROLE=crdb_sync
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
-      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
       - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
-      - ./logs:/app/logs  # R38 P2-4: 只读容器需要可写日志挂载
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=crdb_sync 映射
+      - ./logs:/app/logs
     depends_on:
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -232,7 +220,6 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
-    # R38 P1-7: 角色专属 healthcheck — 检查 crdb_sync 进程在运行(cmdline 含 crdb_sync)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'crdb_sync' in cmd else 1)\" || exit 1"]
       interval: 30s
@@ -242,7 +229,7 @@ services:
 
   # ── up (上传接收 Bot) ──
   up:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-up
     restart: always
     env_file:
@@ -250,14 +237,20 @@ services:
       - .env.secrets.up
     environment:
       - SERVICE_ROLE=up
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
-      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
       - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ./logs:/app/logs
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=up 映射
     depends_on:
       redis:
         condition: service_healthy
@@ -265,7 +258,6 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -278,7 +270,6 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
-    # R38 P1-7: 角色专属 healthcheck — 检查 up Bot 进程在运行(cmdline 含 up)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone up' in cmd else 1)\" || exit 1"]
       interval: 30s
@@ -288,7 +279,7 @@ services:
 
   # ── idx (解码索引 Bot) ──
   idx:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-idx
     restart: always
     env_file:
@@ -296,14 +287,20 @@ services:
       - .env.secrets.idx
     environment:
       - SERVICE_ROLE=idx
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
-      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
       - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ./logs:/app/logs
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=idx 映射
     depends_on:
       redis:
         condition: service_healthy
@@ -311,7 +308,6 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -324,7 +320,6 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
-    # R38 P1-7: 角色专属 healthcheck — 检查 idx Bot 进程在运行(cmdline 含 idx)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone idx' in cmd else 1)\" || exit 1"]
       interval: 30s
@@ -334,7 +329,7 @@ services:
 
   # ── dsp (派送分发 Bot) ──
   dsp:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-dsp
     restart: always
     env_file:
@@ -342,14 +337,20 @@ services:
       - .env.secrets.dsp
     environment:
       - SERVICE_ROLE=dsp
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
-      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
       - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ./logs:/app/logs
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=dsp 映射
     depends_on:
       redis:
         condition: service_healthy
@@ -357,7 +358,6 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -370,7 +370,6 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
-    # R38 P1-7: 角色专属 healthcheck — 检查 dsp Bot 进程在运行(cmdline 含 dsp)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone dsp' in cmd else 1)\" || exit 1"]
       interval: 30s
@@ -380,7 +379,7 @@ services:
 
   # ── mon (监控管理 Bot) ──
   mon:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-mon
     restart: always
     env_file:
@@ -388,15 +387,20 @@ services:
       - .env.secrets.mon
     environment:
       - SERVICE_ROLE=mon
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
-      # R41 P1-9: mon 需要管理权限(XAUTOCLAIM/XTRIM/EVAL)→ 改用 tgjiema_admin 用户
-      # tgjiema_writer 缺少 XAUTOCLAIM/EVAL,mon 切换 leader lease / 修复 PEL 时需要
       - REDIS_URL=redis://tgjiema_admin:${REDIS_ADMIN_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ./logs:/app/logs
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=mon 映射
     depends_on:
       redis:
         condition: service_healthy
@@ -404,7 +408,6 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -417,7 +420,6 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
-    # R38 P1-7: 角色专属 healthcheck — 检查 mon Bot 进程在运行(cmdline 含 mon)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone mon' in cmd else 1)\" || exit 1"]
       interval: 30s
@@ -427,7 +429,7 @@ services:
 
   # ── admin_bot (管理员 Bot) ──
   admin_bot:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-admin_bot
     restart: always
     env_file:
@@ -435,14 +437,20 @@ services:
       - .env.secrets.admin_bot
     environment:
       - SERVICE_ROLE=admin_bot
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
-      # R41 P1-9: admin_bot 需要管理权限(管理消费组/重置 PEL)→ 改用 tgjiema_admin
       - REDIS_URL=redis://tgjiema_admin:${REDIS_ADMIN_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ./logs:/app/logs
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=admin_bot 映射
     depends_on:
       redis:
         condition: service_healthy
@@ -450,7 +458,6 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -463,7 +470,6 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
-    # R38 P1-7: 角色专属 healthcheck — 检查 admin_bot 进程在运行(cmdline 含 admin_bot)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone admin_bot' in cmd else 1)\" || exit 1"]
       interval: 30s
@@ -473,7 +479,7 @@ services:
 
   # ── admin (Web 管理后台) ──
   admin:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-admin
     restart: always
     ports:
@@ -483,14 +489,20 @@ services:
       - .env.secrets.admin
     environment:
       - SERVICE_ROLE=admin
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
-      # R41 P1-9: admin 后台需要管理权限(管理消费组/EVAL Lua)→ 改用 tgjiema_admin
       - REDIS_URL=redis://tgjiema_admin:${REDIS_ADMIN_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ./logs:/app/logs
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=admin 映射
     depends_on:
       redis:
         condition: service_healthy
@@ -498,7 +510,6 @@ services:
         condition: service_started
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固(read_only + tmpfs + security_opt + 资源限制)
     read_only: true
     tmpfs:
       - /tmp
@@ -525,7 +536,7 @@ services:
 
   # ── db_backup (数据库备份,增量 watermark + 加密) ──
   db_backup:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-db_backup
     restart: on-failure
     env_file:
@@ -533,18 +544,23 @@ services:
       - .env.secrets.db_backup
     environment:
       - SERVICE_ROLE=db_backup
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
-      # R40 P0-3: 统一 REDIS_URL 格式(tgjiema_writer 用户 + Compose 插值密码)
       - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
       - ./data:/app/data
-      - ./config:/app/config
       - ./logs:/app/logs
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据 SERVICE_ROLE=db_backup 映射
     depends_on:
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -557,7 +573,6 @@ services:
         limits:
           cpus: '1.0'
           memory: 512M
-    # R38 P1-7: 角色专属 healthcheck — 检查 db_backup 进程在运行(cmdline 含 db_backup)
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import os; cmd=open('/proc/1/cmdline','rb').read().replace(b'\\x00',b' ').decode(); exit(0 if 'standalone db_backup' in cmd else 1)\" || exit 1"]
       interval: 60s
@@ -565,29 +580,32 @@ services:
       retries: 3
       start_period: 120s
 
-  # ── prometheus_exporter (指标导出,R38 P1-9) ──
-  # 独立 HTTP server,监听 0.0.0.0:9100/metrics
-  # 从 SQLite cache_store / relay_pool 读取指标,不依赖 Redis/CRDB
+  # ── prometheus_exporter (指标导出) ──
   prometheus_exporter:
-    build: .
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
     container_name: tgjiema-prometheus_exporter
     restart: always
     env_file:
       - .env.shared
     environment:
       - SERVICE_ROLE=prometheus_exporter
+      - APP_ENV=production
       - PYTHONUNBUFFERED=1
       - PROMETHEUS_EXPORTER_HOST=0.0.0.0
       - PROMETHEUS_EXPORTER_PORT=9100
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
     volumes:
-      - ./data:/app/data:ro  # 只读挂载(exporter 不写数据)
-      - ./config:/app/config
-    # R70 Wave 2: 移除 command 覆盖,由 docker/entrypoint.py 根据
-    # SERVICE_ROLE=prometheus_exporter 映射到 `python -m services.prometheus_exporter`
+      - ./data:/app/data:ro
     depends_on:
       migration:
         condition: service_completed_successfully
-    # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
       - /tmp
@@ -602,7 +620,6 @@ services:
         limits:
           cpus: '0.25'
           memory: 64M
-    # R38 P1-7: 角色专属 healthcheck — 检查 /metrics 端点可访问
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; r=urllib.request.urlopen('http://localhost:9100/health'); exit(0 if r.status==200 else 1)\" || exit 1"]
       interval: 30s

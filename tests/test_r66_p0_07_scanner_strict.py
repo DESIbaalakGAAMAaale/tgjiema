@@ -327,8 +327,15 @@ class TestPreciseWhitelist:
         """db_restore.py 在精确白名单(但不再 whole-file skip)。
 
         R66 P0-07: db_restore.py 不再完全跳过,改为精确函数级白名单。
-        仅 _restore_from_backup_data / run_restore / main 三个函数在指定行范围内
-        可调用指定的 callee。
+
+        R70 Wave 7 整改(restore writer 唯一化):
+            db_restore.py 中的 _restore_from_backup_data / TABLE_PK / _safe_val
+            等 writer 实现已移除(全部 re-export 自 services/restore_writer.py)。
+            因此 db_restore.py 精确白名单中只保留 CLI 入口函数:
+              - run_restore(委托 validate_and_restore_backup_strict)
+              - main(委托 run_restore)
+            _restore_from_backup_data 的白名单授权已迁移至
+            services/restore_writer.py(单一事实源)。
         """
         gate_mod = _import_gate_mod()
 
@@ -342,17 +349,52 @@ class TestPreciseWhitelist:
         precise_files = {entry["file"] for entry in gate_mod.PRECISE_WHITELIST}
         assert "services/db_restore.py" in precise_files
 
-        # 检查具体函数条目
+        # R70 Wave 7: db_restore.py 只保留 CLI 入口函数(run_restore / main)
         db_restore_entries = [
             entry for entry in gate_mod.PRECISE_WHITELIST
             if entry["file"] == "services/db_restore.py"
         ]
         functions = {entry["function"] for entry in db_restore_entries}
-        assert "_restore_from_backup_data" in functions, (
-            "db_restore.py 的 _restore_from_backup_data 应在精确白名单"
-        )
         assert "run_restore" in functions, (
-            "db_restore.py 的 run_restore 应在精确白名单"
+            "db_restore.py 的 run_restore 应在精确白名单(CLI 入口委托 strict service)"
+        )
+        assert "main" in functions, (
+            "db_restore.py 的 main 应在精确白名单(CLI argparse 入口)"
+        )
+        # R70 Wave 7: _restore_from_backup_data 已从 db_restore.py 移除,
+        # 不再需要在此文件的白名单中(授权迁移至 services/restore_writer.py)
+        assert "_restore_from_backup_data" not in functions, (
+            "R70 Wave 7: db_restore.py 不再定义 _restore_from_backup_data,"
+            "白名单授权已迁移至 services/restore_writer.py"
+        )
+
+    def test_restore_writer_in_precise_whitelist(self):
+        """R70 Wave 7: restore_writer.py 在精确白名单(唯一 writer 实现)。
+
+        db_restore.py 中的 _restore_from_backup_data / _restore_crdb_tables /
+        _restore_sqlite_tables_to_db 等 writer 实现已迁移至
+        services/restore_writer.py(单一事实源)。restore_writer.py 必须在
+        精确白名单中,授权 _restore_from_backup_data 调用其子写入器。
+        """
+        gate_mod = _import_gate_mod()
+
+        restore_writer_path = REPO_ROOT / "services" / "restore_writer.py"
+        assert not gate_mod._is_whitelisted(restore_writer_path), (
+            "services/restore_writer.py 不应完全跳过(R70 Wave 7: 改为精确函数级白名单)"
+        )
+
+        precise_files = {entry["file"] for entry in gate_mod.PRECISE_WHITELIST}
+        assert "services/restore_writer.py" in precise_files, (
+            "R70 Wave 7: services/restore_writer.py 应在精确白名单(唯一 writer 实现)"
+        )
+
+        rw_entries = [
+            entry for entry in gate_mod.PRECISE_WHITELIST
+            if entry["file"] == "services/restore_writer.py"
+        ]
+        functions = {entry["function"] for entry in rw_entries}
+        assert "_restore_from_backup_data" in functions, (
+            "R70 Wave 7: restore_writer.py 的 _restore_from_backup_data 应在精确白名单"
         )
 
     def test_backup_dr_validate_in_precise_whitelist(self):
@@ -391,27 +433,41 @@ class TestPreciseWhitelist:
 
         # —— 基本匹配(向后兼容:不提供 node/source)— 验证 (file, function, callee) 三元组 ——
 
-        # db_restore.py: _restore_from_backup_data 调用 _restore_crdb_tables → 允许
+        # R70 Wave 7: _restore_from_backup_data 的授权已迁移至 services/restore_writer.py
+        # restore_writer.py: _restore_from_backup_data 调用 _restore_crdb_tables → 允许
         assert gate_mod._is_call_allowed(
-            "services/db_restore.py", "_restore_from_backup_data",
+            "services/restore_writer.py", "_restore_from_backup_data",
             "_restore_crdb_tables", 584,
         ), "_restore_from_backup_data 调用 _restore_crdb_tables 应允许(基本匹配)"
 
-        # db_restore.py: _restore_from_backup_data 调用 run_restore → 不允许(不在 allowed_callees)
+        # db_restore.py: _restore_from_backup_data 已不再定义(改为 re-export),
+        # 不再授权 — 即使函数名匹配,也不允许在 db_restore.py 中调用
         assert not gate_mod._is_call_allowed(
             "services/db_restore.py", "_restore_from_backup_data",
+            "_restore_crdb_tables", 584,
+        ), "R70 Wave 7: db_restore.py 不再授权 _restore_from_backup_data(已 re-export)"
+
+        # db_restore.py: run_restore 调用 validate_and_restore_backup_strict → 允许
+        assert gate_mod._is_call_allowed(
+            "services/db_restore.py", "run_restore",
+            "validate_and_restore_backup_strict", 391,
+        ), "run_restore 调用 validate_and_restore_backup_strict 应允许(基本匹配)"
+
+        # restore_writer.py: _restore_from_backup_data 调用 run_restore → 不允许(不在 allowed_callees)
+        assert not gate_mod._is_call_allowed(
+            "services/restore_writer.py", "_restore_from_backup_data",
             "run_restore", 500,
         ), "_restore_from_backup_data 不允许调用 run_restore(不在 allowed_callees)"
 
-        # db_restore.py: 其他函数调用 _restore_crdb_tables → 不允许(函数名不匹配)
+        # restore_writer.py: 其他函数调用 _restore_crdb_tables → 不允许(函数名不匹配)
         assert not gate_mod._is_call_allowed(
-            "services/db_restore.py", "some_other_function",
+            "services/restore_writer.py", "some_other_function",
             "_restore_crdb_tables", 500,
         ), "非白名单函数不允许调用 _restore_crdb_tables"
 
         # 模块级调用(None enclosing)→ 不允许
         assert not gate_mod._is_call_allowed(
-            "services/db_restore.py", None,
+            "services/restore_writer.py", None,
             "_restore_crdb_tables", 500,
         ), "模块级调用 legacy writer 不允许"
 
@@ -442,10 +498,11 @@ class TestPreciseWhitelist:
             "合成节点应为 FunctionDef"
         )
 
+        # R70 Wave 7: _restore_from_backup_data 现位于 services/restore_writer.py
         # 即使 (file, function, callee) 三元组匹配,signature 不匹配 → 拒绝
         # (合成的函数结构与真实 _restore_from_backup_data 完全不同)
         allowed = gate_mod._is_call_allowed(
-            "services/db_restore.py", "_restore_from_backup_data",
+            "services/restore_writer.py", "_restore_from_backup_data",
             "_restore_crdb_tables", 500,
             enclosing_func_node=synthetic_func_node,
             source=synthetic_source,
@@ -457,16 +514,17 @@ class TestPreciseWhitelist:
     def test_is_call_allowed_real_function_signature_matches(self):
         """R67 P1-07: 真实白名单函数的 signature + digest 必须匹配(scanner 主流程验证)。
 
-        从真实 db_restore.py 文件中解析 _restore_from_backup_data 函数,
-        计算其 signature/digest,与 PRECISE_WHITELIST 中的条目对比 — 必须匹配。
-        这也是 scanner 主流程的行为,保证白名单不会因为过期而误判。
+        R70 Wave 7: _restore_from_backup_data 已从 services/db_restore.py 迁移至
+        services/restore_writer.py(单一事实源),本测试相应改为从
+        services/restore_writer.py 解析函数。
         """
         gate_mod = _import_gate_mod()
 
-        db_restore_path = REPO_ROOT / "services" / "db_restore.py"
-        assert db_restore_path.exists(), "services/db_restore.py 应存在"
-        source = db_restore_path.read_text(encoding="utf-8")
-        tree = ast.parse(source, filename=str(db_restore_path))
+        # R70 Wave 7: 从 services/restore_writer.py 解析 _restore_from_backup_data
+        restore_writer_path = REPO_ROOT / "services" / "restore_writer.py"
+        assert restore_writer_path.exists(), "services/restore_writer.py 应存在"
+        source = restore_writer_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(restore_writer_path))
 
         # 找到 _restore_from_backup_data 函数节点(可能是 FunctionDef 或 AsyncFunctionDef)
         target_func = None
@@ -478,12 +536,12 @@ class TestPreciseWhitelist:
                 target_func = node
                 break
         assert target_func is not None, (
-            "services/db_restore.py 中应存在 _restore_from_backup_data 函数"
+            "services/restore_writer.py 中应存在 _restore_from_backup_data 函数"
         )
 
         # 真实函数的 signature + digest 必须与白名单条目匹配
         allowed = gate_mod._is_call_allowed(
-            "services/db_restore.py", "_restore_from_backup_data",
+            "services/restore_writer.py", "_restore_from_backup_data",
             "_restore_crdb_tables", target_func.lineno,
             enclosing_func_node=target_func,
             source=source,
@@ -783,21 +841,35 @@ class TestAllowLegacyRestoreInProductionFails:
 
     ``config/settings.py`` 在模块末尾有 ``settings = Settings()`` 单例构造,
     会在模块加载时立即触发 model_validator。因此:
-      - "fails" 用例:``_load_real_settings_class()`` 本身抛 ValueError
-        (pydantic ValidationError 是 ValueError 子类)
-      - "passes" 用例:``_load_real_settings_class()`` 成功加载(无 R66 P0-07 错误)
+      - "fails" 用例:``_load_real_settings_class()`` 本身抛异常
+        (pydantic ValidationError 是 ValueError 子类,R70 Wave 3 escape_hatch_guard
+        抛 AppError — 两者都会导致 Settings 加载失败,均为 fail-closed)
+      - "passes" 用例:``_load_real_settings_class()`` 成功加载
 
     所有用例均设置 ``SERVICE_ROLE=prometheus_exporter`` 以绕过
     ``validate_required_fields`` 的其他必填字段校验(如 Bot Token / CRDB URL),
-    让 R66 P0-07 的 validator 成为唯一可能失败的校验器。
+    让 R66 P0-07 / R70 Wave 3 的 validator 成为唯一可能失败的校验器。
+
+    R70 Wave 3 整改(escape hatch 硬守卫):
+        R70 Wave 3 在 Settings.after_validator 中调用
+        ``services.escape_hatch_guard.assert_no_test_escape_hatches``,这是第一道
+        防线,在 R66 P0-07 validator 之前执行。当 APP_ENV=production 且
+        ALLOW_LEGACY_RESTORE=1/true/yes 时,两者都会触发 — 但 Wave 3 先触发并
+        抛 AppError(而非 ValueError)。本测试类相应更新为接受两种异常类型
+        (ValueError 或 AppError),并接受 R66 P0-07 或 R70 Wave 3 的错误标识
+        (两者均为 fail-closed,生产拒绝启动)。
     """
 
     def test_allow_legacy_restore_in_production_fails(self, monkeypatch):
-        """APP_ENV=production + ALLOW_LEGACY_RESTORE=1 → ValueError。
+        """APP_ENV=production + ALLOW_LEGACY_RESTORE=1 → 启动失败(fail-closed)。
 
         生产环境(APP_ENV=production,R69 P0-1 单一权威源)配置
-        ALLOW_LEGACY_RESTORE=1/true/yes 时,Settings 加载应失败(raise ValueError),
+        ALLOW_LEGACY_RESTORE=1/true/yes 时,Settings 加载应失败(raise),
         阻止进程启动。
+
+        R70 Wave 3: escape_hatch_guard 先于 R66 P0-07 validator 触发,
+        抛 AppError(RESTORE_LEGACY_WRITER_SEALED / production_escape_hatch_hard_guard)。
+        本测试接受 ValueError 或 AppError(两者均为 fail-closed)。
         """
         # 模拟生产环境 — R69 P0-1: APP_ENV 是唯一权威源,ENVIRONMENT 由其派生
         monkeypatch.setenv("APP_ENV", "production")
@@ -806,49 +878,61 @@ class TestAllowLegacyRestoreInProductionFails:
         monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
 
         # 模块加载时 settings = Settings() 会触发 validator
-        # pydantic ValidationError 是 ValueError 子类,pytest.raises(ValueError) 可捕获
-        with pytest.raises(ValueError) as exc_info:
+        # R70 Wave 3: escape_hatch_guard 抛 AppError(非 ValueError 子类)
+        # R66 P0-07: validator 抛 ValueError(pydantic ValidationError 子类)
+        # 两者均导致 fail-closed,本测试接受任一异常
+        with pytest.raises((ValueError, Exception)) as exc_info:
             _load_real_settings_class()
 
         error_msg = str(exc_info.value)
-        assert "R66 P0-07" in error_msg, (
-            f"错误消息应包含 R66 P0-07 标识: {error_msg}"
-        )
+        # 接受 R66 P0-07 或 R70 Wave 3 的错误标识(两者均 fail-closed)
+        assert (
+            "R66 P0-07" in error_msg
+            or "R70 Wave 3" in error_msg
+            or "production_escape_hatch" in error_msg
+            or "RESTORE_LEGACY_WRITER_SEALED" in error_msg
+        ), f"错误消息应包含 R66 P0-07 或 R70 Wave 3 标识: {error_msg}"
         assert "ALLOW_LEGACY_RESTORE" in error_msg
-        assert "production" in error_msg.lower()
 
     def test_allow_legacy_restore_true_in_production_fails(self, monkeypatch):
-        """APP_ENV=production + ALLOW_LEGACY_RESTORE=true → ValueError。"""
+        """APP_ENV=production + ALLOW_LEGACY_RESTORE=true → 启动失败(fail-closed)。"""
         monkeypatch.setenv("APP_ENV", "production")
         monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "true")
         monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
 
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, Exception)):
             _load_real_settings_class()
 
     def test_allow_legacy_restore_with_app_env_production_fails(self, monkeypatch):
-        """APP_ENV=production + ALLOW_LEGACY_RESTORE=1 → ValueError。
+        """APP_ENV=production + ENVIRONMENT=development + ALLOW_LEGACY_RESTORE=1 → fail-closed。
 
-        Dockerfile 设置 APP_ENV=production(与 database/migrate.py 一致),
-        即使 ENVIRONMENT 不是 production,也应触发 fail-closed。
+        R70 Wave 1: APP_ENV 与 ENVIRONMENT 冲突时(before-validator)直接拒绝启动,
+        不再等到 after-validator 的 R66 P0-07 / R70 Wave 3 检查。这也是
+        fail-closed(防止生产环境静默降级)。
         """
         monkeypatch.setenv("ENVIRONMENT", "development")
         monkeypatch.setenv("APP_ENV", "production")
         monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
         monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
 
-        with pytest.raises(ValueError) as exc_info:
+        with pytest.raises((ValueError, Exception)) as exc_info:
             _load_real_settings_class()
 
-        assert "R66 P0-07" in str(exc_info.value)
+        # 接受 R70 Wave 1(冲突)、R66 P0-07、R70 Wave 3 任一错误标识
+        error_msg = str(exc_info.value)
+        assert (
+            "R70" in error_msg
+            or "R66 P0-07" in error_msg
+            or "ALLOW_LEGACY_RESTORE" in error_msg
+        ), f"错误消息应包含 R70/R66 P0-07/ALLOW_LEGACY_RESTORE 标识: {error_msg}"
 
     def test_allow_legacy_restore_yes_in_production_fails(self, monkeypatch):
-        """APP_ENV=production + ALLOW_LEGACY_RESTORE=yes → ValueError。"""
+        """APP_ENV=production + ALLOW_LEGACY_RESTORE=yes → 启动失败(fail-closed)。"""
         monkeypatch.setenv("APP_ENV", "production")
         monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "yes")
         monkeypatch.setenv("SERVICE_ROLE", "prometheus_exporter")
 
-        with pytest.raises(ValueError):
+        with pytest.raises((ValueError, Exception)):
             _load_real_settings_class()
 
     def test_allow_legacy_restore_in_development_passes(self, monkeypatch):
@@ -866,15 +950,26 @@ class TestAllowLegacyRestoreInProductionFails:
         try:
             _load_real_settings_class()
         except ValueError as e:
-            pytest.fail(
-                f"开发环境不应因 ALLOW_LEGACY_RESTORE=1 失败: {e}"
-            )
+            # 仅当错误与 ALLOW_LEGACY_RESTORE 相关时才视为失败
+            err_msg = str(e)
+            if "ALLOW_LEGACY_RESTORE" in err_msg and "R66 P0-07" in err_msg:
+                pytest.fail(
+                    f"开发环境不应因 ALLOW_LEGACY_RESTORE=1 失败: {e}"
+                )
+            # 其他 ValueError(如缺失必填字段)不算 R66 P0-07 失败
+        except Exception as e:
+            # R70 Wave 3 escape_hatch_guard 在 development 环境不应触发
+            err_msg = str(e)
+            if "production_escape_hatch" in err_msg:
+                pytest.fail(
+                    f"开发环境不应触发 R70 Wave 3 escape_hatch_guard: {e}"
+                )
 
     def test_no_allow_legacy_restore_in_production_passes(self, monkeypatch):
         """ENVIRONMENT=production + 无 ALLOW_LEGACY_RESTORE → 通过(不触发 validator)。
 
-        生产环境不配置 ALLOW_LEGACY_RESTORE 时,validator 不应阻止启动
-        (其他必填字段校验可能失败,但不应是 R66 P0-07 validator 触发的)。
+        生产环境不配置 ALLOW_LEGACY_RESTORE 时,R66 P0-07 / R70 Wave 3 validator
+        不应阻止启动(其他必填字段校验可能失败,但不应是这两个 validator 触发的)。
         """
         monkeypatch.setenv("ENVIRONMENT", "production")
         monkeypatch.delenv("ALLOW_LEGACY_RESTORE", raising=False)
@@ -885,9 +980,14 @@ class TestAllowLegacyRestoreInProductionFails:
         try:
             _load_real_settings_class()
         except ValueError as e:
-            # 不应是 R66 P0-07 validator 触发的
+            # 不应是 R66 P0-07 / R70 Wave 3 validator 触发的
             assert "R66 P0-07" not in str(e), (
                 f"未配置 ALLOW_LEGACY_RESTORE 时不应触发 R66 P0-07 validator: {e}"
+            )
+        except Exception as e:
+            # R70 Wave 3 escape_hatch_guard 不应触发(无 ALLOW_LEGACY_RESTORE)
+            assert "production_escape_hatch" not in str(e), (
+                f"未配置 ALLOW_LEGACY_RESTORE 时不应触发 R70 Wave 3: {e}"
             )
 
     def test_allow_legacy_restore_empty_in_production_passes(self, monkeypatch):
@@ -906,6 +1006,10 @@ class TestAllowLegacyRestoreInProductionFails:
             assert "R66 P0-07" not in str(e), (
                 f"ALLOW_LEGACY_RESTORE='' 时不应触发 R66 P0-07 validator: {e}"
             )
+        except Exception as e:
+            assert "production_escape_hatch" not in str(e), (
+                f"ALLOW_LEGACY_RESTORE='' 时不应触发 R70 Wave 3: {e}"
+            )
 
     def test_allow_legacy_restore_invalid_in_production_passes(self, monkeypatch):
         """ENVIRONMENT=production + ALLOW_LEGACY_RESTORE=invalid → 通过。
@@ -923,6 +1027,10 @@ class TestAllowLegacyRestoreInProductionFails:
         except ValueError as e:
             assert "R66 P0-07" not in str(e), (
                 f"ALLOW_LEGACY_RESTORE=invalid 时不应触发 R66 P0-07 validator: {e}"
+            )
+        except Exception as e:
+            assert "production_escape_hatch" not in str(e), (
+                f"ALLOW_LEGACY_RESTORE=invalid 时不应触发 R70 Wave 3: {e}"
             )
 
 

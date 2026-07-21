@@ -484,8 +484,8 @@ class TestWriterDigestRecompute:
         should_not_call = AsyncMock(
             return_value={"restored": {}, "skipped": [], "errors": []}
         )
-        with patch("services.db_restore._restore_crdb_tables", should_not_call), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", should_not_call):
+        with patch("services.restore_writer._restore_crdb_tables", should_not_call), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", should_not_call):
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
@@ -546,8 +546,8 @@ class TestWriterDigestRecompute:
 
         # writer 重算 digest(基于 tampered canonical_payload_bytes)→ tampered_digest
         # 但 _capability.payload_digest 仍是原始值 → 不匹配 → AppError
-        with patch("services.db_restore._restore_crdb_tables", AsyncMock()), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", AsyncMock()):
+        with patch("services.restore_writer._restore_crdb_tables", AsyncMock()), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", AsyncMock()):
             with pytest.raises(AppError):
                 await _restore_from_backup_data(
                     verified_payload,
@@ -575,8 +575,8 @@ class TestWriterDigestRecompute:
         )
 
         # mock 恢复函数(返回空结果,无错误)
-        with patch("services.db_restore._restore_crdb_tables", AsyncMock()), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", AsyncMock()):
+        with patch("services.restore_writer._restore_crdb_tables", AsyncMock()), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", AsyncMock()):
             result = await _restore_from_backup_data(
                 verified_payload,
                 _capability=cap,
@@ -618,8 +618,8 @@ class TestWriterDigestRecompute:
 
         # writer 应重算 digest(与 capability 一致)→ 成功
         # (不使用 verified_payload.payload_digest = "0"*64)
-        with patch("services.db_restore._restore_crdb_tables", AsyncMock()), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", AsyncMock()):
+        with patch("services.restore_writer._restore_crdb_tables", AsyncMock()), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", AsyncMock()):
             result = await _restore_from_backup_data(
                 verified_payload,
                 _capability=cap,
@@ -665,8 +665,8 @@ class TestFailClosedOnDataSourceFailure:
             result["errors"].append("CRDB connection refused")
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-        with patch("services.db_restore._restore_crdb_tables", _failing_crdb), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", AsyncMock()):
+        with patch("services.restore_writer._restore_crdb_tables", _failing_crdb), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", AsyncMock()):
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
@@ -709,12 +709,12 @@ class TestFailClosedOnDataSourceFailure:
 
         # mock get_table_source 返回 "sqlite" → 走 SQLite 恢复路径
         monkeypatch.setattr(
-            "services.db_restore.get_table_source",
+            "services.restore_writer.get_table_source",
             lambda t: "sqlite" if t == "sqlite_table" else "crdb",
         )
         # mock BACKUP_SCHEMA 包含此表
         monkeypatch.setattr(
-            "services.db_restore.BACKUP_SCHEMA",
+            "services.restore_writer.BACKUP_SCHEMA",
             {"sqlite_table": MagicMock()},
         )
 
@@ -723,7 +723,7 @@ class TestFailClosedOnDataSourceFailure:
             result["errors"].append("SQLite disk I/O error")
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-        with patch("services.db_restore._restore_sqlite_tables_to_db", _failing_sqlite):
+        with patch("services.restore_writer._restore_sqlite_tables_to_db", _failing_sqlite):
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
@@ -764,11 +764,11 @@ class TestFailClosedOnDataSourceFailure:
         )
 
         monkeypatch.setattr(
-            "services.db_restore.get_table_source",
+            "services.restore_writer.get_table_source",
             lambda t: "relay_sqlite" if t == "relay_table" else "crdb",
         )
         monkeypatch.setattr(
-            "services.db_restore.BACKUP_SCHEMA",
+            "services.restore_writer.BACKUP_SCHEMA",
             {"relay_table": MagicMock()},
         )
 
@@ -776,7 +776,7 @@ class TestFailClosedOnDataSourceFailure:
             result["errors"].append("relay SQLite locked")
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-        with patch("services.db_restore._restore_sqlite_tables_to_db", _failing_relay):
+        with patch("services.restore_writer._restore_sqlite_tables_to_db", _failing_relay):
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
@@ -811,8 +811,8 @@ class TestFailClosedOnDataSourceFailure:
         async def _crdb_with_error(tables_data, merge, result):
             result["errors"].append("simulated partial failure")
 
-        with patch("services.db_restore._restore_crdb_tables", _crdb_with_error), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", AsyncMock()):
+        with patch("services.restore_writer._restore_crdb_tables", _crdb_with_error), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", AsyncMock()):
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
@@ -845,8 +845,8 @@ class TestFailClosedOnDataSourceFailure:
             result["errors"].append("fail")
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
 
-        with patch("services.db_restore._restore_crdb_tables", _failing_crdb), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", AsyncMock()):
+        with patch("services.restore_writer._restore_crdb_tables", _failing_crdb), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", AsyncMock()):
             # AppError 抛出 — 调用方无法获得 result dict(无部分成功)
             with pytest.raises(AppError):
                 returned = await _restore_from_backup_data(
@@ -1119,7 +1119,7 @@ class TestNoOpenTransactionsOnColsEmpty:
 
         # Mock validate_columns_for_table 返回空列表
         monkeypatch.setattr(
-            "services.db_restore.validate_columns_for_table",
+            "services.restore_writer.validate_columns_for_table",
             lambda table, cols: [],
         )
 
@@ -1158,7 +1158,7 @@ class TestNoOpenTransactionsOnColsEmpty:
         monkeypatch.setattr(session_mod, "_client", mock_client)
 
         monkeypatch.setattr(
-            "services.db_restore.validate_columns_for_table",
+            "services.restore_writer.validate_columns_for_table",
             lambda table, cols: [],
         )
 
@@ -1195,7 +1195,7 @@ class TestNoOpenTransactionsOnColsEmpty:
             raise ValueError(f"非法列名: {cols}")
 
         monkeypatch.setattr(
-            "services.db_restore.validate_columns_for_table",
+            "services.restore_writer.validate_columns_for_table",
             _failing_validate,
         )
 
@@ -1252,7 +1252,7 @@ class TestTransactionContextManager:
 
         # Mock validate_columns_for_table 返回合法列
         monkeypatch.setattr(
-            "services.db_restore.validate_columns_for_table",
+            "services.restore_writer.validate_columns_for_table",
             lambda table, cols: ["user_id", "username"],
         )
 
@@ -1310,7 +1310,7 @@ class TestTransactionContextManager:
         monkeypatch.setattr(session_mod, "_client", mock_client)
 
         monkeypatch.setattr(
-            "services.db_restore.validate_columns_for_table",
+            "services.restore_writer.validate_columns_for_table",
             lambda table, cols: ["user_id"],
         )
 
@@ -1351,10 +1351,7 @@ class TestTransactionContextManager:
 
         # Mock:表名校验失败(模拟 _validate_identifier 抛异常)
         monkeypatch.setattr(
-            "services.db_restore._validate_identifier" if hasattr(
-                __import__("services.db_restore", fromlist=["_validate_identifier"]),
-                "_validate_identifier"
-            ) else "database.session._validate_identifier",
+            "database.session._validate_identifier",
             lambda x: (_ for _ in ()).throw(ValueError(f"非法表名: {x}")),
         )
 

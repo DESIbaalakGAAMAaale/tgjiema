@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# R48 P0-2: 配置 GitHub branch protection for master 分支
+# R48 P0-2 / R70 Wave 10: 配置 GitHub branch protection for master 分支(兼容模式)
 #
 # R48 整改说明:
 #   旧版本硬编码 required_status_checks.contexts 为
@@ -11,6 +11,13 @@
 #   新版本通过 scripts/detect_branch_protection_contexts.sh 自动读取
 #   最新 master commit 的 check-runs,提取实际 context 名称,再配置 BP。
 #   用户也可通过 CONTEXTS_JSON 环境变量手动覆盖。
+#
+# R70 Wave 10 兼容模式说明:
+#   R70 Wave 10 引入 Repository Ruleset (configure_branch_ruleset.sh)
+#   作为主治理方式。本脚本作为兼容 backup:
+#     - 若 BP 已配置:打印当前配置 + 警告"建议迁移到 Ruleset",不覆盖
+#     - 若 BP 未配置(404):使用 legacy API 配置(作为安全网)
+#     - --dry-run:仅打印 payload,不调用 gh api
 #
 # 使用方法:
 #   # 1) 自动检测 context(推荐)
@@ -24,18 +31,107 @@
 #                   "Release Gates / verify-branch-protection", \
 #                   "E2E Tests / playwright-e2e"]' \
 #     ./scripts/configure_branch_protection.sh
+#   # 5) --dry-run 模式(仅打印 payload,不调用 gh api)
+#   ./scripts/configure_branch_protection.sh --dry-run
+#   ./scripts/configure_branch_protection.sh --dry-run maxiuquan tgjiema
 #
 # 鉴权(二选一):
 #   - 设置 GH_TOKEN / GITHUB_TOKEN 环境变量
 #   - 或 gh CLI 已登录(gh auth login)
+#   - --dry-run 模式跳过鉴权
 #
 # 配置完成后会立即复用 verify-branch-protection job 的断言逻辑做自检,
 # 任何属性不满足 R47/R48 P0-2 要求都会让本脚本以非零退出。
 set -euo pipefail
 
+# ─── R70 Wave 10 兼容模式默认 contexts(--dry-run 模式使用) ───
+DEFAULT_DRY_RUN_CONTEXTS='["CI / test (3.11)","CI / lint","CI / repo-hygiene","Release Gates / verify-branch-protection","Release Gates / verify-branch-ruleset","Deploy Check / verify-deploy"]'
+
+# ─── 帮助信息 ───
+print_help() {
+  cat <<EOF
+用法: $0 [--dry-run] [OWNER] [REPO]
+
+R48 P0-2 / R70 Wave 10: 配置 GitHub branch protection for master 分支(兼容模式)。
+
+R70 Wave 10 兼容模式行为:
+  - 若 BP 已配置:打印当前配置 + 警告"建议迁移到 Ruleset",不覆盖
+  - 若 BP 未配置(404):使用 legacy API 配置(作为安全网)
+  - --dry-run:仅打印 payload,不调用 gh api
+
+参数(可选,可通过环境变量或位置参数指定):
+  OWNER  仓库 owner(默认从 gh repo view / git remote 推断)
+  REPO   仓库名(默认从 gh repo view / git remote 推断)
+
+标志:
+  --dry-run   仅打印 payload,不调用 gh api(用于审计/测试)
+  --help, -h  显示帮助信息
+
+环境变量:
+  OWNER                  仓库 owner
+  REPO                   仓库名
+  CONTEXTS_JSON          手动指定 contexts(JSON 数组,覆盖自动检测)
+  GH_TOKEN / GITHUB_TOKEN  GitHub PAT(admin scope,若未设置则使用 gh CLI)
+
+鉴权(二选一):
+  - 设置 GH_TOKEN / GITHUB_TOKEN 环境变量
+  - 或 gh CLI 已登录(gh auth login with admin scope)
+  - --dry-run 模式跳过鉴权
+
+退出码:
+  0  成功(或 --dry-run 打印 payload 完成,或 BP 已配置时打印 + 警告迁移)
+  1  API 失败或参数错误
+
+示例:
+  OWNER=maxiuquan REPO=tgjiema $0
+  $0 maxiuquan tgjiema
+  $0 --dry-run
+  $0 --dry-run maxiuquan tgjiema
+  CONTEXTS_JSON='["CI / lint"]' $0
+EOF
+}
+
+# ─── 0. 解析 flags(--dry-run / --help) ───
+DRY_RUN=false
+POSITIONAL_ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --help|-h)
+      print_help
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
+    --*)
+      echo "ERROR: [R70 Wave 10] 未知 flag: $1"
+      echo "  用法: $0 [--dry-run] [OWNER] [REPO]"
+      echo "  运行 '$0 --help' 查看完整帮助"
+      exit 1
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+# 恢复位置参数
+set -- "${POSITIONAL_ARGS[@]+"${POSITIONAL_ARGS[@]}"}" 2>/dev/null || set --
+
 # ─── 1. 解析 OWNER / REPO(环境变量优先,其次位置参数,最后 git remote 推断) ───
 OWNER="${OWNER:-${1:-}}"
 REPO="${REPO:-${2:-}}"
+
+if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
+  if command -v gh >/dev/null 2>&1; then
+    REPO_INFO=$(gh repo view --json owner,name 2>/dev/null || true)
+    if [ -n "$REPO_INFO" ]; then
+      OWNER="${OWNER:-$(echo "$REPO_INFO" | jq -r '.owner.login // empty')}"
+      REPO="${REPO:-$(echo "$REPO_INFO" | jq -r '.name // empty')}"
+    fi
+  fi
+fi
 
 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
   # 从 git remote origin 推断 owner/repo
@@ -52,22 +148,34 @@ if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
 fi
 
 if [ -z "$OWNER" ] || [ -z "$REPO" ]; then
-  echo "ERROR: 无法确定 OWNER / REPO"
+  echo "ERROR: [R70 Wave 10] 无法确定 OWNER / REPO"
   echo "  用法 1: OWNER=owner REPO=repo $0"
   echo "  用法 2: $0 owner repo"
+  echo "  用法 3: $0 --dry-run owner repo"
   echo "  或确保 git remote origin 指向 GitHub 仓库"
   exit 1
 fi
 
-# ─── 2. 鉴权(token 优先,否则用 gh CLI 已登录的凭证) ───
+echo "[INFO] OWNER=${OWNER}  REPO=${REPO}  DRY_RUN=${DRY_RUN}"
+
+# ─── 2. 鉴权(token 优先,否则用 gh CLI 已登录的凭证;--dry-run 跳过) ───
 TOKEN="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
 USE_GH_CLI=true
 if [ -n "$TOKEN" ]; then
   USE_GH_CLI=false
 else
-  if ! gh auth status >/dev/null 2>&1; then
-    echo "ERROR: 需要 GH_TOKEN / GITHUB_TOKEN 环境变量,或先执行 gh auth login"
-    exit 1
+  if [ "$DRY_RUN" = "false" ]; then
+    if ! gh auth status >/dev/null 2>&1; then
+      echo "ERROR: [R70 Wave 10] 需要 GH_TOKEN / GITHUB_TOKEN 环境变量,或先执行 gh auth login"
+      echo "  提示: 使用 --dry-run 可跳过鉴权与 API 调用"
+      exit 1
+    fi
+  else
+    # dry-run 模式: 不需要鉴权,但仍检查 jq 可用
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "ERROR: [R70 Wave 10] 需要 jq(即使 --dry-run 模式也需构造 payload)"
+      exit 1
+    fi
   fi
 fi
 
@@ -89,8 +197,12 @@ if [ -n "${CONTEXTS_JSON:-}" ]; then
     echo "ERROR: CONTEXTS_JSON 数组元素必须全部为字符串"
     exit 1
   fi
+elif [ "$DRY_RUN" = "true" ]; then
+  # 3.2 --dry-run 模式: 不调用 detect 脚本,使用默认 contexts
+  echo "[INFO] --dry-run 模式: 使用默认 contexts(不调用 detect 脚本)"
+  CONTEXTS_JSON="$DEFAULT_DRY_RUN_CONTEXTS"
 else
-  # 3.2 调用 detect 脚本自动检测
+  # 3.3 调用 detect 脚本自动检测
   echo "[INFO] 自动检测实际 check-runs 名称..."
   if [ ! -f "$DETECT_SCRIPT" ]; then
     echo "ERROR: detect_branch_protection_contexts.sh 不存在: $DETECT_SCRIPT"
@@ -106,12 +218,13 @@ else
     echo "  请先在 master 分支触发至少一次 CI / Deploy Check / Release Gates / E2E workflow,"
     echo "  然后再运行本脚本;或手动指定:"
     echo "  CONTEXTS_JSON='[\"CI / test (3.11)\",\"Deploy Check / verify-deploy\",...]' $0"
+    echo "  提示: 使用 --dry-run 可跳过 detect 调用"
     exit 1
   fi
   CONTEXTS_JSON="$DETECT_OUTPUT"
 fi
 
-# 3.3 输出待配置的 contexts 供用户确认
+# 3.4 输出待配置的 contexts 供用户确认
 CONTEXTS_COUNT=$(echo "$CONTEXTS_JSON" | jq 'length')
 if [ "$CONTEXTS_COUNT" -lt 1 ]; then
   echo "ERROR: contexts 列表为空,无法配置 branch protection"
@@ -123,8 +236,8 @@ echo "=== 即将配置的 status check contexts (${CONTEXTS_COUNT} 个) ==="
 echo "$CONTEXTS_JSON" | jq -r '.[]' | sed 's/^/  - /'
 echo ""
 
-# 3.4 R48 P0-2 软警告:四个核心 workflow 至少各有一个 context 覆盖
-# (警告不阻断,允许用户自定义子集)
+# 3.5 R48 P0-2 软警告:四个核心 workflow 至少各有一个 context 覆盖
+# (警告不阻断,允许用户自定义子集;--dry-run 模式也输出警告以提示完整覆盖)
 MISSING_COVERAGE=()
 for prefix in "CI /" "Deploy Check /" "Release Gates /" "E2E Tests /"; do
   if ! echo "$CONTEXTS_JSON" | jq -e --arg p "$prefix" \
@@ -142,7 +255,7 @@ if [ "${#MISSING_COVERAGE[@]}" -gt 0 ]; then
   echo ""
 fi
 
-# 3.5 R64 P0-01 / P1-11 软警告:Release Gates 17 个 job + CI / repo-hygiene 覆盖
+# 3.6 R64 P0-01 / P1-11 软警告:Release Gates 17 个 job + CI / repo-hygiene 覆盖
 # Release Gates workflow 实际 job 名必须与 release-gates.yml 完全一致(17 个 job,
 # R66 P1-10 新增 attestation-semantics-verify,R66 P1-11 新增 tag-ruleset-verify,
 # R66 P1-02 新增 migration-binding-gate):
@@ -256,6 +369,64 @@ PAYLOAD=$(jq -n \
   block_creations: false,
   required_conversation_resolution: true
 }')
+
+# ─── 4.1 --dry-run 模式:打印 payload 后退出 ───
+if [ "$DRY_RUN" = "true" ]; then
+  echo ""
+  echo "=========================================================="
+  echo "  DRY RUN — 不调用 gh api,仅打印 payload 供审计"
+  echo "=========================================================="
+  echo ""
+  echo "=== Branch Protection PUT payload ==="
+  echo "$PAYLOAD" | jq '.'
+  echo ""
+  echo "=========================================================="
+  echo "  DRY RUN 完成 — 未调用任何 gh api"
+  echo "  实际应用: 去掉 --dry-run 重新运行本脚本"
+  echo "  (实际模式下,本脚本会先 GET 检查现有 BP:"
+  echo "   若已配置则打印 + 警告迁移到 Ruleset;"
+  echo "   若未配置则 PUT 创建)"
+  echo "=========================================================="
+  exit 0
+fi
+
+# ─── 4.2 R70 Wave 10 兼容模式:检查现有 BP ───
+# 若 BP 已配置:打印当前配置 + 警告"建议迁移到 Ruleset",不覆盖
+# 若 BP 未配置(404):使用 legacy API 配置(作为安全网)
+echo ""
+echo "=== R70 Wave 10 兼容模式: 检查现有 branch protection ==="
+if [ "$USE_GH_CLI" = "true" ]; then
+  BP_CHECK_RESPONSE=$(gh api "repos/${OWNER}/${REPO}/branches/master/protection" 2>&1 || true)
+else
+  BP_CHECK_RESPONSE=$(curl -sS \
+    -H "Authorization: token ${TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/${OWNER}/${REPO}/branches/master/protection" 2>&1 || true)
+fi
+
+# BP 已配置:响应包含 url 字段
+if echo "$BP_CHECK_RESPONSE" | jq -e '.url' > /dev/null 2>&1; then
+  echo "WARN: [R70 Wave 10] branch protection 已配置(legacy API)"
+  echo "  R70 Wave 10 推荐: 迁移到 Repository Ruleset (configure_branch_ruleset.sh)"
+  echo "  Ruleset 提供更现代的声明式规则,与 BP 互补或替代。"
+  echo ""
+  echo "  当前 legacy BP 配置:"
+  echo "$BP_CHECK_RESPONSE" | jq '{required_status_checks, enforce_admins, required_pull_request_reviews, allow_force_pushes, allow_deletions, required_linear_history, required_conversation_resolution}'
+  echo ""
+  echo "  迁移指南:"
+  echo "  1. 运行 ./scripts/configure_branch_ruleset.sh 配置 R67 + R70 ruleset"
+  echo "  2. 验证 ruleset: ./scripts/verify_branch_ruleset.sh"
+  echo "  3. (可选)删除 legacy BP (admin 操作):"
+  echo "     gh api -X DELETE repos/${OWNER}/${REPO}/branches/master/protection"
+  echo ""
+  echo "  本脚本保留 legacy BP 作为 backup(不覆盖现有配置)。"
+  exit 0
+fi
+
+# BP 未配置(404 或其他错误):使用 legacy API 创建
+echo "[INFO] branch protection 未配置,使用 legacy API 创建(作为安全网)"
+echo ""
 
 # ─── 5. 调用 GitHub API 配置 branch protection ───
 echo "Configuring branch protection for ${OWNER}/${REPO}/master..."

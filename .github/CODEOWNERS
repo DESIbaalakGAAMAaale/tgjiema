@@ -1,6 +1,11 @@
-# R68 P0: CODEOWNERS — 强制独立 reviewer 审批
+# R68 P0 / R70 Wave 10: CODEOWNERS — 强制独立 reviewer 审批
 # 规则:每个路径至少需要 2 名独立 reviewer 审批
 # 提交者不得自批(dismiss_stale_reviews + require_code_owner_reviews)
+#
+# R70 Wave 10 整改(P0-01 治理止血):
+#   - 补齐关键信任链路径的 owner
+#   - services/restore_writer.py / config/environment.py / config/settings.py /
+#     docker/entrypoint.py / docker-compose.prod.yml 强制 owner 评审
 
 # ─── 治理与签名 ───
 /.github/workflows/                        @maxiuquan
@@ -21,23 +26,30 @@
 /scripts/generate_production_evidence.py   @maxiuquan
 /scripts/check_crdb_ru_threshold.py        @maxiuquan
 
-# ─── Scanner 与 allowlist ───
+# ─── Scanner 与 allowlist(静态门禁) ───
 /scripts/check_restore_no_legacy_writer.py @maxiuquan
+/scripts/check_compose_static_rules.py     @maxiuquan
 /scripts/regenerate_scanner_whitelist_digests.py @maxiuquan
 
-# ─── Docker / Compose ───
+# ─── Docker / Compose(容器入口 + 部署拓扑) ───
 /Dockerfile                                @maxiuquan
 /.dockerignore                             @maxiuquan
+/docker/entrypoint.py                      @maxiuquan
 /docker-compose.yml                        @maxiuquan
-/scripts/check_compose_static_rules.py     @maxiuquan
+/docker-compose.prod.yml                   @maxiuquan
 /scripts/runtime_smoke_compose.py          @maxiuquan
 
-# ─── Restore / Backup / Production guard ───
+# ─── Restore / Backup / Production guard(恢复信任链) ───
+/services/restore_writer.py                @maxiuquan
 /services/db_restore.py                    @maxiuquan
 /services/db_backup.py                     @maxiuquan
 /services/backup_dr_validate.py            @maxiuquan
 /services/_production_guard.py             @maxiuquan
 /services/command_bus.py                   @maxiuquan
+
+# ─── Config 层(配置基线) ───
+/config/environment.py                     @maxiuquan
+/config/settings.py                        @maxiuquan
 
 # ─── Promotion / Evidence ───
 /services/production_promotion.py          @maxiuquan

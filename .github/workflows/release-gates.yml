@@ -67,11 +67,20 @@ name: Release Gates
 on:
   push:
     branches: [master, main]
-    # R65 P0-04: release tag (v*.*.*) 触发 production-promotion-gate,
-    # 强制要求真实、签名、未过期、5 类齐全的 production 证据才能晋级
-    tags: ['v*.*.*']
+    # R70 P0-10: master/staging/RC/production namespace 完全分离
+    #   - master/main push → staging environment (CI gates + 镜像构建,不签名)
+    #   - rc-v* tag → rc-candidate environment (sign-image + publish-attestation
+    #                 + attestation-semantics-verify + migration-binding-gate
+    #                 + verify-only-3x + production-evidence)
+    #   - production-v* tag → production environment (production-promotion-gate)
+    # 旧的 v*.*.* tag 触发已废弃 — production 部署只能通过 production-v* tag
+    # 或 workflow_dispatch 触发(R70 P0-10 强制要求)。
+    tags: ['rc-v*', 'production-v*']
   pull_request:
     branches: [master, main]
+  # R70 P0-10: production 部署可通过 workflow_dispatch 手动触发
+  # (例如运维上传 production evidence artifact 后手动触发 production-promotion-gate)
+  workflow_dispatch:
 
 jobs:
   # ─── 1. docker-build (R58 P0-1: build once, 推送 GHCR, 输出 OCI digest) ──
@@ -86,6 +95,10 @@ jobs:
   #       均通过 image_digest 引用, 不再重新构建
   docker-build:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。docker-build 在 master push 与 RC tag 都运行,
+    # 因此使用动态 environment 表达式根据 ref 选择环境。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
       packages: write   # 推送 GHCR 必需
@@ -125,21 +138,22 @@ jobs:
     # R58 P0-1: 唯一镜像 tag = ci-{sha}-{run_id} (不可变, 强引用 digest)
     # R67 P1-14: 仅 release candidate/tag 流程推送可晋级镜像到生产命名空间;
     #            普通 push/PR 使用临时命名空间(<repo>-ci)与短 retention。
+    # R70 P0-10: namespace 完全分离 — 使用 rc-v* / production-v* 替代旧的 v*.*.* tag
     - name: Compute image tag
       id: meta
       run: |
         # tag 在所有 job 间共享 (rc-continuity / publish-attestation / sign-image)
         # 同一 SHA + 不同 run_id 时 tag 也会变化 (用于 RC continuity 比对)
-        # R67 P1-14: 命名空间选择
-        #   - 生产命名空间 ghcr.io/${{ github.repository }}:仅 release tag (v*.*.*)
-        #     或 master/main push 可推送(可晋级镜像)
+        # R67 P1-14 / R70 P0-10: 命名空间选择
+        #   - 生产命名空间 ghcr.io/${{ github.repository }}:仅 release candidate tag
+        #     (rc-v*) 或 production tag (production-v*) 或 master/main push 可推送(可晋级镜像)
         #   - 临时命名空间 ghcr.io/${{ github.repository }}-ci:PR 与非 master 分支 push
         #     使用短 retention(由 cleanup-ci-images job 自动清理)
         REPO="${{ github.repository }}"
         GITHUB_REF="${{ github.ref }}"
         GITHUB_EVENT="${{ github.event_name }}"
-        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-          # release tag (v*.*.*) → 生产命名空间
+        if [[ "${GITHUB_REF}" == refs/tags/rc-v* ]] || [[ "${GITHUB_REF}" == refs/tags/production-v* ]]; then
+          # RC tag (rc-v*) 或 production tag (production-v*) → 生产命名空间
           IMAGE_NAME="ghcr.io/${REPO}"
           IS_PRODUCTION_NAMESPACE="true"
           RETENTION_DAYS="permanent"
@@ -398,6 +412,9 @@ jobs:
   oci-allowlist-verify:
     runs-on: ubuntu-latest
     needs: [docker-build]
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。oci-allowlist-verify 在 master push 与 RC tag 都运行。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
       packages: read   # 拉取 GHCR 镜像必需
@@ -441,6 +458,9 @@ jobs:
   runtime-smoke-compose:
     runs-on: ubuntu-latest
     needs: [docker-build]
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。runtime-smoke-compose 在 master push 与 RC tag 都运行。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
       packages: read   # 拉取 GHCR 镜像必需
@@ -486,6 +506,10 @@ jobs:
   # 用 docker manifest inspect 验证 Dockerfile 第 17 行的 digest 真实可拉取
   docker-digest-verify:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。docker-digest-verify 是纯静态校验(无 secrets),
+    # 但为保持 environment 审计一致性,仍使用动态 environment 表达式。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -500,6 +524,9 @@ jobs:
   # 验证 docker-compose.yml 配置语法正确
   compose-config:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -542,6 +569,9 @@ jobs:
   # 跑 Redis ACL 契约测试(由其他 agent 创建)
   redis-acl-matrix:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -572,6 +602,9 @@ jobs:
   # 验证 SQLite/CRDB schema 静态合法性
   schema-diff:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -599,6 +632,9 @@ jobs:
   # 默认模式与 ci.yml Scanner 11 一致;--strict 模式留作未来全量迁移后启用。
   restore-legacy-seal-gate:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -629,6 +665,9 @@ jobs:
   #                       文案违规(dims 4-5)允许 baseline 渐进式清零。
   i18n-strict-export-boundary-gate:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -662,6 +701,9 @@ jobs:
   # 失败必须阻断 release-summary 和 publish-attestation(required, no skip)。
   migration-manifest-gate:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -693,6 +735,9 @@ jobs:
   # 失败必须阻断 release-summary 和 publish-attestation(required, no skip)。
   button-flow-real-ux-gate:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -715,6 +760,9 @@ jobs:
   # 跑 backup 恢复演练测试(由其他 agent 创建)
   backup-restore-drill:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -746,6 +794,9 @@ jobs:
   # 生成 SBOM(JSON 格式,含 license / sha256)
   sbom:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -785,6 +836,9 @@ jobs:
   # R43 P0-2: 安全任务不允许降级为 warning,必须阻断发布
   pip-audit:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
@@ -807,6 +861,9 @@ jobs:
   # ─── 9. trivy (R43 P0-2: 阻断式漏洞扫描,移除 continue-on-error) ──
   trivy:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       with:
@@ -835,10 +892,16 @@ jobs:
   sign-image:
     runs-on: ubuntu-latest
     needs: [docker-build]
-    # R66 P1-01: Release Gates 语义降级 — 普通 push 到非 master 分支或 PR 不签名临时镜像。
-    # 仅 master/main push 与 release tag (refs/tags/v*) 才签名,避免每个文档提交产生
-    # 可被误认作候选的签名镜像。tag push 必须签名以满足 P0-03 的 tag identity 校验。
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # R70 P0-10: sign-image 仅在 RC tag (rc-v*) 触发,禁止 master push 直接进入签名路径。
+    #   旧实现: master/main push 与 v* tag 都触发 sign-image → 违反"master/staging/RC/
+    #            production namespace 完全分离"原则(master push 直接产生正式签名证据)。
+    #   新实现: 仅 rc-v* tag 触发,environment=rc-candidate。master push 只产 staging
+    #           (镜像构建 + 测试 + lint),不签名;RC tag 才产生 production candidate
+    #           evidence(sign-image + publish-attestation + attestation-semantics-verify)。
+    #   production 部署由 production-v* tag 触发 production-promotion-gate(独立 job),
+    #   不再触发 sign-image(签名已在 RC 阶段完成,production 阶段只做晋级门禁验证)。
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v')
+    environment: rc-candidate
     # R46 P0-5: 删除 continue-on-error,签名失败必须阻断发布
     # R61 P0-04: cosign sign 默认把签名推回 GHCR (sha256-<digest>.sig 标签),
     # 需要 packages: write;actions/attest-build-provenance push-to-registry: true 同理。
@@ -1602,6 +1665,9 @@ jobs:
   #           差异、修复命令)。
   verify-branch-protection:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — verify-branch-protection 在 master push 与
+    # RC/production tag 都运行(治理门禁,非纯 lint),使用动态 environment。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     # R53 P0-1: GITHUB_TOKEN 无 administration 权限(读 BP 返回 403
     # "Resource not accessible by integration")。
     # administration 不是 GITHUB_TOKEN 的有效 permission scope,必须用 PAT。
@@ -1632,6 +1698,9 @@ jobs:
   # 失败必须阻断 release-summary 和 publish-attestation(required, no skip)。
   verify-branch-ruleset:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — verify-branch-ruleset 在 master push 与
+    # RC/production tag 都运行(治理门禁,非纯 lint),使用动态 environment。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
     steps:
@@ -1655,7 +1724,11 @@ jobs:
   # 失败必须阻断 release-summary 和 publish-attestation(required, no skip)。
   verify-git-source-governance:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。verify-git-source-governance 在 master push 与 RC/
+    # production tag 都运行(commit/tag 签名治理,所有 release target 都需要)。
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/rc-v') || startsWith(github.ref, 'refs/tags/production-v'))
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
     steps:
@@ -1698,6 +1771,10 @@ jobs:
   #     只有当历史 >= 3 次且 digest 不一致时才阻断。
   rc-continuity:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。rc-continuity 在 master push 与 RC/production tag 都运行
+    # (验证 RC 候选证据 + 3-run promotion gate),使用动态 environment。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
       actions: read
@@ -1974,6 +2051,9 @@ jobs:
     #   且要求 evidence_status=production。
     # R66 P1-01: Release Gates 语义降级 — publish-attestation 同样在 release tag (refs/tags/v*)
     #   触发,确保 tag push 也生成签名 attestation;非 master 非 tag 的普通 push 与 PR 不签名。
+    # R70 P0-10: publish-attestation 仅在 RC tag (rc-v*) 触发,与 sign-image 同步。
+    #   master push 不再产生 publish-attestation(只产 staging,不签名);
+    #   RC tag 才产生 production candidate evidence(sign-image + publish-attestation)。
     # R66 P1-02: needs 增加 migration-binding-gate — publish-attestation 必须等待
     #   migration-binding-gate (HARD 签名绑定校验) 通过后才生成 attestation,
     #   确保发布的 attestation 绑定的 catalog 已通过 HARD 校验。
@@ -1983,7 +2063,8 @@ jobs:
             backup-restore-drill, sbom, pip-audit, trivy,
             verify-branch-protection, verify-branch-ruleset,
             verify-git-source-governance, rc-continuity, sign-image]
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v')
+    environment: rc-candidate
     permissions:
       contents: read
       actions: read
@@ -2412,7 +2493,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [publish-attestation, docker-build]
     # R66 P1-10: 同 publish-attestation,仅在 master/main push 或 release tag 时运行
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # R70 P0-10: 同 publish-attestation,仅在 RC tag (rc-v*) 触发。
+    #   master push 不再触发(不签名 → 无 attestation 可校验)。
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v')
+    environment: rc-candidate
     permissions:
       contents: read
       actions: read
@@ -2656,7 +2740,11 @@ jobs:
     runs-on: ubuntu-latest
     # R67 P0-04: 仅 release target (master/main push) 或 release tag 时运行
     # PR 场景不运行(避免资源消耗 + PR 不需要 3x 验证)
-    if: github.event_name == 'push'
+    # R70 P0-10: 同 sign-image / publish-attestation,仅在 RC tag (rc-v*) 触发。
+    #   verify-only-3x 依赖 sign-image + publish-attestation + attestation-semantics-verify,
+    #   这些 job 都只在 RC tag 触发,因此 verify-only-3x 也只在 RC tag 运行。
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v')
+    environment: rc-candidate
     needs: [docker-build, sign-image, publish-attestation, attestation-semantics-verify]
     permissions:
       contents: read
@@ -2760,7 +2848,11 @@ jobs:
     runs-on: ubuntu-latest
     # R66 P1-11: tag ruleset 校验仅在 release tag 时严格阻断;
     # PR / branch push 时仅做 dry-run(允许 ruleset 未配置,但 warn)。
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。tag-ruleset-verify 在 master push 与 RC/production tag
+    # 都运行(治理门禁),使用动态 environment。
     if: github.event_name == 'push'
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     # R66 P1-11 注:administration 不是 GitHub Actions permissions 有效 scope,
     # ruleset API 读取依赖默认 GITHUB_TOKEN(contents: read)或 PAT(通过 secrets)。
     permissions:
@@ -2773,8 +2865,8 @@ jobs:
       env:
         GH_TOKEN: ${{ secrets.BP_PAT_TOKEN || secrets.GITHUB_TOKEN }}
         GITHUB_REPOSITORY: ${{ github.repository }}
-        # R66 P1-11: release tag 场景严格校验;其他场景 dry-run
-        RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        # R70 P0-10: release tag 场景严格校验(rc-v* / production-v*);其他场景 dry-run
+        RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/rc-v') || startsWith(github.ref, 'refs/tags/production-v') }}
       run: |
         set -euo pipefail
         echo "=== R66 P1-11: Tag Ruleset Verification ==="
@@ -2787,8 +2879,8 @@ jobs:
         echo ""
         echo "Release tag scenario: ${RELEASE_TAG}"
         echo ""
-        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
-          echo "R66 P1-11: release tag 场景 — 严格校验 tag ruleset"
+        if [[ "${GITHUB_REF}" == refs/tags/rc-v* ]] || [[ "${GITHUB_REF}" == refs/tags/production-v* ]]; then
+          echo "R66 P1-11 / R70 P0-10: release tag 场景 (rc-v* / production-v*) — 严格校验 tag ruleset"
           # release tag 场景:必须严格校验,fail-closed
           bash scripts/verify_tag_ruleset.sh --strict
         else
@@ -2828,6 +2920,10 @@ jobs:
   #     5. production-promotion-gate (tag-only) 必须依赖此 job 且 evidence_status=production
   crdb-ru-72h-attribution-gate:
     runs-on: ubuntu-latest
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。crdb-ru-72h-attribution-gate 在 master push 与 RC/
+    # production tag 都运行(证据生成 + 阈值校验),使用动态 environment。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     outputs:
       # R66 P0-05: job 输出 evidence_status,区分 not_applicable (dry-run) 与 production (strict)
       # - not_applicable: PR / push 场景,未提供真实 72h 数据,不得计入 Production GO
@@ -2871,9 +2967,10 @@ jobs:
         set -euo pipefail
         echo "=== R65 P1-09 / R66 P0-05: CRDB RU 72h Attribution Gate ==="
         # 判断场景:PR / push → dry-run;release tag → strict + real data
+        # R70 P0-10: release tag 包括 rc-v* (RC candidate) 与 production-v* (production)
         IS_RELEASE_TAG=false
         DATA_FILE=""
-        if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+        if [[ "${GITHUB_REF}" == refs/tags/rc-v* ]] || [[ "${GITHUB_REF}" == refs/tags/production-v* ]]; then
           IS_RELEASE_TAG=true
           echo "  场景: release tag(${GITHUB_REF}),要求严格校验 + 真实 72h 数据"
         else
@@ -2958,7 +3055,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [sign-image]
     # R66 P1-01: 同 sign-image,仅在 master/main push 或 release tag 时运行
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    # R70 P0-10: 同 sign-image,仅在 RC tag (rc-v*) 触发。
+    #   master push 不再触发(无 sign-image 输出可校验)。
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v')
+    environment: rc-candidate
     permissions:
       contents: read
       actions: read
@@ -3007,6 +3107,11 @@ jobs:
   production-evidence:
     runs-on: ubuntu-latest
     if: always()
+    # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
+    # production-v*=production。production-evidence 通过 if: always() 在所有场景运行
+    # (PR / push / tag),使用动态 environment。RC/production tag 触发真实证据,
+    # PR / master push 仅 dry-run。
+    environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     needs: [docker-build, sbom, sign-image, publish-attestation]
     permissions:
       contents: read
@@ -3119,14 +3224,13 @@ jobs:
             'production_evidence_required': ['soak', 'vps_recovery', 'chaos', 'ru_72h', 'supply_chain'],
         }
         # 若 supply_chain_result.json 存在,附加结果摘要
+        # R70 P0-10 整改: 删除 except Exception: pass (吞异常违反整改规范),
+        #   改为 fail-closed — JSON 解析失败立即报错,不静默跳过
         sc_path = Path('./supply_chain_result.json')
         if sc_path.exists():
-            try:
-                sc = json.loads(sc_path.read_text())
-                index['supply_chain_passed'] = sc.get('overall_passed', False)
-                index['supply_chain_checks_count'] = len(sc.get('checks', []))
-            except Exception:
-                pass
+            sc = json.loads(sc_path.read_text())
+            index['supply_chain_passed'] = sc.get('overall_passed', False)
+            index['supply_chain_checks_count'] = len(sc.get('checks', []))
         Path('./production-evidence/production_evidence_index.json').write_text(
             json.dumps(index, ensure_ascii=False, indent=2)
         )
@@ -3164,13 +3268,20 @@ jobs:
   #   artifact(production-evidence-{sha}-{run_id}),CI 不自动合成真实证据。
   production-promotion-gate:
     runs-on: ubuntu-latest
-    # R65 P0-04: 仅 release tag (v*.*.*) 触发,PR / branch push 自动 skipped
-    if: startsWith(github.ref, 'refs/tags/v')
+    # R70 P0-10: master/staging/RC/production namespace 完全分离
+    #   - 旧版 v*.*.* tag 触发已废弃
+    #   - production 部署只能由 production-v* tag 或 workflow_dispatch 手动触发
+    #   - master push / rc-v* tag 触发的 workflow 中本 job 必须 skipped
+    #   - 使用 environment: production (受 GitHub Environment Protection Rules 保护:
+    #     required reviewers / deployment branches / wait timer)
+    # R65 P0-04: 仅 release tag 触发,PR / branch push 自动 skipped
     # R66 P0-05: 增加 crdb-ru-72h-attribution-gate 依赖,要求 evidence_status=production
     #   (tag-only 场景下该 job 必须运行 strict 模式并提供真实 72h 数据,
     #    evidence_status=not_applicable 不允许 — 缺证据 = failure)
     # R67 P0-04: 增加 verify-only-3x 依赖,要求 release tag 前 3x verify-only 必须通过
     # R67 P0-05: 增加 verify-only-3x 作为代码门禁 vs 生产证据门禁分离的一部分
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/production-v')
+    environment: production
     needs: [production-evidence, crdb-ru-72h-attribution-gate, verify-only-3x]
     permissions:
       contents: read
@@ -3397,14 +3508,31 @@ jobs:
         if [ "${GITHUB_EVENT_NAME}" = "push" ] && { [ "${GITHUB_REF}" = "refs/heads/master" ] || [ "${GITHUB_REF}" = "refs/heads/main" ]; }; then
           RELEASE_TARGET=true
         fi
-        # R65 P0-04: release tag (v*.*.*) 触发 production-promotion-gate,
+        # R70 P0-10: release tag 模式分离
+        #   - RC_TAG (refs/tags/rc-v*): RC candidate,触发 sign-image / verify-only-3x /
+        #     production-evidence / migration-binding-gate / attestation-semantics-verify
+        #   - PRODUCTION_TAG (refs/tags/production-v*): production 部署,触发
+        #     production-promotion-gate (environment: production)
+        #   - 旧的 v*.*.* tag 触发已废弃
+        # R65 P0-04: release tag 触发 production-promotion-gate,
         # 必须严格阻断;PR / branch push 场景该 job 为 skipped(允许)
+        RC_TAG=false
+        PRODUCTION_TAG=false
+        if [[ "${GITHUB_REF}" == refs/tags/rc-v* ]]; then
+          RC_TAG=true
+        fi
+        if [[ "${GITHUB_REF}" == refs/tags/production-v* ]]; then
+          PRODUCTION_TAG=true
+        fi
+        # RELEASE_TAG = RC_TAG 或 PRODUCTION_TAG(用于 sign-image 等需要 release tag 触发的 job)
         RELEASE_TAG=false
-        if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+        if [ "${RC_TAG}" = "true" ] || [ "${PRODUCTION_TAG}" = "true" ]; then
           RELEASE_TAG=true
         fi
         echo "Release target (master/main push): ${RELEASE_TARGET}"
-        echo "Release tag (v*.*.*): ${RELEASE_TAG}"
+        echo "RC tag (rc-v*): ${RC_TAG}"
+        echo "Production tag (production-v*): ${PRODUCTION_TAG}"
+        echo "Release tag (rc-v* or production-v*): ${RELEASE_TAG}"
         FAIL=0
         for entry in \
           "docker-build=${DOCKER_BUILD}" \
@@ -3439,25 +3567,46 @@ jobs:
           conclusion="${entry##*=}"
           echo "  ${job}: ${conclusion}"
           # sign-image / publish-attestation / migration-binding-gate /
-          # attestation-semantics-verify / verify-git-source-governance / verify-only-3x:
-          # master-only + tag-only job,PR 上可 skipped
-          # R66 P1-10: attestation-semantics-verify 同样仅在 master/tag push 运行
-          # R67 P0-01: verify-git-source-governance 同样仅在 master/tag push 运行
+          # attestation-semantics-verify / verify-only-3x:
+          # R70 P0-10: RC-only jobs — 仅 rc-v* tag 触发,master push 与 production-v* tag
+          # 上均为 skipped(签名 / attestation / 验证链在 RC 阶段完成)。
+          # verify-git-source-governance: master push + rc-v* + production-v* 都运行
           #   (PR 场景 commit 签名可放宽,因 PR commit 在合并时通常会被重新签名)
-          # R67 P0-04: verify-only-3x 同样仅在 push 运行(PR 不需要 3x 验证)
-          if [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ] || [ "${job}" = "migration-binding-gate" ] || [ "${job}" = "attestation-semantics-verify" ] || [ "${job}" = "verify-git-source-governance" ] || [ "${job}" = "verify-only-3x" ]; then
-            if [ "${RELEASE_TARGET}" = "true" ] || [ "${RELEASE_TAG}" = "true" ]; then
-              # release target (master/main push) 或 release tag (refs/tags/v*):
-              # 必须成功(skipped = 供应链断裂,P0-06 必须兜住)
-              # R66 P1-01: tag push 也必须签名 + 生成 attestation,不允许 skipped
-              # R66 P1-02: migration-binding-gate 同样在 tag/master push 上必须 success
-              # R66 P1-10: attestation-semantics-verify 同样在 tag/master push 上必须 success
+          # R66 P1-10: attestation-semantics-verify 同 RC-only 模式
+          # R67 P0-01: verify-git-source-governance 在 master push + RC/production tag 都运行
+          # R67 P0-04: verify-only-3x 同 RC-only 模式
+          if [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ] || [ "${job}" = "migration-binding-gate" ] || [ "${job}" = "attestation-semantics-verify" ] || [ "${job}" = "verify-only-3x" ]; then
+            # R70 P0-10: RC-only jobs — 仅 RC_TAG=true 时必须 success
+            # - master push: skipped (允许,master 不再触发签名)
+            # - production-v* tag: skipped (允许,签名已在 RC 阶段完成)
+            # - rc-v* tag: 必须 success (RC candidate 必须有完整签名链)
+            # - PR: skipped (允许)
+            if [ "${RC_TAG}" = "true" ]; then
+              # RC tag: 必须成功(skipped = 供应链断裂,P0-06 必须兜住)
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on RC tag (got: ${conclusion})"
+                echo "  R70 P0-10: RC candidate 必须有完整签名/attestation/验证链"
+                FAIL=1
+              fi
+            else
+              # master push / production-v* tag / PR: 允许 skipped,failure/cancelled 仍阻断
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
+          elif [ "${job}" = "verify-git-source-governance" ]; then
+            # R67 P0-01: verify-git-source-governance 在 master push + rc-v* + production-v* 都运行
+            # - master/main push (RELEASE_TARGET=true): 必须 success
+            # - rc-v* tag (RC_TAG=true): 必须 success
+            # - production-v* tag (PRODUCTION_TAG=true): 必须 success
+            # - PR: 允许 skipped(if: github.event_name == 'push' 排除 PR)
+            if [ "${RELEASE_TARGET}" = "true" ] || [ "${RC_TAG}" = "true" ] || [ "${PRODUCTION_TAG}" = "true" ]; then
               if [ "${conclusion}" != "success" ]; then
                 echo "::error::Job '${job}' did not succeed on release target/tag (got: ${conclusion})"
                 FAIL=1
               fi
             else
-              # PR: 允许 skipped(if: 未满足),但 failure/cancelled 仍阻断
               if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
                 echo "::error::Job '${job}' did not succeed on PR (got: ${conclusion})"
                 FAIL=1
@@ -3465,7 +3614,7 @@ jobs:
             fi
           elif [ "${job}" = "tag-ruleset-verify" ]; then
             # R66 P1-11: tag-ruleset-verify 在 push 时运行(dry-run or strict)
-            # - release tag: 必须 success(strict 模式)
+            # - release tag (rc-v* / production-v*): 必须 success(strict 模式)
             # - 非 release tag push: 必须 success(dry-run,允许 ruleset 未配置)
             # - PR: 允许 skipped(if: github.event_name == 'push' 排除 PR)
             if [ "${RELEASE_TAG}" = "true" ]; then
@@ -3489,13 +3638,14 @@ jobs:
               echo "::warning::Job '${job}' did not succeed (got: ${conclusion}) — non-blocking (R64 P1-12)"
             fi
           elif [ "${job}" = "production-promotion-gate" ]; then
-            # R65 P0-04: release tag (v*.*.*) 上的严格 production 晋级门禁
-            # - release tag: 必须 success(失败立即阻断 release)
-            # - PR / branch push: 允许 skipped(本 job 仅在 tag 上运行)
-            if [ "${RELEASE_TAG}" = "true" ]; then
+            # R70 P0-10: production-promotion-gate 仅在 production-v* tag 或 workflow_dispatch 触发
+            # - production-v* tag (PRODUCTION_TAG=true): 必须 success(失败立即阻断 production 部署)
+            # - workflow_dispatch: 必须 success(运维手动触发的晋级门禁)
+            # - master push / rc-v* tag / PR: 允许 skipped
+            if [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
               if [ "${conclusion}" != "success" ]; then
-                echo "::error::Job '${job}' did not succeed on release tag (got: ${conclusion})"
-                echo "R65 P0-04: production promotion 证据不足,无法晋级"
+                echo "::error::Job '${job}' did not succeed on production tag/dispatch (got: ${conclusion})"
+                echo "R65 P0-04 / R70 P0-10: production promotion 证据不足,无法晋级"
                 FAIL=1
               fi
             else
@@ -3518,9 +3668,10 @@ jobs:
           exit 1
         fi
         echo "PASS: All release gate jobs succeeded"
-        # R65 P0-04: 最终汇总报告 production_promotion_allowed 标记
-        # - release tag 且 production-promotion-gate success → true
-        # - 其他场景(PR / branch push / gate 未运行)→ false
+        # R65 P0-04 / R70 P0-10: 最终汇总报告 production_promotion_allowed 标记
+        # - production-v* tag 或 workflow_dispatch 且 production-promotion-gate success → true
+        # - rc-v* tag (RC candidate): false (RC 不等于 production,需手动晋级)
+        # - master push / PR: false
         # R66 P0-05: defense in depth — 额外校验 crdb-ru-72h-attribution-gate
         #   的 evidence_status=production(production-promotion-gate 已校验,
         #   但 release-summary 作为最终聚合点再校验一次,防止单点失效)
@@ -3528,20 +3679,28 @@ jobs:
         #   - evidence_status=production 但 evidence_present!=true 视为证据缺失
         #   - 防止 dry-run success 被误计为 Production GO
         PRODUCTION_PROMOTION_ALLOWED=false
-        if [ "${RELEASE_TAG}" = "true" ] && [ "${PRODUCTION_PROMOTION_GATE}" = "success" ]; then
-          if [ "${CRDB_RU_72H_EVIDENCE_STATUS}" = "production" ] && [ "${CRDB_RU_72H_EVIDENCE_PRESENT}" = "true" ]; then
-            PRODUCTION_PROMOTION_ALLOWED=true
+        # R70 P0-10: production promotion 仅在 PRODUCTION_TAG=true 或 workflow_dispatch 时允许
+        if [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+          if [ "${PRODUCTION_PROMOTION_GATE}" = "success" ]; then
+            if [ "${CRDB_RU_72H_EVIDENCE_STATUS}" = "production" ] && [ "${CRDB_RU_72H_EVIDENCE_PRESENT}" = "true" ]; then
+              PRODUCTION_PROMOTION_ALLOWED=true
+            else
+              echo "::error::R66 P0-05/P1-04: production tag/dispatch 但 evidence_status=${CRDB_RU_72H_EVIDENCE_STATUS} (要求 production) / evidence_present=${CRDB_RU_72H_EVIDENCE_PRESENT} (要求 true)"
+              echo "  defense in depth 校验失败 — production promotion 拒绝"
+              echo "  R66 P1-04: evidence_present=false 表示无真实数据(即便 job success 也是 dry-run)"
+              exit 1
+            fi
           else
-            echo "::error::R66 P0-05/P1-04: release tag 但 evidence_status=${CRDB_RU_72H_EVIDENCE_STATUS} (要求 production) / evidence_present=${CRDB_RU_72H_EVIDENCE_PRESENT} (要求 true)"
-            echo "  defense in depth 校验失败 — production promotion 拒绝"
-            echo "  R66 P1-04: evidence_present=false 表示无真实数据(即便 job success 也是 dry-run)"
+            echo "::error::R70 P0-10: production tag/dispatch 但 production-promotion-gate=${PRODUCTION_PROMOTION_GATE} (要求 success)"
             exit 1
           fi
         fi
         echo ""
-        echo "=== R65 P0-04 / R66 P0-05 / R66 P1-04: Production Promotion Summary ==="
+        echo "=== R65 P0-04 / R66 P0-05 / R66 P1-04 / R70 P0-10: Production Promotion Summary ==="
         echo "production_promotion_allowed: ${PRODUCTION_PROMOTION_ALLOWED}"
-        echo "  release_tag: ${RELEASE_TAG}"
+        echo "  rc_tag: ${RC_TAG}"
+        echo "  production_tag: ${PRODUCTION_TAG}"
+        echo "  workflow_dispatch: $([ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && echo true || echo false)"
         echo "  production-promotion-gate: ${PRODUCTION_PROMOTION_GATE}"
         echo "  crdb-ru-72h-evidence-status: ${CRDB_RU_72H_EVIDENCE_STATUS}"
         echo "  crdb-ru-72h-evidence-present: ${CRDB_RU_72H_EVIDENCE_PRESENT}"

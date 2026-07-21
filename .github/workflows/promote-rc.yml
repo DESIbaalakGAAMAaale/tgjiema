@@ -1,0 +1,375 @@
+name: Promote RC
+
+# ══════════════════════════════════════════════════════════════════════
+# R70 P0-10 Wave 9: Release Namespace Separation — staging/RC/production
+# ══════════════════════════════════════════════════════════════════════
+#
+# 本 workflow 实现 staging → RC → production 的晋级流水线,与 release-gates.yml
+# 配合完成 R70 P0-10 要求的"master/staging/RC/production namespace 完全分离"。
+#
+# 触发方式:
+#   1. production-v* tag push — 自动晋级(运维推送 production-v* tag 后触发)
+#   2. workflow_dispatch — 手动晋级(运维提供 rc_tag 与 production_tag)
+#
+# 晋级前置条件:
+#   1. RC candidate 必须存在(rc-v* tag 已推送)
+#   2. RC 必须通过 release-gates.yml 的所有 RC-only jobs:
+#      - sign-image (cosign 签名)
+#      - publish-attestation (SLSA / 供应链 attestation)
+#      - attestation-semantics-verify (attestation 语义校验)
+#      - migration-binding-gate (迁移绑定门禁)
+#      - verify-only-3x (Build Once + 3x Verify Only)
+#      - production-evidence (生产证据生成)
+#   3. Signed production evidence artifact 必须已上传
+#      (artifact name: signed-production-evidence-{rc_commit_sha})
+#   4. crdb-ru-72h-attribution-gate 必须 evidence_status=production 且
+#      evidence_present=true
+#
+# 与 release-gates.yml 的关系:
+#   - release-gates.yml: master push → staging / rc-v* tag → rc-candidate /
+#     production-v* tag → production(production-promotion-gate job)
+#   - promote-rc.yml: 显式晋级流水线,验证 RC → production 的所有门禁,
+#     可在 production-v* tag push 或 workflow_dispatch 时触发
+#   - 两个 workflow 的 production-promotion-gate / promote-to-production
+#     都使用 environment: production(GitHub Environment Protection Rules)
+#
+# 整改规范:
+#   - 禁止 TODO 注释、pass 占位符、其他占位符
+#   - 禁止 skip / warn / 吞异常
+#   - 所有 step 必须显式成功或失败(set -euo pipefail)
+
+on:
+  push:
+    tags: ['production-v*']
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: 'RC tag to promote (e.g. rc-v1.0.0)'
+        required: true
+        type: string
+      production_tag:
+        description: 'Production tag to create (e.g. production-v1.0.0)'
+        required: true
+        type: string
+
+# Production 晋级不可取消(避免半完成状态)
+concurrency:
+  group: promote-rc-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ─── 1. Validate RC candidate exists and passed release-gates ────────
+  validate-rc-candidate:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      rc_tag: ${{ steps.resolve.outputs.rc_tag }}
+      rc_commit_sha: ${{ steps.resolve.outputs.rc_commit_sha }}
+      production_tag: ${{ steps.resolve.outputs.production_tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Resolve RC and production tags
+        id: resolve
+        run: |
+          set -euo pipefail
+          # R70 P0-10: 解析 RC tag 与 production tag
+          # - workflow_dispatch: 从 inputs 读取
+          # - production-v* tag push: 从 production tag 派生 RC tag
+          #   (production-v1.0.0 → rc-v1.0.0)
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            RC_TAG="${{ inputs.rc_tag }}"
+            PRODUCTION_TAG="${{ inputs.production_tag }}"
+          else
+            PRODUCTION_TAG="${GITHUB_REF#refs/tags/}"
+            RC_TAG="rc-${PRODUCTION_TAG#production-}"
+          fi
+          echo "RC tag: ${RC_TAG}"
+          echo "Production tag: ${PRODUCTION_TAG}"
+          # 校验 RC tag 命名规范(必须以 rc-v 开头)
+          if [[ ! "${RC_TAG}" =~ ^rc-v ]]; then
+            echo "::error::RC tag '${RC_TAG}' 不符合命名规范(必须以 rc-v 开头)"
+            echo "  R70 P0-10: RC candidate tag 必须形如 rc-v*.*.*"
+            exit 1
+          fi
+          # 校验 production tag 命名规范(必须以 production-v 开头)
+          if [[ ! "${PRODUCTION_TAG}" =~ ^production-v ]]; then
+            echo "::error::Production tag '${PRODUCTION_TAG}' 不符合命名规范(必须以 production-v 开头)"
+            echo "  R70 P0-10: production tag 必须形如 production-v*.*.*"
+            exit 1
+          fi
+          # 校验 RC tag 存在
+          if ! git rev-parse --verify "refs/tags/${RC_TAG}" >/dev/null 2>&1; then
+            echo "::error::RC tag '${RC_TAG}' does not exist"
+            echo "  R70 P0-10: production 部署必须基于已存在的 RC candidate"
+            echo "  请先推送 ${RC_TAG} tag 并通过 release-gates.yml 的 RC 门禁"
+            exit 1
+          fi
+          RC_COMMIT_SHA=$(git rev-parse "refs/tags/${RC_TAG}^{commit}")
+          echo "RC commit SHA: ${RC_COMMIT_SHA}"
+          echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
+          echo "rc_commit_sha=${RC_COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "production_tag=${PRODUCTION_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify RC tag passed release-gates.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RC_TAG="${{ steps.resolve.outputs.rc_tag }}"
+          echo "=== R70 P0-10: Verify RC tag '${RC_TAG}' passed release-gates.yml ==="
+          # 通过 gh CLI 查询 RC tag 的 release-gates.yml workflow run 状态
+          # --branch 匹配 tag 名称(GitHub Actions 将 tag 视为 branch 参数)
+          RUN_INFO=$(gh run list \
+            --workflow=release-gates.yml \
+            --branch="${RC_TAG}" \
+            --status=success \
+            --limit=1 \
+            --json databaseId,conclusion,headSha \
+            2>&1 || echo "")
+          if [ -z "${RUN_INFO}" ] || [ "${RUN_INFO}" = "[]" ]; then
+            echo "::error::RC tag '${RC_TAG}' has no successful release-gates.yml run"
+            echo "  R70 P0-10: production 晋级必须基于已通过 release-gates 的 RC candidate"
+            echo "  请检查 release-gates.yml 在 ${RC_TAG} tag 上的运行状态"
+            exit 1
+          fi
+          RUN_ID=$(echo "${RUN_INFO}" | python3 -c "import json, sys; data=json.load(sys.stdin); print(data[0]['databaseId'] if data else '')")
+          RUN_CONCLUSION=$(echo "${RUN_INFO}" | python3 -c "import json, sys; data=json.load(sys.stdin); print(data[0]['conclusion'] if data else '')")
+          echo "RC tag '${RC_TAG}' passed release-gates.yml:"
+          echo "  run_id:      ${RUN_ID}"
+          echo "  conclusion:  ${RUN_CONCLUSION}"
+          if [ "${RUN_CONCLUSION}" != "success" ]; then
+            echo "::error::RC tag '${RC_TAG}' release-gates.yml conclusion is '${RUN_CONCLUSION}' (expected success)"
+            exit 1
+          fi
+          echo "PASS: RC tag '${RC_TAG}' passed release-gates.yml run ID ${RUN_ID}"
+
+  # ─── 2. Verify signed production evidence artifact ───────────────────
+  verify-production-evidence:
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [validate-rc-candidate]
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio aiosqlite pyyaml
+
+      - name: Download signed production evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: signed-production-evidence-${{ needs.validate-rc-candidate.outputs.rc_commit_sha }}
+          path: ./signed-evidence
+        continue-on-error: true  # artifact 可能不存在,后续步骤会因找不到证据文件而 FAIL
+
+      - name: Verify production evidence (strict, no skip)
+        run: |
+          set -euo pipefail
+          echo "=== R70 P0-10: Verify production evidence for promotion ==="
+          RC_TAG="${{ needs.validate-rc-candidate.outputs.rc_tag }}"
+          RC_COMMIT_SHA="${{ needs.validate-rc-candidate.outputs.rc_commit_sha }}"
+          echo "  RC tag:        ${RC_TAG}"
+          echo "  RC commit SHA: ${RC_COMMIT_SHA}"
+          EVIDENCE_FILE=""
+          for candidate in \
+            "./signed-evidence/production_evidence.json" \
+            "./signed-evidence/production_evidence_index.json"; do
+            if [ -f "${candidate}" ]; then
+              EVIDENCE_FILE="${candidate}"
+              break
+            fi
+          done
+          if [ -z "${EVIDENCE_FILE}" ]; then
+            echo "::error::未找到 production evidence 文件"
+            echo "  R70 P0-10: production 晋级必须提供 signed-production-evidence-${RC_COMMIT_SHA} artifact"
+            echo "  运维需通过单独的 workflow_dispatch 上传签名的 production_evidence.json artifact"
+            echo "  证据文件需含 5 类 artifact: SOAK_7DAY / RESTORE_3X / OUTBOX_FAULT_INJECTION / RU_72H / SUPPLY_CHAIN"
+            echo "  + 顶层 signature 块(cosign 或 gpg, verified=true)"
+            echo "  + 每个 artifact 含 expires_at(ISO 8601,未过期)"
+            echo "  + flags.skip 为空(未使用 --skip)"
+            exit 1
+          fi
+          echo "校验证据文件: ${EVIDENCE_FILE}"
+          # 调用 verify_production_promotion — 不可跳过,失败立即 exit 1
+          python3 scripts/generate_production_evidence.py \
+            --verify-promotion "${EVIDENCE_FILE}"
+          echo "PASS: production evidence 校验通过"
+
+  # ─── 3. Verify RC tag immutability (tag not moved during promotion) ─
+  verify-rc-tag-immutability:
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [validate-rc-candidate]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Verify RC tag has not been moved
+        run: |
+          set -euo pipefail
+          RC_TAG="${{ needs.validate-rc-candidate.outputs.rc_tag }}"
+          RC_COMMIT_SHA="${{ needs.validate-rc-candidate.outputs.rc_commit_sha }}"
+          echo "=== R70 P0-10: Verify RC tag immutability ==="
+          echo "  RC tag:        ${RC_TAG}"
+          echo "  RC commit SHA: ${RC_COMMIT_SHA}"
+          # 重新查询 RC tag 当前指向的 commit
+          CURRENT_SHA=$(git rev-parse "refs/tags/${RC_TAG}^{commit}")
+          echo "RC tag '${RC_TAG}' → ${CURRENT_SHA}"
+          if [ "${CURRENT_SHA}" != "${RC_COMMIT_SHA}" ]; then
+            echo "::error::RC tag '${RC_TAG}' has been moved"
+            echo "  expected (from validate-rc-candidate): ${RC_COMMIT_SHA}"
+            echo "  actual (current):                     ${CURRENT_SHA}"
+            echo "  R70 P0-10: RC tag 不可变 — 不允许在晋级过程中移动 tag"
+            echo "  这可能是恶意篡改或并发推送导致,production 晋级必须 abort"
+            exit 1
+          fi
+          echo "PASS: RC tag '${RC_TAG}' is immutable at ${RC_COMMIT_SHA}"
+
+  # ─── 4. Promote to production (create tag if workflow_dispatch) ─────
+  promote-to-production:
+    runs-on: ubuntu-latest
+    environment: production
+    needs: [validate-rc-candidate, verify-production-evidence, verify-rc-tag-immutability]
+    permissions:
+      contents: write  # workflow_dispatch 需要写权限来创建 production-v* tag
+      actions: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          fetch-depth: 0
+
+      - name: Create production tag (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          RC_TAG="${{ needs.validate-rc-candidate.outputs.rc_tag }}"
+          PRODUCTION_TAG="${{ needs.validate-rc-candidate.outputs.production_tag }}"
+          RC_COMMIT_SHA="${{ needs.validate-rc-candidate.outputs.rc_commit_sha }}"
+          echo "=== R70 P0-10: Create production tag (workflow_dispatch) ==="
+          echo "  RC tag:         ${RC_TAG}"
+          echo "  Production tag: ${PRODUCTION_TAG}"
+          echo "  RC commit SHA:  ${RC_COMMIT_SHA}"
+          # 校验 production tag 不已存在(不允许覆盖)
+          if git rev-parse --verify "refs/tags/${PRODUCTION_TAG}" >/dev/null 2>&1; then
+            echo "::error::Production tag '${PRODUCTION_TAG}' already exists"
+            echo "  R70 P0-10: 不允许覆盖已存在的 production tag(不可变性要求)"
+            exit 1
+          fi
+          # 创建 annotated tag,指向与 RC tag 相同的 commit
+          git tag -a "${PRODUCTION_TAG}" -m "Promote ${RC_TAG} to production (R70 P0-10)" "${RC_COMMIT_SHA}"
+          git push origin "${PRODUCTION_TAG}"
+          echo "PASS: Created production tag '${PRODUCTION_TAG}' at ${RC_COMMIT_SHA}"
+          echo ""
+          echo "注意: 推送 production-v* tag 会触发 release-gates.yml 的 production-promotion-gate job"
+          echo "      该 job 会再次校验 production evidence(environment: production)"
+
+      - name: Verify production tag exists (tag push path)
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          PRODUCTION_TAG="${{ needs.validate-rc-candidate.outputs.production_tag }}"
+          RC_TAG="${{ needs.validate-rc-candidate.outputs.rc_tag }}"
+          RC_COMMIT_SHA="${{ needs.validate-rc-candidate.outputs.rc_commit_sha }}"
+          echo "=== R70 P0-10: Verify production tag exists (tag push path) ==="
+          # production-v* tag push 触发,tag 必然已存在
+          if ! git rev-parse --verify "refs/tags/${PRODUCTION_TAG}" >/dev/null 2>&1; then
+            echo "::error::Production tag '${PRODUCTION_TAG}' does not exist"
+            exit 1
+          fi
+          PROD_COMMIT_SHA=$(git rev-parse "refs/tags/${PRODUCTION_TAG}^{commit}")
+          echo "  Production tag: ${PRODUCTION_TAG} → ${PROD_COMMIT_SHA}"
+          echo "  RC tag:         ${RC_TAG} → ${RC_COMMIT_SHA}"
+          # production-v* tag 应指向与 RC tag 相同的 commit(或其后代)
+          # R70 P0-10: 推荐 production tag 与 RC tag 指向同一 commit
+          # (Build Once — 同一 image digest 贯穿 RC → production)
+          if [ "${PROD_COMMIT_SHA}" != "${RC_COMMIT_SHA}" ]; then
+            echo "::error::Production tag '${PRODUCTION_TAG}' 指向的 commit 与 RC tag '${RC_TAG}' 不一致"
+            echo "  production commit: ${PROD_COMMIT_SHA}"
+            echo "  RC commit:         ${RC_COMMIT_SHA}"
+            echo "  R70 P0-10: Build Once 原则 — production tag 必须指向与 RC tag 相同的 commit"
+            exit 1
+          fi
+          echo "PASS: Production tag '${PRODUCTION_TAG}' 与 RC tag '${RC_TAG}' 指向同一 commit ${RC_COMMIT_SHA}"
+
+      - name: Production promotion summary
+        run: |
+          set -euo pipefail
+          RC_TAG="${{ needs.validate-rc-candidate.outputs.rc_tag }}"
+          PRODUCTION_TAG="${{ needs.validate-rc-candidate.outputs.production_tag }}"
+          RC_COMMIT_SHA="${{ needs.validate-rc-candidate.outputs.rc_commit_sha }}"
+          echo "=== R70 P0-10: Production Promotion Summary ==="
+          echo "  RC tag:           ${RC_TAG}"
+          echo "  RC commit SHA:    ${RC_COMMIT_SHA}"
+          echo "  Production tag:   ${PRODUCTION_TAG}"
+          echo "  Trigger:          ${GITHUB_EVENT_NAME}"
+          echo "  Promotion status: SUCCESS"
+          echo ""
+          echo "  R70 P0-10: staging → RC → production 晋级完成"
+          echo "  命名空间分离:"
+          echo "    - staging (master push)    → environment: staging"
+          echo "    - rc-candidate (rc-v*)     → environment: rc-candidate"
+          echo "    - production (production-v*) → environment: production"
+          echo ""
+          echo "  下一步:"
+          echo "    1. 在 GitHub Environments 中确认 production deployment 已批准"
+          echo "    2. release-gates.yml 的 production-promotion-gate 会再次校验证据"
+          echo "    3. 触发实际的生产部署(若存在独立 deploy workflow)"
+
+  # ─── 5. Promotion aggregate summary (always runs) ───────────────────
+  promotion-summary:
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [validate-rc-candidate, verify-production-evidence,
+            verify-rc-tag-immutability, promote-to-production]
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Aggregate promotion status
+        run: |
+          set -euo pipefail
+          echo "=== R70 P0-10: Promotion Aggregate Summary ==="
+          echo "  validate-rc-candidate:      ${{ needs.validate-rc-candidate.result }}"
+          echo "  verify-production-evidence: ${{ needs.verify-production-evidence.result }}"
+          echo "  verify-rc-tag-immutability: ${{ needs.verify-rc-tag-immutability.result }}"
+          echo "  promote-to-production:      ${{ needs.promote-to-production.result }}"
+          FAIL=0
+          for r in \
+            "${{ needs.validate-rc-candidate.result }}" \
+            "${{ needs.verify-production-evidence.result }}" \
+            "${{ needs.verify-rc-tag-immutability.result }}" \
+            "${{ needs.promote-to-production.result }}"; do
+            if [ "${r}" != "success" ]; then
+              echo "::error::Promotion job failed: ${r}"
+              FAIL=1
+            fi
+          done
+          if [ "${FAIL}" -ne 0 ]; then
+            echo "::error::R70 P0-10: Production promotion FAILED"
+            echo "  任一前置 job 失败均阻断 production 晋级"
+            exit 1
+          fi
+          echo "PASS: R70 P0-10 Production promotion succeeded"
+          echo "  staging → RC → production 流水线完成"

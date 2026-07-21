@@ -48,6 +48,9 @@ ENV PATH=/app/venv/bin:$PATH
 # 物理排除 legacy restore CLI(services/db_restore.py) — 未被 run_all.py 引用,
 # 仅用于 admin CLI 恢复,生产环境通过 _production_guard 硬守卫禁止。
 # .dockerignore 同时排除 services/db_restore.py 作为纵深防御。
+# R70 Wave 2: 新增 docker/entrypoint.py 作为正式容器入口
+#   - SERVICE_ROLE 显式映射到唯一生产命令
+#   - Compose/systemd 只注入 SERVICE_ROLE,不复制启动命令
 COPY run_all.py ./
 COPY services/ ./services/
 COPY bots/ ./bots/
@@ -57,6 +60,7 @@ COPY database/ ./database/
 COPY locales/ ./locales/
 COPY utils/ ./utils/
 COPY storage/ ./storage/
+COPY docker/ ./docker/
 COPY requirements.txt ./
 
 # R69 P0-5 (Wave 3): 物理删除 blocklist 文件作为第二道防线
@@ -106,12 +110,21 @@ USER app
 #     让事件循环走 finally 块优雅关闭 polling / HTTP / DB / 队列
 STOPSIGNAL SIGTERM
 
-# R69 P0-3: 生产镜像默认 CMD 必须 fail-closed
-#   - 旧 CMD ["python", "run_all.py"] 在 APP_ENV=production 下直接 exit 1
-#     (run_all.py main() 拒绝在 production 下启动多进程模式)
-#   - 新 CMD 通过 docker-compose.yml 的 command: 字段或 systemd 显式覆盖
-#     为 `python run_all.py --standalone <role>`
-#   - 若未覆盖,run_all.py 会因 APP_ENV=production + 未指定 --standalone
-#     而退出码 1,容器进入 restart 循环(可观测,不会误进入多进程模式)
-#   - 这保证了生产镜像不会隐式降级到 development 多进程路径
-CMD ["python", "run_all.py"]
+# R70 Wave 2: 正式 ENTRYPOINT — 基于 SERVICE_ROLE 的角色映射启动器
+#   - 替代旧的 CMD ["python", "run_all.py"](在 APP_ENV=production 下 exit 1
+#     进入 restart loop)
+#   - ENTRYPOINT 通过 SERVICE_ROLE 环境变量映射到唯一生产命令:
+#       SERVICE_ROLE=up → python run_all.py --standalone up
+#       SERVICE_ROLE=migration → python -m services.migration_runner
+#       SERVICE_ROLE=prometheus_exporter → python -m services.prometheus_exporter
+#   - production/staging 下未指定 SERVICE_ROLE → fail-closed exit 1
+#   - development/test 下未指定 SERVICE_ROLE → 回退 run_all.py 多进程模式
+#   - Compose/systemd 只注入 SERVICE_ROLE,不复制启动命令
+#   - exec 模式:entrypoint.py 通过 os.execvp 替换进程映像,确保 PID 1
+#     直接是业务进程,SIGTERM 直达
+ENTRYPOINT ["python", "/app/docker/entrypoint.py"]
+
+# R70 Wave 2: 默认 CMD 为空(entrypoint.py 根据 SERVICE_ROLE 决定)
+#   - 若 Compose/systemd 未注入 SERVICE_ROLE 且 APP_ENV=production → exit 1
+#   - 这是 fail-closed 设计:不允许容器空跑被误判为正常
+CMD []

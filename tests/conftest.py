@@ -83,6 +83,28 @@ def _install_fake_config() -> None:
 
     fake_config = types.ModuleType("config")
     fake_config.settings = settings
+
+    # R70 Wave 7: 同时暴露真实的 config.environment 子模块
+    # ``services/_production_guard.py`` 在模块顶部执行
+    # ``from config.environment import detect_production_from_os_environ``,
+    # 若 fake_config 不暴露 ``environment`` 属性,所有依赖 _production_guard
+    # 的测试(R62 / R63 / R65 / R66 / R67 等)都会在 import 阶段失败。
+    # config/environment.py 仅依赖 os / enum / typing(无 Settings 依赖),
+    # 可安全通过 importlib 直接加载,不会触发 Settings 实例化。
+    try:
+        env_spec = importlib.util.spec_from_file_location(
+            "config.environment",
+            Path(__file__).resolve().parent.parent / "config" / "environment.py",
+        )
+        if env_spec is not None and env_spec.loader is not None:
+            env_module = importlib.util.module_from_spec(env_spec)
+            sys.modules["config.environment"] = env_module
+            env_spec.loader.exec_module(env_module)
+            fake_config.environment = env_module
+    except Exception:
+        # 加载失败不阻断测试收集;依赖 _production_guard 的测试会自行 skip / fail
+        pass
+
     # 强制覆盖,确保被测模块函数内的 ``from config import settings`` 拿到模拟对象
     sys.modules["config"] = fake_config
 
@@ -211,9 +233,73 @@ def _install_telegram_mock_if_missing() -> None:
     _sys.modules["telegram.error"] = _telegram_err_mod
 
 
+def _install_asyncpg_mock_if_missing() -> None:
+    """R70 Wave 7: asyncpg 未安装时注入 MagicMock,避免 restore_writer import 失败。
+
+    背景:services/restore_writer.py 在模块顶部 import asyncpg(用于 CRDB 恢复的
+    asyncpg.Connection 类型)。本地开发 / CI 测试环境可能未安装 asyncpg
+    (CRDB 生产依赖,本地测试用 SQLite + mock)。services/db_restore.py 通过
+    re-export 引用 restore_writer 的符号,因此任何 `from services.db_restore import`
+    都会触发 asyncpg 的 import。
+
+    本函数在收集阶段最早期注入 asyncpg 的 MagicMock,确保所有依赖
+    restore_writer / db_restore 的测试模块都能在测试环境中正常加载
+    (仅在 asyncpg 真实模块不可导入时生效)。
+
+    安全性:asyncpg 的真实功能只在生产 CRDB 恢复时使用,测试中通过 mock
+    或 skip 验证(R62/R63/R67 等测试不实际连接 CRDB)。
+    """
+    try:
+        importlib.import_module("asyncpg")
+        return  # asyncpg 真实可用,无需 mock
+    except ImportError:
+        pass
+    # asyncpg 不可用 → 注入 MagicMock
+    import sys as _sys
+    from unittest.mock import MagicMock as _MM
+    mock_asyncpg = _MM(name="mock_asyncpg")
+    # Connection 类(asyncpg.Connection 用于类型注解,需可 isinstance 检查)
+    mock_asyncpg.Connection = type("Connection", (), {})
+    # create_pool / connect 协程函数(async)
+    mock_asyncpg.create_pool = _MM(name="mock_create_pool")
+    mock_asyncpg.connect = _MM(name="mock_connect")
+    _sys.modules["asyncpg"] = mock_asyncpg
+
+
+def _install_httpx_mock_if_missing() -> None:
+    """R70 Wave 7: httpx 未安装时注入 MagicMock,避免 storage.r2 import 失败。
+
+    背景:storage/r2.py 在模块顶部 import httpx(用于 R2 / S3 兼容存储 HTTP 客户端)。
+    services/db_restore.py 通过 `from storage.r2 import _r2 as r2_storage` 引用,
+    因此任何 `from services.db_restore import` 都会触发 httpx 的 import。
+    本地测试环境可能未安装 httpx(R2 生产依赖,本地测试用 mock)。
+
+    本函数在收集阶段最早期注入 httpx 的 MagicMock,确保所有依赖
+    storage.r2 / db_restore 的测试模块都能在测试环境中正常加载
+    (仅在 httpx 真实模块不可导入时生效)。
+    """
+    try:
+        importlib.import_module("httpx")
+        return  # httpx 真实可用,无需 mock
+    except ImportError:
+        pass
+    # httpx 不可用 → 注入 MagicMock
+    import sys as _sys
+    from unittest.mock import MagicMock as _MM
+    mock_httpx = _MM(name="mock_httpx")
+    # AsyncClient / Client 类(用于类型注解)
+    mock_httpx.AsyncClient = type("AsyncClient", (), {})
+    mock_httpx.Client = type("Client", (), {})
+    # HTTPStatus 枚举(httpx.HTTPStatus 用于响应状态码)
+    mock_httpx.HTTPStatus = _MM(name="mock_HTTPStatus")
+    _sys.modules["httpx"] = mock_httpx
+
+
 # 收集阶段即注入(早于任何 test 模块 import 被测代码)
 _install_fake_config()
 _install_telegram_mock_if_missing()
+_install_asyncpg_mock_if_missing()
+_install_httpx_mock_if_missing()
 _ensure_tested_modules_importable()
 
 

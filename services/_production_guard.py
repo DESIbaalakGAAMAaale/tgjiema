@@ -22,6 +22,11 @@ R67 审计背景:
          (``APP_ENV`` 与 ``ENVIRONMENT`` 两种标识),但作为函数级守卫,可在
          CLI 直接调用 ``run_restore()`` 时生效(Settings 可能未实例化)
 
+R70 Wave 1 整改:
+    生产环境检测改为调用 ``config.environment.detect_production_from_os_environ()``,
+    统一所有入口的环境判定逻辑。本模块保留 ``_detect_production_environment()``
+    作为薄 wrapper,维持向后兼容(已有测试 / 调用方不变)。
+
 设计原则:
     - **fail-closed**:任何不确定状态(包括无法读取环境变量)均视为非生产,
       但若显式设置为 production/staging 则强制 fail
@@ -35,34 +40,30 @@ import os
 from services.error_codes import AppError, ErrorCodes
 from services.i18n import translate as _i18n_t
 
-
-# 生产环境标识集合(小写比较)
-_PRODUCTION_ENVS = frozenset({"production", "staging", "prod", "stg"})
+# R70 Wave 1: 统一调用 config.environment 模块
+from config.environment import detect_production_from_os_environ
 
 
 def _detect_production_environment() -> tuple[bool, str]:
-    """检测当前是否为生产/staging 环境。
+    """检测当前是否为生产/staging 环境(R70 Wave 1: 薄 wrapper)。
 
-    R69 P0-1: APP_ENV 是单一权威源,Dockerfile/Compose/run_all.py/Settings
-    全部以 APP_ENV 为事实源。ENVIRONMENT / DEPLOY_ENV 作为历史兼容降级读取
-    (旧部署可能未迁移到 APP_ENV),但 APP_ENV 优先级最高。
+    本函数是 ``config.environment.detect_production_from_os_environ()`` 的薄 wrapper,
+    保留是为了向后兼容(已有测试 / 调用方直接 import 本函数)。
 
     直接读取环境变量,不依赖 Settings 实例化(R67 P0-06 关键设计)。
 
-    检查顺序:
+    检查顺序(由 ``config.environment`` 统一实现):
         1. ``APP_ENV``(R69 P0-1 单一权威源,Dockerfile 设置的 ENV APP_ENV=production)
         2. ``ENVIRONMENT``(历史兼容,Settings 字段对应的 env var)
         3. ``DEPLOY_ENV``(常见部署工具标识,历史兼容)
+
+    别名规范化(prod → production, stg → staging)由 config.environment 处理。
 
     Returns:
         (is_production, source_env_var):若为生产环境,返回 (True, env_var_name);
         否则返回 (False, "")。
     """
-    for env_var in ("APP_ENV", "ENVIRONMENT", "DEPLOY_ENV"):
-        val = os.environ.get(env_var, "").strip().lower()
-        if val in _PRODUCTION_ENVS:
-            return True, env_var
-    return False, ""
+    return detect_production_from_os_environ()
 
 
 def assert_no_legacy_restore_in_production(

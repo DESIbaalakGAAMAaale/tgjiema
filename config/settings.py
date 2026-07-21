@@ -7,25 +7,37 @@ from loguru import logger
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
 
+# R70 Wave 1: 唯一环境解析模块 — 所有入口统一调用 parse_app_env()
+from config.environment import (
+    AppEnvironment,
+    EnvironmentResolutionError,
+    is_production as env_is_production,
+    is_production_like as env_is_production_like,
+    parse_app_env,
+)
+
 
 class Settings(BaseSettings):
-    # ── R69 P0-1: 单一环境事实源 = APP_ENV ──
-    # 允许值(显式枚举): development / test / staging / production
-    # 缺值/未知值/拼写错误在 production 镜像中拒绝启动(fail-closed)。
-    # 兼容历史:ENVIRONMENT / DEPLOY_ENV 仍可读取(降级为别名),
-    # 但 APP_ENV 优先级最高。Dockerfile/Compose/run_all.py/_production_guard
-    # 全部以 APP_ENV 为权威源。
-    APP_ENV: str = "development"
+    # ── R70 Wave 1: APP_ENV 单一事实源 —─────────────────────────────────
+    # R70 P0-03 根因修复:
+    #   旧版 APP_ENV 默认值为 "development"(非空),导致只设置
+    #   ENVIRONMENT=production 的旧部署会:
+    #     1. APP_ENV 保持 "development"(Pydantic 用默认值填充)
+    #     2. validator 反向把 ENVIRONMENT 覆盖成 "development"
+    #     3. 生产 guard / legacy restore seal / 加密强制等按 development 执行
+    #     4. 生产环境静默降级
+    # 修复:
+    #   - APP_ENV 默认值改为 None(不再隐式 development)
+    #   - 通过 before-validator 调用 parse_app_env() 解析权威值
+    #   - 解析规则:APP_ENV > ENVIRONMENT > DEPLOY_ENV,冲突/未知值 fail-closed
+    #   - 三变量全缺失时由调用方决定(本地开发命令允许回退 development,
+    #     生产入口(Settings 加载)拒绝启动)
+    APP_ENV: Optional[str] = None
 
     # ── 历史兼容字段(派生自 APP_ENV,禁止直接配置) ──
     # 旧代码以 settings.ENVIRONMENT 判定生产环境,保留该字段避免大规模重写。
-    # R69 P0-1: 通过 model_validator 在 APP_ENV 设置后自动同步 ENVIRONMENT。
-    ENVIRONMENT: str = "development"
-
-    # 允许的环境值枚举(R69 P0-1: 缺值/未知值在 production 镜像中 fail-closed)
-    _ALLOWED_ENVS: frozenset = frozenset({
-        "development", "test", "staging", "production",
-    })
+    # R70 Wave 1: 通过 model_validator 在 APP_ENV 解析后自动同步 ENVIRONMENT。
+    ENVIRONMENT: Optional[str] = None
 
     # ── R35 P0-1: 服务角色(用于分服务校验 secrets) ──
     # 取值: "up" / "idx" / "dsp" / "mon" / "admin_bot" / "admin" / "db_writer" / ""
@@ -373,42 +385,87 @@ class Settings(BaseSettings):
             stripped[key] = value
         return stripped
 
+    @model_validator(mode='before')
+    @classmethod
+    def _resolve_app_env_before(cls, data: dict) -> dict:
+        """R70 Wave 1: before-validator — 调用 parse_app_env() 解析 APP_ENV。
+
+        在 Pydantic 字段解析之前介入,把原始输入传给 parse_app_env() 做权威解析。
+        这样可以在 Pydantic 用旧默认值("development")填充 APP_ENV 之前介入,
+        避免 R70 P0-03 描述的"默认值非空导致 ENVIRONMENT 反向覆盖"问题。
+
+        解析后写回 data['APP_ENV'] / data['ENVIRONMENT'],确保后续 validator
+        拿到的是规范化后的权威值。
+
+        注意:Settings 是生产入口,三变量全缺失时 fail-closed
+        (allow_default_development=False)。
+        """
+        if not isinstance(data, dict):
+            return data
+
+        # 显式覆盖(允许测试 / 调用方注入)
+        raw_overrides = {
+            "APP_ENV": data.get("APP_ENV") or "",
+            "ENVIRONMENT": data.get("ENVIRONMENT") or "",
+            "DEPLOY_ENV": data.get("DEPLOY_ENV") or "",
+        }
+        # 若 data 没有显式提供,从 os.environ 读取(parse_app_env 内部也会读)
+        for k in raw_overrides:
+            if not raw_overrides[k]:
+                env_val = os.environ.get(k)
+                if env_val:
+                    raw_overrides[k] = env_val
+
+        try:
+            resolved = parse_app_env(
+                allow_default_development=False,
+                raw_overrides=raw_overrides,
+            )
+        except EnvironmentResolutionError as e:
+            # 转成 ValueError 让 Pydantic 在字段校验阶段 raise
+            raise ValueError(str(e)) from e
+
+        # 写回权威值(规范化后的字符串,如 "production")
+        canonical = resolved.value
+        data["APP_ENV"] = canonical
+        data["ENVIRONMENT"] = canonical  # 派生同步
+        return data
+
     @model_validator(mode='after')
     def _sync_environment_from_app_env(self):
-        """R69 P0-1: 统一环境事实源 — APP_ENV 为权威源,ENVIRONMENT 派生同步。
+        """R70 Wave 1: after-validator — 验证 APP_ENV 已规范化且 ENVIRONMENT 同步。
 
-        规则:
-          1. 优先级:APP_ENV > ENVIRONMENT > DEPLOY_ENV(降级读取)
-          2. APP_ENV 是显式枚举:development / test / staging / production
-          3. 缺值/未知值/拼写错误 → 启动失败(fail-closed)
-          4. 同步 ENVIRONMENT 字段 = APP_ENV(向后兼容旧代码 settings.ENVIRONMENT 判定)
-          5. 生产镜像中(Dockerfile ENV APP_ENV=production):
-             - APP_ENV=production → ENVIRONMENT=production(允许)
-             - APP_ENV=staging → ENVIRONMENT=staging(允许)
-             - APP_ENV=development/test → 启动失败(生产镜像禁止开发模式)
-             - APP_ENV=未知值 → 启动失败(fail-closed)
+        before-validator 已完成权威解析与冲突检测,这里只做幂等校验:
+          - APP_ENV 必须在显式枚举内
+          - ENVIRONMENT 必须与 APP_ENV 一致(派生同步)
 
-        注意:本 validator 在 validate_required_fields 之前执行(model_validator
-        按 method 定义顺序执行,但本 validator 显式置于最前)。
+        若有外部代码绕过 before-validator 直接设置非法值,这里兜底拒绝。
+
+        R70 Wave 3: 在 APP_ENV 规范化后立即调用 escape_hatch_guard,
+        在 Settings 加载阶段(最早可拦截点)拒绝任何 production/staging 下的
+        测试逃生舱变量(I18N_ALLOW_FALLBACK / ALLOW_LEGACY_RESTORE / TEST_ONLY 等)。
         """
-        # 1. 解析 APP_ENV(优先级最高)
         app_env = (self.APP_ENV or "").strip().lower()
-        # 2. 若 APP_ENV 缺值,降级读取 ENVIRONMENT / DEPLOY_ENV(向后兼容)
-        if not app_env:
-            legacy_env = (self.ENVIRONMENT or "").strip().lower()
-            if not legacy_env:
-                legacy_env = os.environ.get("DEPLOY_ENV", "").strip().lower()
-            app_env = legacy_env or "development"
-        # 3. 校验 APP_ENV 是显式枚举值
-        if app_env not in self._ALLOWED_ENVS:
+        if app_env not in {e.value for e in AppEnvironment}:
             raise ValueError(
-                f"[R69 P0-1] APP_ENV='{app_env}' 不在允许枚举内"
-                f"({sorted(self._ALLOWED_ENVS)})。"
+                f"[R70 Wave1] APP_ENV='{app_env}' 不在允许枚举内"
+                f"({sorted(e.value for e in AppEnvironment)})。"
                 f"缺值/未知值/拼写错误均不允许启动(fail-closed)。"
             )
-        # 4. 同步 ENVIRONMENT = APP_ENV(向后兼容旧代码)
+        # 同步 ENVIRONMENT = APP_ENV(向后兼容旧代码 settings.ENVIRONMENT 判定)
         self.APP_ENV = app_env
         self.ENVIRONMENT = app_env
+
+        # R70 Wave 3: 在 Settings 实例化后立即调用逃生舱硬守卫
+        # 这是第一道防线 — 在 Settings 加载阶段就拦截任何 production 逃生舱
+        # (后续 docker/entrypoint 与 _production_guard 还有第二、三道防线)
+        try:
+            from services.escape_hatch_guard import assert_no_test_escape_hatches
+            assert_no_test_escape_hatches(caller="Settings.after_validator")
+        except ImportError:
+            # services.escape_hatch_guard 不可用时(如纯 config 模块单测),
+            # 降级由 docker/entrypoint 与 _production_guard 兜底
+            pass
         return self
 
     @model_validator(mode='after')

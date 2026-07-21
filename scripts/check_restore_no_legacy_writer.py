@@ -117,25 +117,23 @@ LEGACY_WRITER_FUNDS_STRICT_EXTRA: set[str] = {
 #     详细的过期条目信息,指引运行 scripts/regenerate_scanner_whitelist_digests.py
 #     重新生成。
 PRECISE_WHITELIST: tuple[dict, ...] = (
-    # db_restore.py: _restore_from_backup_data 内部委托给子写入器(同模块私有委托)
-    {
-        "file": "services/db_restore.py",
-        "function": "_restore_from_backup_data",
-        "ast_signature": "438c44d1ebe770aa7f3d628975b779c5b86e65d27d7eddae56e22bd9e4b81aee",
-        "source_digest": "ba66f52f9e5476b8dd66e3674595184a91d09630308c10515dcd181f6074df4b",
-        "allowed_callees": frozenset({"_restore_crdb_tables", "_restore_sqlite_tables_to_db"}),
-        "reason": "同模块私有委托:_restore_from_backup_data → 子写入器",
-    },
+    # R70 Wave 7: db_restore.py::_restore_from_backup_data 已移除 — 本模块改为
+    # 薄 CLI adapter,_restore_from_backup_data 通过 re-export 从
+    # services/restore_writer.py 导入(单一事实源)。本模块不再定义任何 writer
+    # 实现,scanner 不再需要为 db_restore.py 中的 _restore_from_backup_data
+    # 授权。授权移至 services/restore_writer.py::_restore_from_backup_data(下方)。
     # db_restore.py: run_restore CLI 入口委托给 validate_and_restore_backup_strict
     # (run_restore 本身被 ALLOW_LEGACY_RESTORE seal,但仍允许调用 strict service)
     # R67 P0-06: 在 capability-seal 之前增加 _production_guard 硬守卫(生产环境
     # APP_ENV=production|staging 无条件拒绝,不允许 ALLOW_LEGACY_RESTORE 解封)。
     # 守卫调用不调用 legacy writer,因此不影响白名单 allowed_callees。
+    # R70 Wave 7: db_restore.py 重写为薄 adapter,run_restore 源码随之变化,
+    # source_digest 重新生成。
     {
         "file": "services/db_restore.py",
         "function": "run_restore",
-        "ast_signature": "b7fdd2c4cd94ebc411d025f5cb633641f626b97fe2c3141076e4efdc14d420ba",
-        "source_digest": "3e9c71910401146ebec5b4d2f047c7e6064ba45f16e6303bbf7d32c9f9a141d8",
+        "ast_signature": "fd687f7355c207417f14bf93c703b72221449aa89750e72ea5800c6dc2e9e07e",
+        "source_digest": "c368a10a0389bbef1248ac535eff7a251243ff41f92c648701a8fba3e3b9dc66",
         "allowed_callees": frozenset({"validate_and_restore_backup_strict"}),
         "reason": "CLI 入口委托:run_restore → validate_and_restore_backup_strict(strict service)",
     },

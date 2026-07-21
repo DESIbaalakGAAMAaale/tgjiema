@@ -378,37 +378,38 @@ def main():
 
     args = sys.argv[1:]
 
-    # R69 P0-1: APP_ENV 是单一权威源(Dockerfile/Compose/Settings/_production_guard 统一)
+    # R70 Wave 1: 调用唯一环境解析模块 config.environment.parse_app_env()
+    # (替代 run_all.py 本地的 _ALLOWED_ENVS 局部定义,统一所有入口)
     # R38 P2-1: 多进程模式仅用于本地开发,生产环境必须用 systemd + --standalone
     # 多进程模式共享信号处理/资源限制,单 Bot 崩溃影响其他 Bot,且 Telegram Bot API
     # 要求每个 token 独占 getUpdates 连接,多进程模式信号传播不完善可能导致 polling 残留
-    # R69 P0-3: 生产镜像默认 CMD 必须是 fail-closed — 未指定 --standalone 时
-    # 在 APP_ENV=production/staging 下直接 exit 1(不再允许 ENVIRONMENT 缺省时
+    # R69 P0-3 / R70 Wave 2: 生产镜像默认 CMD 必须是 fail-closed — 未指定 --standalone
+    # 时在 APP_ENV=production/staging 下直接 exit 1(不再允许 ENVIRONMENT 缺省时
     # 误进入多进程模式)
+    from config.environment import (
+        AppEnvironment,
+        EnvironmentResolutionError,
+        parse_app_env,
+    )
+
     is_standalone = bool(args and args[0] == "--standalone")
     if not is_standalone:
-        # R69 P0-1: 优先读取 APP_ENV,降级读取 ENVIRONMENT(向后兼容)
-        app_env = os.environ.get("APP_ENV", "").strip().lower()
-        if not app_env:
-            app_env = os.environ.get("ENVIRONMENT", "development").strip().lower()
-        # R69 P0-1: APP_ENV 显式枚举校验(production 镜像中未知值 fail-closed)
-        _ALLOWED_ENVS = frozenset({
-            "development", "test", "staging", "production",
-        })
-        if app_env and app_env not in _ALLOWED_ENVS:
-            logger.error(
-                f"[R69-P0-1] APP_ENV='{app_env}' 不在允许枚举内"
-                f"({sorted(_ALLOWED_ENVS)})。"
-                f"缺值/未知值/拼写错误在 production 镜像中拒绝启动(fail-closed)。"
-            )
+        # R70 Wave 1: 多进程模式是本地开发命令,允许三变量全缺失时回退 development
+        try:
+            resolved_env = parse_app_env(allow_default_development=True)
+        except EnvironmentResolutionError as e:
+            logger.error(f"[R70 Wave1] 环境解析失败: {e}")
             sys.exit(1)
-        if app_env in ("production", "staging", "prod", "stg"):
+
+        # 拒绝在 production/staging 下启动多进程模式
+        if resolved_env in (AppEnvironment.PRODUCTION, AppEnvironment.STAGING):
             logger.error(
-                f"[R38-P2-1/R69-P0-3] 拒绝在 APP_ENV={app_env} 下启动多进程模式。"
+                f"[R38-P2-1/R69-P0-3/R70-Wave2] 拒绝在 APP_ENV={resolved_env.value}"
+                " 下启动多进程模式。"
                 "生产环境必须使用 systemd + --standalone 模式运行各 Bot,"
                 "例如: python run_all.py --standalone up。"
                 "多进程模式仅用于本地开发(共享信号/GIL,单 Bot 崩溃影响其他 Bot)。"
-                "R69 P0-3: 生产镜像默认 CMD 必须显式指定 --standalone <role>,"
+                "R69 P0-3 / R70 Wave 2: 生产镜像必须显式指定 --standalone <role>,"
                 "未指定时 fail-closed(禁止隐式降级到多进程模式)。"
             )
             sys.exit(1)
@@ -416,6 +417,20 @@ def main():
             "[R38-P2-1] 多进程模式仅用于本地开发。"
             "生产环境请使用 systemd + --standalone 模式。"
         )
+
+    # R70 Wave 3: 逃生舱硬守卫 — 在启动业务循环前调用
+    # 即使是 --standalone 模式也必须通过此守卫(防止生产环境的 SERVICE_ROLE=up
+    # 同时设置 I18N_ALLOW_FALLBACK=1 这类危险组合)
+    # 非生产环境(development/test)允许逃生舱,守卫直接返回
+    try:
+        from services.escape_hatch_guard import assert_no_test_escape_hatches
+        assert_no_test_escape_hatches(caller="run_all.main")
+    except ImportError as e:
+        logger.error(f"[R70 Wave3] 无法加载 escape_hatch_guard: {e}")
+        sys.exit(1)
+    except Exception as e:
+        logger.error(f"[R70 Wave3] 检测到生产环境测试逃生舱,拒绝启动: {e}")
+        sys.exit(1)
 
     # ── 启动前自动初始化拓扑（仅多进程模式需要）──
     # 独立模式下各 Bot 自行调用 init_db()，拓扑已预初始化

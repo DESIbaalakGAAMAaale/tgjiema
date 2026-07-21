@@ -459,6 +459,14 @@ class ErrorCodes:
     #         candidate_tag (当前请求的 candidate tag)
     EVIDENCE_ALREADY_CONSUMED = "PRODUCTION.EVIDENCE.ALREADY_CONSUMED"
 
+    # ── R70 Wave 3: 测试逃生舱硬守卫 ──
+    # production/staging 下检测到任何测试逃生舱环境变量(I18N_ALLOW_FALLBACK /
+    # ALLOW_LEGACY_RESTORE / TEST_ONLY / DEV_ONLY / BYPASS / SKIP_VERIFY 等)
+    # 被设置时,escape_hatch_guard.assert_no_test_escape_hatches() 抛此错误。
+    # params: caller (调用方标识) / hatch_count (检测到的逃生舱数量) /
+    #         hatch_details (逃生舱详情列表) / reason (主因标识)
+    PRODUCTION_ESCAPE_HATCH_DETECTED = "PRODUCTION.ESCAPE_HATCH.DETECTED"
+
 
 # ════════════════════════════════════════════════════════════════
 # 1b. ErrorEnum — R56 §5.2 Python enum(str + Enum 双继承,保持字符串兼容)
@@ -3412,6 +3420,21 @@ def _register_defaults() -> None:
         retryable=False,
         severity="critical",
         safe_params=["artifact_type", "consumed_candidate", "candidate_tag"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # 500 critical — R70 Wave 3: production/staging 下检测到测试逃生舱环境变量
+    # (I18N_ALLOW_FALLBACK / ALLOW_LEGACY_RESTORE / TEST_ONLY / DEV_ONLY / BYPASS /
+    #  SKIP_VERIFY 等被设置为真值)→ escape_hatch_guard 抛此错误 fail-closed。
+    # safe_params: caller / hatch_count / hatch_details / reason(均无敏感信息)。
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.PRODUCTION_ESCAPE_HATCH_DETECTED,
+        message_key="errors.production.escape_hatch.detected",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["caller", "hatch_count", "hatch_details", "reason"],
         presentation="inline",
         show_retry_button=False,
         audit_level="critical",

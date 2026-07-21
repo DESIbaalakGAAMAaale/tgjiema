@@ -218,6 +218,7 @@
     "backup.restore.approval_action_id_required": "灾备恢复必须通过审批流 ApprovalExecutor 调用,需提供 approval_action_id(backup_id={backup_id})",
     "production.restore.hash_required": "production 恢复必须传 expected_request_hash(TOCTOU 防护,backup_id={backup_id}, target={target}, trace_id={trace_id})",
     "production.restore.hash_mismatch": "production 恢复 expected_request_hash 与存储 hash 不匹配(TOCTOU 攻击或 payload 被篡改,backup_id={backup_id}, approval_action_id={approval_action_id}, trace_id={trace_id})",
+    "production.escape_hatch.detected": "R70 Wave 3: 生产环境检测到测试逃生舱变量,已拒绝启动(caller={caller}, hatch_count={hatch_count}, hatch_details={hatch_details}, reason={reason}, trace_id={trace_id})",
     "restore.execute.already_executed": "command_executions 已 executed,禁止重复执行 restore(approval_action_id={approval_action_id}, trace_id={trace_id})",
     "restore.staging.provision_failed": "恢复 staging 创建失败,已销毁已分配资源并 fail-closed(operation_id={operation_id}, datasource={datasource}, reason={reason})",
     "restore.staging.validate_failed": "恢复 staging 验证失败,schema/行数/主外键/业务守恒/hash/演练任一未通过(operation_id={operation_id}, dimension={dimension}, reason={reason})",
