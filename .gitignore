@@ -17,9 +17,14 @@ logs/
 test_results_*.log
 pytest_*.log
 *.pytest.log
+ci_fail.log
+e2e_full.log
+scan_out.log
 
 # 数据库
 *.db
+*.db-shm
+*.db-wal
 data/
 
 # IDE
@@ -62,6 +67,7 @@ tests/e2e/playwright-report/
 tests/e2e/test-results/
 tests/e2e/e2e-results/
 tests/e2e/package-lock.json
+e2e-results-artifact/
 tmp/
 
 # R56 §10: Repository hygiene — 生成产物禁止入库
