@@ -68,7 +68,9 @@ echo ""
 #      → 只有 GitHub web-flow / squash commit (GitHub 用自己密钥签名) 才可接受
 #   Y: expired key but valid signature (密钥过期但签名有效)
 #   R: revoked key (密钥已撤销)
-#   E: expired key (密钥过期)
+#   E: expired key (密钥过期) — 签名本身可能有效,但本地 GPG 信任网因密钥过期拒绝
+#      → GitHub API 持有公钥并保留签名数据,可作为权威源验证
+#      (与 U 状态语义一致:签名有效但本地无法验证,由 GitHub API 裁决)
 # ════════════════════════════════════════════════════════════════
 echo "--- 检查 1: git verify-commit ${GITHUB_SHA:0:12} ---"
 COMMIT_SIG_STATUS=$(git log --pretty='%G?' -1 "${GITHUB_SHA}" 2>/dev/null || echo "X")
@@ -79,15 +81,15 @@ case "$COMMIT_SIG_STATUS" in
   X) echo "  ⚠ commit 无签名(X — no signature,本地未检测到任何 GPG 签名)" ;;
   Y) echo "  ✓ commit 已签名且验证通过(Y — expired key but valid signature)" ;;
   R) fail "commit 签名已撤销(R — revoked)" ;;
-  E) fail "commit 签名无法验证(E — expired key)" ;;
+  E) echo "  ⚠ commit 签名密钥已过期(E — expired key),签名本身可能有效,由 GitHub API 裁决" ;;
   *) fail "commit 签名状态未知: ${COMMIT_SIG_STATUS}" ;;
 esac
 
 # git verify-commit 显式调用
 #   - G/Y: 应该通过(本地有公钥且签名有效)
-#   - U: 签名本身有效,但本地缺公钥 → 不视为硬失败,由 GitHub API 裁决
+#   - U/E: 签名本身有效,但本地缺公钥或密钥过期 → 不视为硬失败,由 GitHub API 裁决
 #   - X: 无签名,git verify-commit 必然失败 → 不视为硬失败,由 GitHub API + reason 裁决
-#   - B/R/E: 硬失败(签名无效/撤销/过期)
+#   - B/R: 硬失败(签名无效/撤销)
 case "$COMMIT_SIG_STATUS" in
   G|Y)
     if git verify-commit "${GITHUB_SHA}" >/dev/null 2>&1; then
@@ -96,8 +98,8 @@ case "$COMMIT_SIG_STATUS" in
       fail "git verify-commit ${GITHUB_SHA} 失败(G/Y 状态但 verify-commit 未通过)"
     fi
     ;;
-  U|X)
-    # U: 签名有效但缺公钥 / X: 无签名 — 由 GitHub API + reason 裁决
+  U|X|E)
+    # U: 签名有效但缺公钥 / X: 无签名 / E: 密钥过期但签名可能有效 — 由 GitHub API 裁决
     echo "  [INFO] ${COMMIT_SIG_STATUS} 状态 — 将由 GitHub API verification.reason 裁决"
     ;;
   *)
@@ -107,8 +109,10 @@ esac
 
 # ════════════════════════════════════════════════════════════════
 # 2. GitHub API commit verification 双重确认
-# R69 P0-8: 区分 U / X 的 GitHub API fallback 语义
+# R69 P0-8: 区分 U / X / E 的 GitHub API fallback 语义
 #   - U (签名有效,缺公钥): GitHub API verified=true 即可接受(签名本身有效)
+#   - E (密钥过期,签名可能有效): GitHub API verified=true 即可接受
+#     (GitHub 持有公钥并保留签名数据,可作为权威源)
 #   - X (无签名): 必须检查 reason — 只有明确的 GitHub web-flow / squash
 #     签名类型才可接受;普通 unsigned commit 即使 API verified=true 也必须失败
 # ════════════════════════════════════════════════════════════════
@@ -133,10 +137,10 @@ else
         # 本地已验证通过,API 双重确认 — 签名有效
         echo "  ✓ 双重验证通过(本地 G/Y + GitHub API verified=true)"
         ;;
-      U)
-        # R69 P0-8: U 状态 — 签名本身有效,但本地缺公钥
+      U|E)
+        # R69 P0-8: U/E 状态 — 签名本身有效,但本地缺公钥或密钥过期
         # GitHub API 持有公钥,verified=true 即为权威源(签名确实有效)
-        echo "  ✓ U 状态(签名有效,公钥不在本地信任网)— GitHub API 验证通过"
+        echo "  ✓ ${COMMIT_SIG_STATUS} 状态(签名有效,本地无法验证)— GitHub API 验证通过"
         echo "    签名本身有效,GitHub 持有公钥,verified=true 即为权威源"
         ;;
       X)
@@ -219,18 +223,50 @@ if [[ "$GITHUB_REF" == refs/tags/* ]]; then
     fail "tag refs/tags/${TAG_NAME} 不存在"
   else
     # 4b. tag 必须是 annotated(轻量 tag 无签名能力)
+    # actions/checkout 可能未获取 tag object,需要显式 fetch
     TAG_TYPE=$(git cat-file -t "refs/tags/${TAG_NAME}" 2>/dev/null || echo "")
     if [ "$TAG_TYPE" = "tag" ]; then
       echo "  ✓ tag 是 annotated(tag object)"
     else
-      fail "tag 是轻量 tag(type=${TAG_TYPE}),不是 annotated — 无法签名"
+      # 尝试 fetch tag object(可能在 checkout 时未获取)
+      git fetch origin "refs/tags/${TAG_NAME}:refs/tags/${TAG_NAME}" --force >/dev/null 2>&1 || true
+      TAG_TYPE=$(git cat-file -t "refs/tags/${TAG_NAME}" 2>/dev/null || echo "")
+      if [ "$TAG_TYPE" = "tag" ]; then
+        echo "  ✓ tag 是 annotated(tag object,fetch 后获取)"
+      else
+        fail "tag 是轻量 tag(type=${TAG_TYPE}),不是 annotated — 无法签名"
+      fi
     fi
 
     # 4c. git verify-tag 验证签名
+    # 对于 SSH 签名的 tag,需要配置 gpg.ssh.allowedSignersFile
     if git verify-tag "${TAG_NAME}" >/dev/null 2>&1; then
       echo "  ✓ git verify-tag '${TAG_NAME}' 通过"
     else
-      fail "git verify-tag '${TAG_NAME}' 失败(tag 未签名或签名无效)"
+      # 尝试通过 GitHub API 验证 tag 签名(SSH 签名在 CI 可能缺 allowed_signers)
+      TAG_VERIFIED_VIA_API=false
+      TAG_API_RESPONSE=$(curl -sS \
+        -H "Authorization: token ${GH_TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/refs/tags/${TAG_NAME}" 2>/dev/null || echo "")
+      TAG_OBJECT_SHA=$(echo "$TAG_API_RESPONSE" | jq -r '.object.sha // ""' 2>/dev/null || echo "")
+      if [ -n "$TAG_OBJECT_SHA" ]; then
+        TAG_OBJ_RESPONSE=$(curl -sS \
+          -H "Authorization: token ${GH_TOKEN}" \
+          -H "Accept: application/vnd.github+json" \
+          "https://api.github.com/repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}" 2>/dev/null || echo "")
+        TAG_VERIFICATION=$(echo "$TAG_OBJ_RESPONSE" | jq -r '.verification.verified // false' 2>/dev/null || echo "false")
+        TAG_REASON=$(echo "$TAG_OBJ_RESPONSE" | jq -r '.verification.reason // ""' 2>/dev/null || echo "")
+        if [ "$TAG_VERIFICATION" = "true" ]; then
+          echo "  ✓ GitHub API tag verification.verified=true (reason=${TAG_REASON})"
+          TAG_VERIFIED_VIA_API=true
+        else
+          echo "  [INFO] GitHub API tag verification.verified=false (reason=${TAG_REASON})"
+        fi
+      fi
+      if [ "$TAG_VERIFIED_VIA_API" = "false" ]; then
+        fail "git verify-tag '${TAG_NAME}' 失败且 GitHub API 验证未通过(tag 未签名或签名无效)"
+      fi
     fi
 
     # 4d. tag 指向的 commit 必须与 release candidate commit 完全一致
@@ -243,9 +279,14 @@ if [[ "$GITHUB_REF" == refs/tags/* ]]; then
     fi
 
     # 4e. tag 指向的 commit 本身必须已签名(commit 签名独立于 tag 签名)
+    # R71 fix: E 状态(密钥过期)允许由 GitHub API fallback 验证
     TAG_COMMIT_SIG=$(git log --pretty='%G?' -1 "${TAG_COMMIT}" 2>/dev/null || echo "X")
     case "$TAG_COMMIT_SIG" in
       G|Y) echo "  ✓ tag 指向的 commit 签名验证通过(${TAG_COMMIT_SIG})" ;;
+      U|E)
+        echo "  ⚠ tag 指向的 commit 签名状态=${TAG_COMMIT_SIG}(本地无法验证,由 GitHub API 裁决)"
+        # GitHub API fallback 已在检查 2 完成,若到达此处说明 API verified=true
+        ;;
       *) fail "tag 指向的 commit 签名状态=${TAG_COMMIT_SIG}(tag 签名不能替代 commit 签名)" ;;
     esac
   fi

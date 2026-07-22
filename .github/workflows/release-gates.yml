@@ -3235,12 +3235,16 @@ jobs:
 
         # R66 P0-05: 设置 evidence_status 输出
         # - PR / push: not_applicable (dry-run,无真实数据)
-        # - release tag: production (strict + 真实数据)
+        # - release tag + 数据文件存在: production (strict + 真实数据)
+        # - rc-v* tag + 数据缺失: first_rc_baseline (首个 RC 候选,无 72h 数据是合理的)
+        # - production-v* tag + 数据缺失: 保留 production(production-promotion-gate 会拒绝)
         # R66 P1-04: 同时设置 evidence_present 输出
         # - PR / push: false (dry-run,无真实数据,即便 job success 也不计 Production GO)
         # - release tag + 数据文件存在: true (真实证据通过)
-        # - release tag + 数据缺失: false (strict 模式会在下方 exit 1,但先写 false 防御性输出)
+        # - rc-v* tag + 数据缺失: false (baseline dry-run,不得计入 Production GO)
+        # - production-v* tag + 数据缺失: false (strict 模式会 exit 1,先写 false 防御性输出)
         if [[ "${IS_RELEASE_TAG}" == "true" ]]; then
+          # 默认设置为 production,若后续发现数据缺失且为 RC tag 会覆盖为 first_rc_baseline
           echo "evidence_status=production" >> $GITHUB_OUTPUT
           echo "evidence_mode=strict" >> $GITHUB_OUTPUT
         else
@@ -3263,20 +3267,41 @@ jobs:
             # R66 P1-04: release tag + 真实数据文件存在,evidence_present=true
             echo "evidence_present=true" >> $GITHUB_OUTPUT
           else
-            echo "FAIL: release tag 场景要求 ru_72h_data.json artifact"
-            echo "  R65 P1-09 / R66 P0-05: 运维必须通过 workflow_dispatch 上传签名的真实 72h 数据文件"
-            echo "  上传方式: 在 workflow_dispatch 触发时通过 artifact upload 提供"
-            echo "            名称为 ru-72h-data-{sha} 的 artifact"
-            echo "  R66 P0-05: production-promotion-gate 缺证据 = failure (not_applicable 不允许)"
-            # R66 P1-04: 数据缺失,evidence_present=false(虽然 strict 模式会 exit 1)
-            echo "evidence_present=false" >> $GITHUB_OUTPUT
-            exit 1
+            # R71 RC1 fix: 首个 RC tag 无 72h 真实数据是合理的 —
+            # RC 镜像本身就是要跑 72h 来收集数据的。
+            # 区分 rc-v* tag 与 production-v* tag:
+            #   - rc-v* tag: 允许 first_rc_baseline 模式(运行 dry-run,evidence_status=first_rc_baseline)
+            #     这不是降级门禁 — RC 只是候选,不是 production 晋级。
+            #     production 晋级仍要求 evidence_status=production(production-promotion-gate 校验)
+            #   - production-v* tag: 必须有真实数据,无数据 = exit 1(fail-closed)
+            if [[ "${GITHUB_REF}" == refs/tags/rc-v* ]]; then
+              echo "WARN: rc-v* tag 无 72h 真实数据 artifact — 使用 first_rc_baseline 模式"
+              echo "  R71 RC1: 首个 RC 候选无 72h 数据是合理的(RC 镜像本身要跑 72h 收集数据)"
+              echo "  evidence_status=first_rc_baseline(production promotion 不接受此状态)"
+              # 覆盖之前设置的 evidence_status=production
+              echo "evidence_status=first_rc_baseline" >> $GITHUB_OUTPUT
+              echo "evidence_mode=baseline_dry_run" >> $GITHUB_OUTPUT
+              echo "evidence_present=false" >> $GITHUB_OUTPUT
+              # 运行 dry-run 验证脚本自洽性(不运行 --strict --data)
+              python scripts/check_crdb_ru_72h_attribution.py --dry-run
+              exit 0
+            else
+              echo "FAIL: production-v* tag 场景要求 ru_72h_data.json artifact"
+              echo "  R65 P1-09 / R66 P0-05: 运维必须通过 workflow_dispatch 上传签名的真实 72h 数据文件"
+              echo "  上传方式: 在 workflow_dispatch 触发时通过 artifact upload 提供"
+              echo "            名称为 ru-72h-data-{sha} 的 artifact"
+              echo "  R66 P0-05: production-promotion-gate 缺证据 = failure (not_applicable 不允许)"
+              # R66 P1-04: 数据缺失,evidence_present=false(虽然 strict 模式会 exit 1)
+              echo "evidence_present=false" >> $GITHUB_OUTPUT
+              exit 1
+            fi
           fi
         fi
 
         # 执行校验
         if [[ "${IS_RELEASE_TAG}" == "true" ]]; then
           # release tag:严格模式 + 真实数据
+          # (RC tag 无数据时已在上方 exit 0,不会到达此处)
           python scripts/check_crdb_ru_72h_attribution.py \
             --strict --data "${DATA_FILE}" --json
         else
