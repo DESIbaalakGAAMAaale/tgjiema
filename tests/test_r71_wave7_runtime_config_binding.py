@@ -427,7 +427,10 @@ class TestR71Wave7BranchProtectionConsistency:
         )
 
     def test_br_expected_contains_bind_runtime_config(self):
-        """branch_ruleset.expected.json 必须包含 bind-runtime-config context。"""
+        """branch_ruleset.expected.json 必须包含 bind-runtime-config context。
+
+        R71 fix: Rulesets API 参数名为 required_status_checks(非 required_checks)。
+        """
         if not self.BR_EXPECTED.is_file():
             pytest.skip("branch_ruleset.expected.json 不存在")
         data = json.loads(self.BR_EXPECTED.read_text(encoding="utf-8"))
@@ -435,7 +438,7 @@ class TestR71Wave7BranchProtectionConsistency:
         for rule in data.get("rules", []):
             if rule.get("type") == "required_status_checks":
                 params = rule.get("parameters", {})
-                checks = [c.get("context", "") for c in params.get("required_checks", [])]
+                checks = [c.get("context", "") for c in params.get("required_status_checks", [])]
         assert "bind-runtime-config" in checks, (
             "branch_ruleset.expected.json 缺少 bind-runtime-config context"
         )

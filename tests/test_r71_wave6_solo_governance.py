@@ -237,25 +237,32 @@ class TestBranchRulesetExpectedJson:
         assert "refs/heads/main" in includes
 
     def test_rules_contain_required_immutability_rules(self, expected: dict):
-        """R71 P1-01: 包含 deletion / non_fast_forward / update / required_signatures 规则。"""
+        """R71 P1-01: 包含 deletion / non_fast_forward / update / required_signatures /
+        required_linear_history 规则。"""
         rule_types = [r["type"] for r in expected["rules"]]
         assert "deletion" in rule_types, "缺少 deletion 规则(禁止删除 master/main)"
         assert "non_fast_forward" in rule_types, "缺少 non_fast_forward 规则(禁止 force push)"
         assert "update" in rule_types, "缺少 update 规则(禁止直接 update)"
         assert "required_signatures" in rule_types, "缺少 required_signatures 规则(强制 GPG 签名)"
+        assert "required_linear_history" in rule_types, (
+            "缺少 required_linear_history 规则(禁止 merge commit,替代旧 BP strict=true)"
+        )
 
-    def test_pull_request_required_reviewers_is_zero(self, expected: dict):
-        """R71 P1-01: pull_request.required_reviewers == 0(solo founder,无审批死锁)。
+    def test_pull_request_required_approving_review_count_is_zero(self, expected: dict):
+        """R71 P1-01: pull_request.required_approving_review_count == 0(solo founder,无审批死锁)。
 
         这是 R71 Wave 6 的核心整改点 — 旧版 R67=2 / R70=1 对 solo founder 造成
         审批死锁(唯一维护者无法批准自己的 PR)。
+
+        R71 fix: GitHub Rulesets API 字段名为 required_approving_review_count
+        (非 required_reviewers;后者是 Branch Protection API 旧字段名)。
         """
         pr_rules = [r for r in expected["rules"] if r["type"] == "pull_request"]
         assert len(pr_rules) == 1, "应有 1 个 pull_request 规则"
         params = pr_rules[0]["parameters"]
-        assert params["required_reviewers"] == 0, (
-            "R71 P1-01: required_reviewers 必须为 0(solo founder,无审批死锁)— "
-            f"实际: {params['required_reviewers']}"
+        assert params["required_approving_review_count"] == 0, (
+            "R71 P1-01: required_approving_review_count 必须为 0(solo founder,无审批死锁)— "
+            f"实际: {params['required_approving_review_count']}"
         )
 
     def test_pull_request_require_code_owner_review_is_false(self, expected: dict):
@@ -283,17 +290,24 @@ class TestBranchRulesetExpectedJson:
             "required_review_thread_resolution 应为 true(conversation 必须解决)"
         )
 
-    def test_required_status_checks_strict_merge_true(self, expected: dict):
-        """R71 P1-03: required_status_checks.strict_merge == true(current-SHA)。
+    def test_required_status_checks_strict_required_status_checks_policy_true(
+        self, expected: dict
+    ):
+        """R71 P1-03: required_status_checks.strict_required_status_checks_policy == true(current-SHA)。
 
-        旧版 R70 strict_merge=false,允许 stale parent commit 通过 status check,
-        违反 current-SHA binding 原则。R71 Wave 6 整改为 true。
+        旧版 R70 strict_merge=false(旧 BP 字段名),允许 stale parent commit 通过
+        status check,违反 current-SHA binding 原则。R71 Wave 6 整改为 true。
+
+        R71 fix: GitHub Rulesets API 字段名为 strict_required_status_checks_policy
+        (非 strict_merge;后者是 Branch Protection API 旧字段名)。
+        来源: go-github RequiredStatusChecksRuleParameters 结构体定义。
         """
         rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
         assert len(rsc_rules) == 1, "应有 1 个 required_status_checks 规则"
         params = rsc_rules[0]["parameters"]
-        assert params["strict_merge"] is True, (
-            "R71 P1-03: strict_merge 必须为 true(current-SHA,不允许 stale parent commit)"
+        assert params["strict_required_status_checks_policy"] is True, (
+            "R71 P1-03: strict_required_status_checks_policy 必须为 true "
+            "(current-SHA,不允许 stale parent commit)"
         )
 
     def test_required_status_checks_has_36_contexts(self, expected: dict):
@@ -302,11 +316,13 @@ class TestBranchRulesetExpectedJson:
         旧版 R70 只有 5 个 required checks,缺少 R71 Wave 2/4/5/7 新增的 14 个
         context(compose-runtime-e2e / validate-oci-rootfs / verify-rc-identity /
         bind-runtime-config 等)。
+
+        R71 fix: Ruleset API 参数名为 required_status_checks(非 required_checks)。
         """
         rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
         assert len(rsc_rules) == 1
         params = rsc_rules[0]["parameters"]
-        contexts = [c["context"] for c in params["required_checks"]]
+        contexts = [c["context"] for c in params["required_status_checks"]]
         assert len(contexts) >= 36, (
             f"R71 P1-02: 至少需要 36 个 required_status_checks.contexts, "
             f"实际: {len(contexts)}"
@@ -317,7 +333,7 @@ class TestBranchRulesetExpectedJson:
         rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
         assert len(rsc_rules) == 1
         params = rsc_rules[0]["parameters"]
-        contexts = [c["context"] for c in params["required_checks"]]
+        contexts = [c["context"] for c in params["required_status_checks"]]
         for ctx in EXPECTED_REQUIRED_CHECKS:
             assert ctx in contexts, (
                 f"R71 P1-02: required_status_checks 缺少 context: {ctx}"
@@ -328,7 +344,7 @@ class TestBranchRulesetExpectedJson:
         rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
         assert len(rsc_rules) == 1
         params = rsc_rules[0]["parameters"]
-        contexts = [c["context"] for c in params["required_checks"]]
+        contexts = [c["context"] for c in params["required_status_checks"]]
         for ctx in R71_NEW_CONTEXTS:
             assert ctx in contexts, (
                 f"R71 P1-02: required_status_checks 缺少 R71 新增 context: {ctx} "
@@ -513,11 +529,15 @@ class TestConfigureBranchRulesetScript:
             "require_code_owner_review 必须为 false (solo founder)"
         )
 
-    def test_script_strict_merge_true(self, script_content: str):
-        """R71 P1-03: payload 中 strict_merge 必须为 true。"""
-        assert '"strict_merge": true' in script_content, (
+    def test_script_strict_required_status_checks_policy_true(self, script_content: str):
+        """R71 P1-03: payload 中 strict_required_status_checks_policy 必须为 true。
+
+        R71 fix: Rulesets API 字段名为 strict_required_status_checks_policy
+        (非 strict_merge;后者是 Branch Protection API 旧字段名)。
+        """
+        assert '"strict_required_status_checks_policy": true' in script_content, (
             "R71 P1-03: configure_branch_ruleset.sh payload 中 "
-            "strict_merge 必须为 true (current-SHA)"
+            "strict_required_status_checks_policy 必须为 true (current-SHA)"
         )
 
     def test_script_bypass_actors_empty(self, script_content: str):
@@ -571,19 +591,33 @@ class TestConfigureBranchRulesetScript:
             "configure_branch_ruleset.sh 应校验 REQUIRED_STATUS_CHECKS 至少含 36 个 context"
         )
 
-    def test_script_self_asserts_required_reviewers_zero(self, script_content: str):
-        """R71 P1-01: 脚本配置后自检断言 required_reviewers == 0。"""
+    def test_script_self_asserts_required_approving_review_count_zero(
+        self, script_content: str
+    ):
+        """R71 P1-01: 脚本配置后自检断言 required_approving_review_count == 0。
+
+        R71 fix: Rulesets API 字段名为 required_approving_review_count
+        (非 required_reviewers;后者是 Branch Protection API 旧字段名)。
+        """
         # 自检断言应在脚本中
-        assert "required_reviewers" in script_content
+        assert "required_approving_review_count" in script_content
         assert "add == 0" in script_content or "== 0" in script_content, (
-            "configure_branch_ruleset.sh 应自检断言 required_reviewers == 0"
+            "configure_branch_ruleset.sh 应自检断言 "
+            "required_approving_review_count == 0"
         )
 
-    def test_script_self_asserts_strict_merge_true(self, script_content: str):
-        """R71 P1-03: 脚本配置后自检断言 strict_merge == true。"""
-        assert "strict_merge" in script_content
+    def test_script_self_asserts_strict_required_status_checks_policy_true(
+        self, script_content: str
+    ):
+        """R71 P1-03: 脚本配置后自检断言 strict_required_status_checks_policy == true。
+
+        R71 fix: Rulesets API 字段名为 strict_required_status_checks_policy
+        (非 strict_merge;后者是 Branch Protection API 旧字段名)。
+        """
+        assert "strict_required_status_checks_policy" in script_content
         assert "add == true" in script_content, (
-            "configure_branch_ruleset.sh 应自检断言 strict_merge == true"
+            "configure_branch_ruleset.sh 应自检断言 "
+            "strict_required_status_checks_policy == true"
         )
 
     def test_script_no_legacy_r67_or_r70_ruleset_names(self, script_content: str):
@@ -640,11 +674,12 @@ class TestConfigureBranchRulesetScript:
         )
         # 输出应含 R71 Solo Founder 标识
         assert "R71 Solo Founder" in result.stdout or "DRY RUN" in result.stdout
-        # 应含 strict_merge: true
-        assert '"strict_merge": true' in result.stdout or '"strict_merge":true' in result.stdout
-        # 应含 required_reviewers: 0
-        assert '"required_reviewers": 0' in result.stdout or \
-               '"required_reviewers":0' in result.stdout
+        # 应含 strict_required_status_checks_policy: true
+        assert '"strict_required_status_checks_policy": true' in result.stdout or \
+               '"strict_required_status_checks_policy":true' in result.stdout
+        # 应含 required_approving_review_count: 0
+        assert '"required_approving_review_count": 0' in result.stdout or \
+               '"required_approving_review_count":0' in result.stdout
         # 不应调用 gh api
         assert "gh auth" not in result.stderr
 
@@ -678,21 +713,27 @@ class TestVerifyBranchRulesetScript:
             "verify_branch_ruleset.sh 应使用 R71 Solo Founder Branch Ruleset 名称"
         )
 
-    def test_script_asserts_required_reviewers_zero(self, script_content: str):
-        """R71 P1-01: 验证脚本断言 required_reviewers == 0(solo founder)。
+    def test_script_asserts_required_approving_review_count_zero(
+        self, script_content: str
+    ):
+        """R71 P1-01: 验证脚本断言 required_approving_review_count == 0(solo founder)。
 
         旧版断言 >= 2(R67)/ >= 1(R70),造成 solo founder 审批死锁。
+
+        R71 fix: Rulesets API 字段名为 required_approving_review_count
+        (非 required_reviewers;后者是 Branch Protection API 旧字段名)。
         """
-        # 应有断言:required_reviewers == 0(不再是 >= 2 或 >= 1)
-        assert "required_reviewers" in script_content
+        # 应有断言:required_approving_review_count == 0(不再是 >= 2 或 >= 1)
+        assert "required_approving_review_count" in script_content
         assert "add == 0" in script_content, (
-            "R71 P1-01: verify_branch_ruleset.sh 应断言 required_reviewers == 0 "
+            "R71 P1-01: verify_branch_ruleset.sh 应断言 "
+            "required_approving_review_count == 0 "
             "(solo founder,无审批死锁)"
         )
-        # 不应再有 >= 2 的旧断言(针对 required_reviewers)
-        # 注意:旧版可能用 '>= 2' 在其他上下文,此处检查 pull_request 段
-        assert "required_reviewers >= 2" not in script_content, (
-            "R71 Wave 6: verify_branch_ruleset.sh 不应再有 required_reviewers >= 2 旧断言"
+        # 不应再有 >= 2 的旧断言(针对 required_approving_review_count)
+        assert "required_approving_review_count >= 2" not in script_content, (
+            "R71 Wave 6: verify_branch_ruleset.sh 不应再有 "
+            "required_approving_review_count >= 2 旧断言"
         )
 
     def test_script_asserts_require_code_owner_review_false(self, script_content: str):
@@ -704,11 +745,18 @@ class TestVerifyBranchRulesetScript:
             "require_code_owner_review == false (solo founder)"
         )
 
-    def test_script_asserts_strict_merge_true(self, script_content: str):
-        """R71 P1-03: 验证脚本断言 strict_merge == true(current-SHA)。"""
-        assert "strict_merge" in script_content
+    def test_script_asserts_strict_required_status_checks_policy_true(
+        self, script_content: str
+    ):
+        """R71 P1-03: 验证脚本断言 strict_required_status_checks_policy == true(current-SHA)。
+
+        R71 fix: Rulesets API 字段名为 strict_required_status_checks_policy
+        (非 strict_merge;后者是 Branch Protection API 旧字段名)。
+        """
+        assert "strict_required_status_checks_policy" in script_content
         assert "add == true" in script_content, (
-            "R71 P1-03: verify_branch_ruleset.sh 应断言 strict_merge == true"
+            "R71 P1-03: verify_branch_ruleset.sh 应断言 "
+            "strict_required_status_checks_policy == true"
         )
 
     def test_script_asserts_bypass_actors_empty(self, script_content: str):

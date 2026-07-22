@@ -78,23 +78,46 @@ fail_diag() {
 }
 
 # 1. 拉取 branch protection 配置(gh api 失败立即捕获,不吞错误)
+# R71 fix: 旧 Branch Protection 已被 Repository Ruleset 替代。
+#   如果旧 BP 不存在(Branch not protected / 404),fallback 到 ruleset 验证。
+#   R71 Solo Founder Branch Ruleset 提供等效或更强的治理:
+#     - required_signatures (GPG 签名)
+#     - deletion / non_fast_forward / update 禁止
+#     - required_linear_history (禁 merge commit)
+#     - pull_request (0 reviewers — solo founder 模式)
+#     - required_status_checks (37 contexts, strict_required_status_checks_policy=true)
+#     - bypass_actors=[] (enforce_admins 等效,无人可绕过)
 if ! RESPONSE=$(gh api "repos/${GITHUB_REPOSITORY}/branches/master/protection" 2>&1); then
-  echo "::error::无法获取 branch protection 配置(可能未配置或 token 权限不足)"
+  # 旧 BP 不可用,检查 R71 Ruleset 是否已配置
+  echo "[INFO] 旧 Branch Protection 不可用,fallback 到 R71 Ruleset 验证..."
+  if [ -x "scripts/verify_branch_ruleset.sh" ]; then
+    bash scripts/verify_branch_ruleset.sh && exit 0
+  elif [ -f "scripts/verify_branch_ruleset.sh" ]; then
+    bash scripts/verify_branch_ruleset.sh && exit 0
+  fi
+  echo "::error::无法获取 branch protection 配置,且 ruleset 验证脚本不可用"
   echo "::error::gh api 输出: $RESPONSE"
   echo ""
-  echo "Branch Protection 未正确配置,请运行:"
-  echo "  bash scripts/detect_branch_protection_contexts.sh > contexts.json"
-  echo "  bash scripts/configure_branch_protection.sh"
+  echo "R71 Solo Founder Branch Ruleset 未正确配置,请运行:"
+  echo "  python scripts/configure_branch_ruleset.py  (Windows)"
+  echo "  bash scripts/configure_branch_ruleset.sh    (Linux/macOS)"
   exit 1
 fi
 
 # 2. 检查是否未配置(Branch not protected 错误响应)
 if echo "$RESPONSE" | grep -q "Branch not protected"; then
-  echo "::error::Branch protection 未配置"
+  # 旧 BP 未配置,fallback 到 R71 Ruleset 验证
+  echo "[INFO] 旧 Branch Protection 未配置(Branch not protected),fallback 到 R71 Ruleset 验证..."
+  if [ -x "scripts/verify_branch_ruleset.sh" ]; then
+    bash scripts/verify_branch_ruleset.sh && exit 0
+  elif [ -f "scripts/verify_branch_ruleset.sh" ]; then
+    bash scripts/verify_branch_ruleset.sh && exit 0
+  fi
+  echo "::error::Branch protection 未配置,且 ruleset 验证脚本不可用"
   echo ""
   echo "请运行:"
-  echo "  bash scripts/detect_branch_protection_contexts.sh > contexts.json"
-  echo "  bash scripts/configure_branch_protection.sh"
+  echo "  python scripts/configure_branch_ruleset.py  (Windows)"
+  echo "  bash scripts/configure_branch_ruleset.sh    (Linux/macOS)"
   exit 1
 fi
 

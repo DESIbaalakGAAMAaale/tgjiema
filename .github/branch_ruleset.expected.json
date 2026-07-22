@@ -1,5 +1,5 @@
 {
-  "_comment": "R71 P1-01/02/03: Solo Founder Branch Ruleset (single ruleset, no approval deadlock). Maintainer @maxiuquan is the sole developer. Required approvals = 0 (solo). strict_merge=true (current-SHA). Required status checks cover ALL real release-gates.yml job names. No admin bypass. Break-glass allowed only with audit log.",
+  "_comment": "R71 P1-01/02/03: Solo Founder Branch Ruleset (single ruleset, no approval deadlock). Maintainer @maxiuquan is the sole developer. Required approvals = 0 (solo). strict_required_status_checks_policy=true (current-SHA). Required status checks cover ALL real release-gates.yml job names. No admin bypass. Break-glass allowed only with audit log.",
   "_schema": "github_repository_ruleset_api_response",
   "_r71_solo_founder_requirements": {
     "target": "branch",
@@ -10,16 +10,17 @@
     "non_fast_forward": "false — no force push",
     "update": "false — no direct update (PR-only)",
     "required_signatures": "true — signed commits required",
-    "pull_request.required_reviewers": "0 — solo founder, no human approval deadlock",
+    "required_linear_history": "true — no merge commits (squash/rebase only, replaces BP strict=true)",
+    "pull_request.required_approving_review_count": "0 — solo founder, no human approval deadlock",
     "pull_request.require_code_owner_review": "false — solo founder (CODEOWNERS retained but not blocking)",
     "pull_request.dismiss_stale_reviews_on_push": "true — invalidate stale approvals on new push",
     "pull_request.required_review_thread_resolution": "true — conversations must be resolved",
-    "required_status_checks.strict_merge": "true — current-SHA strict (no stale parent commit)",
-    "required_status_checks.required_checks": "covers all real release-gates.yml job names",
+    "required_status_checks.strict_required_status_checks_policy": "true — current-SHA strict (no stale parent commit)",
+    "required_status_checks.required_status_checks": "covers all real release-gates.yml job names",
     "bypass_actors": "[] — no admin/app bypass; break-glass via separate audit log"
   },
   "name": "R71 Solo Founder Branch Ruleset",
-  "description": "R71 P1-01/02/03: Solo-founder governance ruleset for @maxiuquan — 0 required reviewers (no approval deadlock), strict current-SHA merge, all release gates required, no admin bypass. Break-glass via scripts/record_break_glass.py audit log.",
+  "description": "R71 P1-01/02/03: Solo-founder governance ruleset for @maxiuquan — 0 required approving reviews (no approval deadlock), strict current-SHA merge, all release gates required, no admin bypass. Break-glass via scripts/record_break_glass.py audit log.",
   "target": "branch",
   "source_type": "Repository",
   "enforcement": "active",
@@ -34,10 +35,11 @@
     {"type": "non_fast_forward"},
     {"type": "update"},
     {"type": "required_signatures"},
+    {"type": "required_linear_history"},
     {
       "type": "pull_request",
       "parameters": {
-        "required_reviewers": 0,
+        "required_approving_review_count": 0,
         "dismiss_stale_reviews_on_push": true,
         "require_code_owner_review": false,
         "require_last_push_approval": false,
@@ -47,7 +49,7 @@
     {
       "type": "required_status_checks",
       "parameters": {
-        "required_checks": [
+        "required_status_checks": [
           {"context": "lint"},
           {"context": "static-gates"},
           {"context": "test"},
@@ -86,7 +88,8 @@
           {"context": "bind-runtime-config"},
           {"context": "release-summary"}
         ],
-        "strict_merge": true
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": false
       }
     }
   ],

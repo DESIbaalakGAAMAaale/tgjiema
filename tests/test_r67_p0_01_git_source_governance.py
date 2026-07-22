@@ -74,16 +74,19 @@ class TestBranchRulesetExpectedJson:
         assert "update" in rule_types
 
     def test_rules_contain_pull_request_with_zero_reviewers(self, expected):
-        """R71 Wave 6 P1-01: solo founder — required_reviewers == 0(无审批死锁)。
+        """R71 Wave 6 P1-01: solo founder — required_approving_review_count == 0(无审批死锁)。
 
         旧 R67 P0-01 要求 >= 2 reviewers,但对 solo founder(@maxiuquan 是唯一
         开发者)造成审批死锁。R71 Wave 6 改为 0。
+
+        R71 fix: Rulesets API 字段名为 required_approving_review_count
+        (非 required_reviewers;后者是 Branch Protection API 旧字段名)。
         """
         pr_rules = [r for r in expected["rules"] if r["type"] == "pull_request"]
         assert len(pr_rules) == 1, "应有 1 个 pull_request 规则"
         params = pr_rules[0]["parameters"]
-        assert params["required_reviewers"] == 0, (
-            "R71 P1-01: solo founder 模式 required_reviewers 必须为 0"
+        assert params["required_approving_review_count"] == 0, (
+            "R71 P1-01: solo founder 模式 required_approving_review_count 必须为 0"
         )
         assert params["dismiss_stale_reviews_on_push"] is True
         assert params["required_review_thread_resolution"] is True
@@ -93,16 +96,24 @@ class TestBranchRulesetExpectedJson:
             "(CODEOWNERS 保留但不阻断)"
         )
 
-    def test_rules_contain_required_status_checks_with_strict_merge(self, expected):
-        """R71 Wave 6 P1-02/03: required_status_checks 必须存在且 strict_merge=true。"""
+    def test_rules_contain_required_status_checks_with_strict_required_status_checks_policy(
+        self, expected
+    ):
+        """R71 Wave 6 P1-02/03: required_status_checks 必须存在且
+        strict_required_status_checks_policy=true。
+
+        R71 fix: Rulesets API 字段名为 strict_required_status_checks_policy
+        (非 strict_merge;后者是 Branch Protection API 旧字段名)。
+        """
         rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
         assert len(rsc_rules) == 1, "应有 1 个 required_status_checks 规则"
         params = rsc_rules[0]["parameters"]
-        assert params.get("strict_merge") is True, (
-            "R71 P1-03: strict_merge 必须为 true(current-SHA,不允许 stale parent commit)"
+        assert params.get("strict_required_status_checks_policy") is True, (
+            "R71 P1-03: strict_required_status_checks_policy 必须为 true "
+            "(current-SHA,不允许 stale parent commit)"
         )
         # R71 P1-02: 必须包含 R71 Wave 2/4/5 新增的 context
-        contexts = [c["context"] for c in params.get("required_checks", [])]
+        contexts = [c["context"] for c in params.get("required_status_checks", [])]
         for ctx in ("compose-runtime-e2e", "validate-oci-rootfs", "verify-rc-identity"):
             assert ctx in contexts, (
                 f"R71 P1-02: required_status_checks 必须包含 R71 新增 context: {ctx}"
@@ -144,14 +155,18 @@ class TestConfigureBranchRulesetScript:
         # bypass_actors 必须为空
         assert "bypass_actors: []" in content, "bypass_actors 应为空数组"
 
-    def test_script_required_reviewers_default_zero(self):
+    def test_script_required_approving_review_count_default_zero(self):
         """R71 Wave 6 P1-01: solo founder — REQUIRED_REVIEWERS 默认 0(无审批死锁)。
 
         旧 R67 P0-01 默认 2 reviewers,但对 solo founder 造成审批死锁。
         R71 Wave 6 改为 0。
+
+        R71 fix: Rulesets API payload 字段名为 required_approving_review_count
+        (非 required_reviewers;后者是 Branch Protection API 旧字段名)。
+        bash 变量名 REQUIRED_REVIEWERS 保留(脚本内部使用)。
         """
         content = CONFIGURE_SH.read_text(encoding="utf-8")
-        assert "required_reviewers" in content
+        assert "required_approving_review_count" in content
         assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-0}"' in content, (
             "R71 P1-01: configure_branch_ruleset.sh 应默认 REQUIRED_REVIEWERS=0 "
             "(solo founder,无审批死锁)"

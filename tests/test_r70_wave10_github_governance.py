@@ -253,33 +253,38 @@ class TestConfigureBranchRulesetR71SoloFounder:
                 f"configure_branch_ruleset.sh 缺少 R71 required status check: {check}"
             )
 
-    def test_r71_required_status_checks_35_count(self, script_content: str):
-        """R71 P1-02: 必须包含至少 35 个 required status check(覆盖所有
-        真实 release-gates.yml job 名)。"""
+    def test_r71_required_status_checks_36_count(self, script_content: str):
+        """R71 P1-02: 必须包含至少 36 个 required status check(覆盖所有
+        真实 release-gates.yml job 名,含 Wave 7 新增 bind-runtime-config)。"""
         assert "REQUIRED_STATUS_CHECKS" in script_content, (
             "configure_branch_ruleset.sh 应有 REQUIRED_STATUS_CHECKS 变量"
         )
-        # 必须有 -lt 35 校验
-        assert "-lt 35" in script_content, (
+        # 必须有 -lt 36 校验(Wave 7 扩展,从 35 到 36)
+        assert "-lt 36" in script_content, (
             "R71 P1-02: configure_branch_ruleset.sh 必须校验 REQUIRED_STATUS_CHECKS "
-            "至少 35 项(-lt 35)"
+            "至少 36 项(-lt 36, Wave 7 新增 bind-runtime-config)"
         )
-        # R71 Wave 2/4/5 新增的 context 必须在默认值中
-        for ctx in ("compose-runtime-e2e", "validate-oci-rootfs", "verify-rc-identity"):
+        # R71 Wave 2/4/5/7 新增的 context 必须在默认值中
+        for ctx in ("compose-runtime-e2e", "validate-oci-rootfs",
+                    "verify-rc-identity", "bind-runtime-config"):
             assert ctx in script_content, (
                 f"R71 P1-02: configure_branch_ruleset.sh 缺少 R71 新增 context: {ctx}"
             )
 
     def test_r71_pull_request_rule_present(self, script_content: str):
-        """R71 P1-01: pull_request 规则 required_reviewers 必须为 0
+        """R71 P1-01: pull_request 规则 required_approving_review_count 必须为 0
         (solo founder,无审批死锁)。
 
         旧 R70 要求 1 reviewer + R67 要求 2 reviewers,造成 solo founder
         审批死锁。R71 Wave 6 改为 0。
+
+        R71 fix: Rulesets API 字段名为 required_approving_review_count
+        (非 required_reviewers;后者是 Branch Protection API 旧字段名)。
+        bash 变量名 REQUIRED_REVIEWERS 保留(脚本内部使用)。
         """
-        assert "required_reviewers" in script_content
-        # payload 中 required_reviewers 必须为 0(变量插值后)
-        # 脚本中默认值字面值:-0
+        assert "required_approving_review_count" in script_content
+        # payload 中 required_approving_review_count 必须为 0(变量插值后)
+        # 脚本中 bash 变量默认值字面值:-0
         assert 'REQUIRED_REVIEWERS="${REQUIRED_REVIEWERS:-0}"' in script_content, (
             "R71 P1-01: configure_branch_ruleset.sh 应默认 REQUIRED_REVIEWERS=0 "
             "(solo founder,无审批死锁)"
@@ -310,13 +315,18 @@ class TestConfigureBranchRulesetR71SoloFounder:
             "R71 P1-01: 不应保留 R70 旧设置 require_code_owner_review: true"
         )
 
-    def test_r71_strict_merge_true(self, script_content: str):
-        """R71 P1-03: required_status_checks.strict_merge 必须为 true
-        (current-SHA,不允许 stale parent commit)。"""
-        assert "strict_merge" in script_content
-        assert "strict_merge\": true" in script_content or \
-               "strict_merge\":true" in script_content, (
-            "R71 P1-03: required_status_checks.strict_merge 必须为 true "
+    def test_r71_strict_required_status_checks_policy_true(self, script_content: str):
+        """R71 P1-03: required_status_checks.strict_required_status_checks_policy 必须为 true
+        (current-SHA,不允许 stale parent commit)。
+
+        R71 fix: Rulesets API 字段名为 strict_required_status_checks_policy
+        (非 strict_merge;后者是 Branch Protection API 旧字段名)。
+        """
+        assert "strict_required_status_checks_policy" in script_content
+        assert "strict_required_status_checks_policy\": true" in script_content or \
+               "strict_required_status_checks_policy\":true" in script_content, (
+            "R71 P1-03: required_status_checks.strict_required_status_checks_policy "
+            "必须为 true "
             "(current-SHA,不允许 stale parent commit)"
         )
 

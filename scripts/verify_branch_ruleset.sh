@@ -294,10 +294,11 @@ assert_contains "rules 含 pull_request (PR-only 流程)" \
   "$RULESET_JSON" \
   '[.rules[].type] | any(. == "pull_request")'
 
-# R71 P1-01: Solo Founder — required_reviewers == 0 (无审批死锁)
-assert_contains "R71 P1-01: pull_request.required_reviewers == 0 (solo founder, 无审批死锁)" \
+# R71 P1-01: Solo Founder — required_approving_review_count == 0 (无审批死锁)
+# R71 fix: API field is required_approving_review_count (not required_reviewers)
+assert_contains "R71 P1-01: pull_request.required_approving_review_count == 0 (solo founder, 无审批死锁)" \
   "$RULESET_JSON" \
-  '[.rules[] | select(.type == "pull_request") | .parameters.required_reviewers] | add == 0'
+  '[.rules[] | select(.type == "pull_request") | .parameters.required_approving_review_count] | add == 0'
 
 # R71 P1-01: Solo Founder — require_code_owner_review == false (CODEOWNERS 保留但不阻断)
 assert_contains "R71 P1-01: pull_request.require_code_owner_review == false (CODEOWNERS 保留但不阻断)" \
@@ -317,35 +318,38 @@ assert_contains "rules 含 required_status_checks (R71 P1-02)" \
   "$RULESET_JSON" \
   '[.rules[].type] | any(. == "required_status_checks")'
 
-# R71 P1-03: strict_merge == true (current-SHA, 不允许 stale parent commit)
-assert_contains "R71 P1-03: required_status_checks.strict_merge == true (current-SHA)" \
+# R71 P1-03: strict_required_status_checks_policy == true (current-SHA, 不允许 stale parent commit)
+# R71 fix: API field is strict_required_status_checks_policy (not strict_merge)
+#   go-github RequiredStatusChecksRuleParameters:
+#     StrictRequiredStatusChecksPolicy bool `json:"strict_required_status_checks_policy"`
+assert_contains "R71 P1-03: required_status_checks.strict_required_status_checks_policy == true (current-SHA)" \
   "$RULESET_JSON" \
-  '[.rules[] | select(.type == "required_status_checks") | .parameters.strict_merge] | add == true'
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.strict_required_status_checks_policy] | add == true'
 
 # R71 P1-02: 每个 expected context 都必须在 required_status_checks 中
 for ctx in "${EXPECTED_REQUIRED_CHECKS[@]}"; do
   assert_contains_ctx "R71 P1-02: required_status_checks 含 '${ctx}'" \
     "$RULESET_JSON" \
-    '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == ($c))' \
+    '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == ($c))' \
     "c" "$ctx"
 done
 
 # R71 P1-02: 特别验证 R71 Wave 2/4/5/7 新增的 context
 assert_contains "R71 Wave 2: required_status_checks 含 'compose-runtime-e2e'" \
   "$RULESET_JSON" \
-  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == "compose-runtime-e2e")'
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "compose-runtime-e2e")'
 
 assert_contains "R71 Wave 4: required_status_checks 含 'validate-oci-rootfs'" \
   "$RULESET_JSON" \
-  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == "validate-oci-rootfs")'
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "validate-oci-rootfs")'
 
 assert_contains "R71 Wave 5: required_status_checks 含 'verify-rc-identity'" \
   "$RULESET_JSON" \
-  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == "verify-rc-identity")'
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "verify-rc-identity")'
 
 assert_contains "R71 Wave 7: required_status_checks 含 'bind-runtime-config'" \
   "$RULESET_JSON" \
-  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == "bind-runtime-config")'
+  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "bind-runtime-config")'
 
 # bypass_actors 必须为空(禁止任何角色 bypass,包括 admin;紧急情况通过 record_break_glass.py)
 assert_contains "R71 P1-01: bypass_actors 为空 (禁止 admin bypass; 紧急情况用 record_break_glass.py)" \

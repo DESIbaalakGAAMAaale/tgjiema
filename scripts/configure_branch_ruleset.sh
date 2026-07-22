@@ -4,24 +4,34 @@
 #
 # R71 P1-01/02/03 整改说明(审计报告要求):
 #   旧版 R67 P0-01 + R70 Wave 10 配置了两个 ruleset:
-#     1. R67 P0-01 Branch Immutability Ruleset — required_reviewers: 2
-#     2. r70-governance-master-protect — required_reviewers: 1 + code_owner_review: true
+#     1. R67 P0-01 Branch Immutability Ruleset — required_approving_review_count: 2
+#     2. r70-governance-master-protect — required_approving_review_count: 1 + code_owner_review: true
 #   对于 solo founder (@maxiuquan 是唯一开发者),这造成审批死锁:
 #   唯一维护者无法合并自己的 PR(无人能批准)。
 #
 #   R71 Wave 6 整改:用单一 "R71 Solo Founder Branch Ruleset" 替换两个旧 ruleset:
-#     - required_reviewers: 0(solo founder,无审批死锁)
+#     - required_approving_review_count: 0(solo founder,无审批死锁)
 #     - require_code_owner_review: false(CODEOWNERS 保留但不阻断)
 #     - dismiss_stale_reviews_on_push: true(新 push 时作废旧 approval)
 #     - required_review_thread_resolution: true(conversation 必须解决)
-#     - required_status_checks.strict_merge: true(current-SHA,不允许 stale parent commit)
-#     - required_status_checks.required_checks: 覆盖所有真实 release-gates.yml job 名
+#     - required_status_checks.strict_required_status_checks_policy: true(current-SHA,不允许 stale parent commit)
+#     - required_status_checks.required_status_checks: 覆盖所有真实 release-gates.yml job 名
 #     - bypass_actors: [](无 admin/app bypass;紧急情况通过 scripts/record_break_glass.py 审计日志)
 #     - deletion / non_fast_forward / update / required_signatures: 全部启用(不可变历史 + 签名)
 #
 #   本脚本通过 GitHub REST API(POST /repos/{owner}/{repo}/rulesets
 #   或 PUT /repos/{owner}/{repo}/rulesets/{id})配置单一 Repository Ruleset,
 #   针对 refs/heads/master 与 refs/heads/main。
+#
+#   R71 fix: API field is strict_required_status_checks_policy (not strict_merge),
+#            required_approving_review_count (not required_reviewers),
+#            required_status_checks (not required_checks).
+#            GitHub REST API 文档不完整;go-github 源码(google/go-github/github/rules.go)确认:
+#            - RequiredStatusChecksRuleParameters.StrictRequiredStatusChecksPolicy
+#              JSON "strict_required_status_checks_policy" (非指针 bool, 无 omitempty → REQUIRED)
+#            - PullRequestRuleParameters.RequiredApprovingReviewCount
+#              JSON "required_approving_review_count"
+#            - required_status_checks 数组字段 JSON key 为 "required_status_checks" (非 "required_checks")
 #
 # 使用方法:
 #   OWNER=maxiuquan REPO=tgjiema ./scripts/configure_branch_ruleset.sh
@@ -58,8 +68,8 @@ R71 Solo Founder 必需的规则(solo-founder 模式,无审批死锁):
                          + dismiss_stale_reviews_on_push=true
                          + require_code_owner_review=false(CODEOWNERS 保留但不阻断)
                          + required_review_thread_resolution=true
-  - required_status_checks  strict_merge=true(current-SHA,不允许 stale parent commit)
-                         + 36 个 required_checks(覆盖所有真实 release-gates.yml job 名)
+  - required_status_checks  strict_required_status_checks_policy=true(current-SHA,不允许 stale parent commit)
+                         + 36 个 required_status_checks(覆盖所有真实 release-gates.yml job 名)
   - bypass_actors        []    — 禁止任何角色(包括 admin)bypass;
                          紧急情况通过 scripts/record_break_glass.py 审计日志
 
@@ -218,9 +228,9 @@ fi
 
 # ─── 5. 构造 R71 Solo Founder ruleset payload ───
 # R71 P1-01/02/03:
-#   - required_reviewers: 0(solo founder,无审批死锁)
+#   - required_approving_review_count: 0(solo founder,无审批死锁)
 #   - require_code_owner_review: false(CODEOWNERS 保留但不阻断)
-#   - strict_merge: true(current-SHA,不允许 stale parent commit)
+#   - strict_required_status_checks_policy: true(current-SHA,不允许 stale parent commit)
 #   - bypass_actors: [](无 admin/app bypass;紧急情况通过 record_break_glass.py 审计日志)
 PAYLOAD=$(jq -n \
   --arg name "$RULESET_NAME" \
@@ -247,7 +257,7 @@ PAYLOAD=$(jq -n \
     {
       "type": "pull_request",
       "parameters": {
-        "required_reviewers": ($required_reviewers),
+        "required_approving_review_count": ($required_reviewers),
         "dismiss_stale_reviews_on_push": true,
         "require_code_owner_review": false,
         "require_last_push_approval": false,
@@ -257,8 +267,8 @@ PAYLOAD=$(jq -n \
     {
       "type": "required_status_checks",
       "parameters": {
-        "required_checks": ($required_checks | map({context: .})),
-        "strict_merge": true
+        "required_status_checks": ($required_checks | map({context: .})),
+        "strict_required_status_checks_policy": true
       }
     }
   ]
@@ -399,9 +409,9 @@ echo "Assert: rules 包含 pull_request (PR-only 流程)"
 echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "pull_request")' > /dev/null \
   || { echo "ERROR: [R71 P1-01] rules 缺少 pull_request 类型"; exit 1; }
 
-echo "Assert: pull_request.required_reviewers == 0 (solo founder, 无审批死锁)"
-echo "$RULESET_JSON" | jq -e '[.rules[] | select(.type == "pull_request") | .parameters.required_reviewers] | add == 0' > /dev/null \
-  || { echo "ERROR: [R71 P1-01] pull_request.required_reviewers != 0 (solo founder 要求 0)"; exit 1; }
+echo "Assert: pull_request.required_approving_review_count == 0 (solo founder, 无审批死锁)"
+echo "$RULESET_JSON" | jq -e '[.rules[] | select(.type == "pull_request") | .parameters.required_approving_review_count] | add == 0' > /dev/null \
+  || { echo "ERROR: [R71 P1-01] pull_request.required_approving_review_count != 0 (solo founder 要求 0)"; exit 1; }
 
 echo "Assert: pull_request.require_code_owner_review == false (CODEOWNERS 保留但不阻断)"
 echo "$RULESET_JSON" | jq -e '[.rules[] | select(.type == "pull_request") | .parameters.require_code_owner_review] | add == false' > /dev/null \
@@ -419,13 +429,13 @@ echo "Assert: rules 包含 required_status_checks"
 echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "required_status_checks")' > /dev/null \
   || { echo "ERROR: [R71 P1-02] rules 缺少 required_status_checks 类型"; exit 1; }
 
-echo "Assert: required_status_checks.strict_merge == true (current-SHA, 不允许 stale parent commit)"
-echo "$RULESET_JSON" | jq -e '[.rules[] | select(.type == "required_status_checks") | .parameters.strict_merge] | add == true' > /dev/null \
-  || { echo "ERROR: [R71 P1-03] required_status_checks.strict_merge != true"; exit 1; }
+echo "Assert: required_status_checks.strict_required_status_checks_policy == true (current-SHA, 不允许 stale parent commit)"
+echo "$RULESET_JSON" | jq -e '[.rules[] | select(.type == "required_status_checks") | .parameters.strict_required_status_checks_policy] | add == true' > /dev/null \
+  || { echo "ERROR: [R71 P1-03] required_status_checks.strict_required_status_checks_policy != true"; exit 1; }
 
 echo "Assert: required_status_checks 包含全部 36 个必需 check (R71 P1-02)"
 ACTUAL_CHECKS=$(echo "$RULESET_JSON" \
-  | jq -r '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | sort | join(",")')
+  | jq -r '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | sort | join(",")')
 EXPECTED_CHECKS=$(echo "$REQUIRED_STATUS_CHECKS" | jq -r 'sort | join(",")')
 if [ "$ACTUAL_CHECKS" != "$EXPECTED_CHECKS" ]; then
   echo "ERROR: [R71 P1-02] required_status_checks.contexts 与预期不一致"
@@ -437,7 +447,7 @@ fi
 echo "Assert: required_status_checks 包含 R71 Wave 2/4/5/7 新增 check"
 for ctx in "compose-runtime-e2e" "validate-oci-rootfs" "verify-rc-identity" "bind-runtime-config"; do
   echo "$RULESET_JSON" | jq -e --arg c "$ctx" \
-    '[.rules[] | select(.type == "required_status_checks") | .parameters.required_checks[].context] | any(. == $c)' > /dev/null \
+    '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == $c)' > /dev/null \
     || { echo "ERROR: [R71 P1-02] required_status_checks 缺少 R71 新增 check: $ctx"; exit 1; }
 done
 
@@ -454,8 +464,8 @@ echo "$RULESET_JSON" | jq '{id, name, target, source_type, enforcement, conditio
 echo ""
 echo "=========================================================="
 echo "  ✓ R71 Solo Founder Branch Ruleset 已配置成功"
-echo "  P1-01: required_reviewers=0 (无审批死锁)"
+echo "  P1-01: required_approving_review_count=0 (无审批死锁)"
 echo "  P1-02: 36 个 required_status_checks (全 release gates)"
-echo "  P1-03: strict_merge=true (current-SHA)"
+echo "  P1-03: strict_required_status_checks_policy=true (current-SHA)"
 echo "  bypass_actors=[] (无 admin bypass; 紧急情况用 record_break_glass.py)"
 echo "=========================================================="
