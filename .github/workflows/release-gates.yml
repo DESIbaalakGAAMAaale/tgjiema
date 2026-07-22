@@ -687,6 +687,24 @@ jobs:
     permissions:
       contents: read
       packages: read   # 拉取 GHCR 镜像必需
+    services:
+      # R71 RC11 fix: migration / crdb_sync / db_backup 需要 COCKROACHDB_URL。
+      # CI 环境没有外部 CRDB,用 CockroachDB single-node service container 提供。
+      # 介于 compose-runtime-e2e 与 compose up 启动的 redis 容器在同一 Docker
+      # network,但 CRDB 是 host network(127.0.0.1:26257),需用 host.docker.internal
+      # 或 --host networking。这里用 service container + ports 暴露到 runner。
+      cockroach:
+        image: cockroachdb/cockroach:latest-v24.3
+        ports:
+          - 26257:26257
+        env:
+          # insecure 模式仅用于 CI,生产必须用 TLS
+          COCKROACH_ARGS: start-single-node --insecure --listen-addr=0.0.0.0:26257
+        options: >-
+          --health-cmd "cockroach sql --insecure --host=localhost:26257 -e 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - name: Checkout
         uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
@@ -729,9 +747,18 @@ jobs:
         run: |
           set -euo pipefail
           # 与 compose-config job 一致:生成 .env.secrets.<service> 占位
-          for svc in migration db_writer crdb_sync up idx dsp mon admin_bot admin db_backup prometheus_exporter; do
+          for svc in db_writer up idx dsp mon admin_bot admin prometheus_exporter; do
             touch ".env.secrets.${svc}"
           done
+          # R71 RC11 fix: migration / crdb_sync / db_backup 需要 COCKROACHDB_URL。
+          # CI 用 CockroachDB single-node insecure service container。
+          # compose 容器通过 172.17.0.1(Docker 默认 bridge gateway)访问 host
+          # network 上的 CRDB service container。
+          # COCKROACHDB_URL 格式: postgresql://user:pass@host:26257/defaultdb?sslmode=disable
+          CRDB_URL="postgresql://root@172.17.0.1:26257/defaultdb?sslmode=disable"
+          echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.migration
+          echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.crdb_sync
+          echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.db_backup
           touch .env.shared
 
       - name: Run Compose Runtime E2E (11 phases, fail-closed)
