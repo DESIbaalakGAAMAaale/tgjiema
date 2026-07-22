@@ -67,7 +67,9 @@ services:
       - ./config/redis:/app/config/redis:ro
     entrypoint: ["/bin/sh", "/app/config/redis/render_acl.sh"]
     # R37 P2-4: 镜像安全加固(init 容器短任务,资源限制放宽)
-    read_only: true
+    # R71 RC6 fix: 移除 read_only: true — render_acl.sh 需要写入 named volume
+    # redis_data:/data。read_only: true 导致 /data/users.acl Permission denied。
+    # 安全性由 cap_drop: ALL + no-new-privileges 保证。
     tmpfs:
       - /tmp
     cap_drop:

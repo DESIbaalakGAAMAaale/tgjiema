@@ -252,7 +252,7 @@ if [ -z "$TAG_RULESET_JSON" ]; then
   # 未按名称找到,回退到按 target=tags + ref_name 匹配
   TAG_RULESET_JSON=$(echo "$RULESETS_JSON" \
     | jq -c \
-      '.[] | select(.target == "tags" and ((.conditions.ref_name.include // []) | index("refs/tags/*") != null))' \
+      '.[] | select(.target == "tag" and ((.conditions.ref_name.include // []) | index("refs/tags/*") != null))' \
     | head -n 1)
 fi
 
@@ -269,10 +269,10 @@ echo "========================================================================="
 
 # ─── 5. R66 P1-11: 严格断言所有必需属性 ───
 
-# 5.1 target == tags
-echo "Assert: target == tags"
-echo "$TAG_RULESET_JSON" | jq -e '.target == "tags"' > /dev/null \
-  || fail_diag "target != tags (R66 P1-11: ruleset 必须针对 tags)"
+# 5.1 target == tag (GitHub API 返回单数 "tag",非 "tags")
+echo "Assert: target == tag"
+echo "$TAG_RULESET_JSON" | jq -e '.target == "tag"' > /dev/null \
+  || fail_diag "target != tag (R66 P1-11: ruleset 必须针对 tags)"
 
 # 5.2 enforcement == active
 echo "Assert: enforcement == active"

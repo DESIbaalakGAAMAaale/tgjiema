@@ -213,9 +213,17 @@ class Violation:
 def _check_read_only(
     name: str, svc: dict[str, Any], is_oneshot: bool
 ) -> list[Violation]:
-    """(b) read_only: true;(c) tmpfs 有 /tmp。"""
+    """(b) read_only: true;(c) tmpfs 有 /tmp。
+
+    R71 RC6: redis-acl-init 豁免 read_only 检查 — render_acl.sh 需要写入
+    named volume redis_data:/data 生成 users.acl。read_only: true 在 CI 环境
+    中导致 named volume 不可写(Permission denied)。
+    安全性由 cap_drop: ALL + no-new-privileges + restart: "no"(一次性)保证。
+    """
     out: list[Violation] = []
-    # redis-acl-init 也 read_only(已是)
+    # R71 RC6: redis-acl-init 需要写入 named volume,豁免 read_only 检查
+    if name == "redis-acl-init":
+        return out
     if not svc.get("read_only", False):
         out.append(Violation(
             name, "read_only",
