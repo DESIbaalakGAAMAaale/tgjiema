@@ -355,7 +355,18 @@ class CockroachDBClient:
 
         # 初始化连接时:关闭 follower_reads + 设置 application_name(按服务追踪 RU)
         async def _init_conn(conn):
-            await conn.execute("SET default_transaction_use_follower_reads = off")
+            # R71 RC17 fix: SET default_transaction_use_follower_reads 是 CockroachDB
+            # 专有参数,PostgreSQL 不识别(unrecognized configuration parameter)。
+            # CI 使用 PostgreSQL service container 替代 CockroachDB(详见 release-gates.yml
+            # compose-runtime-e2e job 的 services.postgres 配置)。生产环境使用 CockroachDB,
+            # 此 SET 会正常执行。用 try/except 兼容两种 DB,失败时仅记录 debug 日志。
+            try:
+                await conn.execute("SET default_transaction_use_follower_reads = off")
+            except Exception as _e:
+                logger.debug(
+                    f"[DB] SET default_transaction_use_follower_reads 跳过"
+                    f"(非 CockroachDB,可忽略): {_e}"
+                )
             await conn.execute("SET application_name = $1", app_name)
 
         min_size = _settings.CRDB_POOL_MIN_SIZE  # R36: 不再强制 max(1, ...)

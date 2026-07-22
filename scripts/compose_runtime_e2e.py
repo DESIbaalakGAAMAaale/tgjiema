@@ -540,11 +540,24 @@ def phase_start_core(timeout: int) -> PhaseResult:
     try:
         result = _run(cmd, timeout=timeout, cwd=REPO_ROOT)
     except subprocess.TimeoutExpired:
+        # R71 RC17 fix: 超时时也捕获容器日志,用于诊断哪个容器导致 compose up 挂起。
+        # (migration 挂起 / redis healthcheck 失败 / redis-acl-init 卡住等)
+        container_logs: dict[str, Any] = {}
+        for svc in ("redis-acl-init", "redis", "migration", "db_writer"):
+            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "100", svc])
+            try:
+                logs_result = _run(logs_cmd, timeout=15, cwd=REPO_ROOT)
+                svc_log = (logs_result.stdout or "") + (logs_result.stderr or "")
+                if svc_log.strip():
+                    container_logs[svc] = svc_log[-4000:]
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         return _fail_result(
             phase="start_core",
             description=description,
             started=started,
             error=f"docker compose up -d {' '.join(CORE_SERVICES)} 超时({timeout}s)",
+            evidence={"container_logs": container_logs} if container_logs else {},
             readiness_checks=[
                 {"check": "docker_daemon", "status": "pass"},
                 {"check": "compose_up", "status": "timeout"},
