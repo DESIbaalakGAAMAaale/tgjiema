@@ -769,7 +769,7 @@ jobs:
 
       - name: Create data and logs directories for bind mounts
         run: |
-          # R71 RC15 fix: docker-compose.prod.yml bind-mounts ./data:/app/data
+          # R71 RC15/RC16 fix: docker-compose.prod.yml bind-mounts ./data:/app/data
           # and ./logs:/app/logs for all business services. When these directories
           # don't exist on the host, Docker creates them as root-owned. But
           # containers run as 'app' user (UID 1000 via 'useradd -m app' in
@@ -779,8 +779,10 @@ jobs:
           # when cache_store.init() tries to open /app/data/cache_store.db.
           #
           # Fix: pre-create directories with UID 1000 ownership before compose up.
+          # R71 RC16: chown requires root — GitHub Actions runner is non-root,
+          # use sudo for chown (runner has passwordless sudo).
           mkdir -p data logs
-          chown -R 1000:1000 data logs
+          sudo chown -R 1000:1000 data logs
           echo "Created data/ and logs/ directories owned by UID 1000 (app user)"
 
       - name: Run Compose Runtime E2E (11 phases, fail-closed)
