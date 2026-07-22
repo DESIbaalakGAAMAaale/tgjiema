@@ -240,7 +240,8 @@ async def run_migration(
         crdb_version_written = False
         try:
             await client.execute(
-                "UPSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1)",
+                "INSERT INTO rotation_config (config_key, config_value) VALUES ('ddl_version', $1) "
+                "ON CONFLICT (config_key) DO UPDATE SET config_value = EXCLUDED.config_value",
                 [str(DDL_VERSION)],
             )
             crdb_version_written = True
