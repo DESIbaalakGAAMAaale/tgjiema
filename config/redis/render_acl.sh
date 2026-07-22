@@ -129,16 +129,25 @@ done
 OUTPUT_DIR=$(dirname "$OUTPUT_PATH")
 mkdir -p "$OUTPUT_DIR" 2>/dev/null || true
 
-# ── 4. sed 替换占位符,输出到目标文件 ──
+# ── 4. sed 替换占位符,输出到临时文件 ──
 # 占位符格式: <REDIS_HEALTH_PASSWORD> / <REDIS_WRITER_PASSWORD> /
 #             <REDIS_READER_PASSWORD> / <REDIS_ADMIN_PASSWORD>
 # 使用 | 作为分隔符避免密码中可能的 / 冲突
+_TMP_OUTPUT="${OUTPUT_PATH}.tmp"
 sed \
     -e "s|<REDIS_HEALTH_PASSWORD>|${HEALTH_PWD}|g" \
     -e "s|<REDIS_WRITER_PASSWORD>|${WRITER_PWD}|g" \
     -e "s|<REDIS_READER_PASSWORD>|${READER_PWD}|g" \
     -e "s|<REDIS_ADMIN_PASSWORD>|${ADMIN_PWD}|g" \
-    "$TEMPLATE_PATH" > "$OUTPUT_PATH"
+    "$TEMPLATE_PATH" > "$_TMP_OUTPUT"
+
+# R71 RC10 fix: Redis ACL 文件格式不支持 # 注释行。
+# Redis 启动时报错 "/data/users.acl:1 should start with user keyword followed
+# by the username",因为模板中的 # 注释行被 Redis 解析为无效语法。
+# 过滤步骤:只保留以 'user ' 开头的行和空行,移除所有 # 注释行。
+# 这保留了模板中的注释(供人类阅读),同时生成 Redis 可解析的 ACL 文件。
+grep -E '^(user |[[:space:]]*$)' "$_TMP_OUTPUT" > "$OUTPUT_PATH" || true
+rm -f "$_TMP_OUTPUT"
 
 # ── 5. 校验输出文件 ──
 # 5.1 不得含 '<'(占位符未替换)
