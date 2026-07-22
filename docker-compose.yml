@@ -106,6 +106,16 @@ services:
     restart: unless-stopped
     # R40 P0-3: 从 redis_data 共享卷加载渲染后的 ACL(/data/users.acl 由 redis-acl-init 生成)
     # R38 P1-8: 启用 ACL(--aclfile),各服务使用独立用户连接 Redis
+    # R71 RC9 fix: redis:7-alpine 镜像 entrypoint.sh 在以 root 启动时会尝试
+    # `setpriv --reuid=redis --regid=redis --clear-groups` 切换到 redis 用户,
+    # 这需要 CAP_SETUID 和 CAP_SETGID capabilities。cap_drop: ALL 移除了这些
+    # capabilities,导致 `setpriv: setresuid failed: Operation not permitted`(RC8 复现)。
+    # 显式指定 user: redis 让 Docker 直接以 redis 用户启动容器,entrypoint.sh
+    # 检测 `id -u != 0` 直接 `exec "$@"`,绕过 setpriv 切换。
+    # /data named volume 的 owner 是 redis:redis(redis:7-alpine Dockerfile
+    # 执行 `chown redis:redis /data`),redis 用户有读写权限。
+    # users.acl 的 owner 也是 redis:redis(render_acl.sh 末尾 chown 设置)。
+    user: redis
     command: redis-server --appendonly yes --appendfsync everysec --maxmemory-policy noeviction --aclfile /data/users.acl
     volumes:
       - redis_data:/data
