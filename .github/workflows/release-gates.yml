@@ -735,6 +735,11 @@ jobs:
           touch .env.shared
 
       - name: Run Compose Runtime E2E (11 phases, fail-closed)
+        env:
+          # R71 RC3 fix: compose_runtime_e2e.py 的 preflight 从 os.environ 读取
+          # TGJIEMA_IMAGE(line 411),而不是从 .env 文件。必须在 step env 中
+          # 显式注入,否则 preflight 的 image_digest 检查失败。
+          TGJIEMA_IMAGE: ${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}
         run: |
           set -euo pipefail
           echo "=== R71 Wave 2: Compose Runtime E2E (11 phases) ==="
@@ -747,6 +752,7 @@ jobs:
           echo "R71 P0-07: backup_restore 通过结构化数据校验验证恢复完整性"
           echo "           (write-marker → snapshot → backup → restore → verify → cleanup)"
           echo ""
+          echo "TGJIEMA_IMAGE=${TGJIEMA_IMAGE}"
           python scripts/compose_runtime_e2e.py \
             --timeout 600 \
             --output runtime-e2e-evidence.json
@@ -3120,6 +3126,22 @@ jobs:
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
+    - name: "R71 RC3: Login gh CLI with BP_PAT_TOKEN (for rulesets API access)"
+      env:
+        BP_PAT_TOKEN: ${{ secrets.BP_PAT_TOKEN }}
+      run: |
+        # R71 RC3 fix: rulesets API 需要 administration:read scope,
+        # GITHUB_TOKEN 无此 scope 返回 404。如果 BP_PAT_TOKEN secret 存在,
+        # 用它登录 gh CLI,verify_tag_ruleset.sh 的 gh CLI fallback 能用
+        # keyring 凭证(BP_PAT_TOKEN)访问 rulesets API。
+        if [ -n "$BP_PAT_TOKEN" ]; then
+          echo "BP_PAT_TOKEN is set (length=${#BP_PAT_TOKEN}), logging in gh CLI..."
+          echo "$BP_PAT_TOKEN" | gh auth login --with-token
+          echo "gh CLI logged in as: $(gh api user --jq '.login' 2>/dev/null || echo 'FAILED')"
+        else
+          echo "WARN: BP_PAT_TOKEN is empty, will use GITHUB_TOKEN (rulesets API may 404)"
+        fi
+
     - name: "R66 P1-11: Verify tag ruleset (immutable tags)"
       env:
         GH_TOKEN: ${{ secrets.BP_PAT_TOKEN || secrets.GITHUB_TOKEN }}
@@ -4079,7 +4101,7 @@ jobs:
 
     - name: Login to GHCR
       if: env.TGJIEMA_IMAGE != ''
-      uses: docker/login-action@97847b5c3934084447a3b5046736c3ae1c5c0b6f
+      uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
       with:
         registry: ghcr.io
         username: ${{ github.actor }}

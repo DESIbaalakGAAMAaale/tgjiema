@@ -319,23 +319,25 @@ def _run_smoke_container(
         # 启动容器(后台运行,-d)
         # 容器命令:/bin/sh -c "cat > /tmp/smoke.py << ... && exec python /tmp/smoke.py"
         # 环境变量:
-        #   APP_ENV=production(已是镜像默认)— 保留 fail-closed 语义
+        #   APP_ENV=test — R71 RC3 fix: 改为 test 环境。
+        #     原因:R69 Wave 7 设置 I18N_ALLOW_FALLBACK=1 绕过 i18n 严格边界,
+        #     但 R70 Wave 3 的 escape_hatch_guard 会在 APP_ENV=production/staging
+        #     下检测到 I18N_ALLOW_FALLBACK=1 并拒绝启动(AppError)。
+        #     两者冲突。本 smoke 只验证 import 链路无断裂,不验证 production
+        #     fail-closed 行为(后者由 _verify_image_default_cmd_fail_closed 覆盖)。
+        #     APP_ENV=test 让 escape_hatch_guard 跳过(只在 production/staging 触发),
+        #     同时 I18N_ALLOW_FALLBACK=1 在 test 环境下被允许。
         #   SERVICE_ROLE=prometheus_exporter — 无 secrets 依赖的合法角色,
         #     让 Settings 跳过 _validate_all_fields(否则会要求 6 个 Bot Token
         #     + COCKROACHDB_URL)。本 smoke 只验证 import 链路无断裂,不验证
         #     生产 secrets 配置(后者由 _verify_image_default_cmd_fail_closed 覆盖)。
         #   I18N_ALLOW_FALLBACK=1 — R69 Wave 7 fix: 测试逃生舱绕过 i18n 严格出口边界。
-        #     APP_ENV=production 会使 ENVIRONMENT=production,触发
-        #     services/i18n.py::_get_i18n_allow_fallback() 返回 False(严格 fail-closed),
-        #     导致模块级 translate() 调用未显式绑定 locale 时抛 AppError。
-        #     本 smoke 只验证 import 链路无断裂,不验证 i18n locale 绑定行为
-        #     (后者由单元测试覆盖)。I18N_ALLOW_FALLBACK=1 是 services/i18n.py
-        #     显式提供的测试逃生舱(见 _get_i18n_allow_fallback 优先级 2)。
+        #     在 APP_ENV=test 下被 escape_hatch_guard 允许。
         # R69 Wave 7: 不需要真实 secrets — smoke 脚本只 import 纯 Python 模块
         run_cmd = [
             "docker", "run", "-d",
             "--name", container_name,
-            "--env", "APP_ENV=production",
+            "--env", "APP_ENV=test",
             "--env", "SERVICE_ROLE=prometheus_exporter",
             "--env", "I18N_ALLOW_FALLBACK=1",
             "--env", "PYTHONUNBUFFERED=1",

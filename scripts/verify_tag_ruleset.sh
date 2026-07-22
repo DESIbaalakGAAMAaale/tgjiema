@@ -147,6 +147,21 @@ else
   fi
 fi
 
+# R71 RC3 fix: 诊断输出 — token 长度和前缀(不暴露完整 token)
+# 用于排查 BP_PAT_TOKEN secret 是否正确传递到 CI
+if [ -n "$TOKEN" ]; then
+  TOKEN_LEN=${#TOKEN}
+  TOKEN_PREFIX=$(echo "$TOKEN" | cut -c1-4)
+  echo "[diag] TOKEN length=${TOKEN_LEN}, prefix=${TOKEN_PREFIX}***"
+  # 验证 token 有效性:调用 /user 端点
+  USER_LOGIN=$(curl -sS -H "Authorization: token ${TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    "https://api.github.com/user" 2>/dev/null | jq -r '.login // "FAILED"' 2>/dev/null || echo "CURL_ERROR")
+  echo "[diag] /user login=${USER_LOGIN}"
+else
+  echo "[diag] TOKEN is empty, using gh CLI keyring credentials"
+fi
+
 # ─── 3. 拉取所有 repository rulesets ───
 # GET /repos/{owner}/{repo}/rulesets 返回当前仓库的所有 ruleset 列表
 if [ "$USE_GH_CLI" = "true" ]; then
@@ -164,6 +179,19 @@ else
     -H "Accept: application/vnd.github+json" \
     -H "X-GitHub-Api-Version: 2022-11-28" \
     "https://api.github.com/repos/${OWNER}/${REPO}/rulesets")
+  # R71 RC3 fix: 如果 curl 返回非数组(如 404),尝试用 gh CLI 作为 fallback
+  if ! echo "$RESPONSE" | jq -e 'type == "array"' > /dev/null 2>&1; then
+    echo "[diag] curl 返回非数组,尝试用 gh CLI fallback..."
+    if command -v gh >/dev/null 2>&1; then
+      GH_RESPONSE=$(gh api "repos/${OWNER}/${REPO}/rulesets" 2>&1 || echo "")
+      if echo "$GH_RESPONSE" | jq -e 'type == "array"' > /dev/null 2>&1; then
+        echo "[diag] gh CLI fallback 成功"
+        RESPONSE="$GH_RESPONSE"
+      else
+        echo "[diag] gh CLI fallback 也失败: $GH_RESPONSE"
+      fi
+    fi
+  fi
 fi
 
 # 校验响应是合法 JSON 数组(非数组表示 API 调用失败或权限不足)

@@ -88,6 +88,14 @@ def _run_container_import(image_ref: str, module: str) -> tuple[bool, str]:
     (后者由单元测试 services/i18n.py 覆盖)。I18N_ALLOW_FALLBACK=1 是
     services/i18n.py 显式提供的测试逃生舱(见 _get_i18n_allow_fallback 优先级 2)。
 
+    R71 RC3 fix: 改用 APP_ENV=test(原来是 production)。
+    原因:R70 Wave 3 引入 escape_hatch_guard,会在 APP_ENV=production/staging
+    下检测到 I18N_ALLOW_FALLBACK=1 并拒绝启动(AppError),与 R69 Wave 7 的
+    I18N_ALLOW_FALLBACK=1 冲突。APP_ENV=test 让 escape_hatch_guard 跳过
+    (只在 production/staging 触发),同时 I18N_ALLOW_FALLBACK=1 在 test 环境
+    下被允许。生产 fail-closed 行为由 _verify_image_default_cmd_fail_closed
+    单独验证(不设置这些 env var)。
+
     生产 fail-closed 行为(默认 CMD + i18n 严格模式)由
     _verify_image_default_cmd_fail_closed 单独验证(不设置此 env var)。
 
@@ -96,6 +104,7 @@ def _run_container_import(image_ref: str, module: str) -> tuple[bool, str]:
     """
     cmd = [
         "docker", "run", "--rm", "--entrypoint", "/bin/sh",
+        "-e", "APP_ENV=test",
         "-e", "SERVICE_ROLE=prometheus_exporter",
         "-e", "I18N_ALLOW_FALLBACK=1",
         image_ref, "-c", f"python -c 'import {module}' 2>&1",
