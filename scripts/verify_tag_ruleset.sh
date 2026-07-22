@@ -89,14 +89,44 @@ R66 P1-11: 验证 GitHub Repository Ruleset 已正确配置为标签不可变。
 EOF
 }
 
-if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
-  print_help
-  exit 0
+# ─── 0. 解析 flags(--strict / --dry-run / --help) ───
+# R71 RC5 fix: 之前 --strict 被当作 OWNER 位置参数,导致 API 调用
+#   repos/--strict/tgjiema/rulesets → 404。
+# 现在先提取 flags,再解析位置参数。
+STRICT_MODE=false
+DRY_RUN=false
+POSITIONAL_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --strict)
+      STRICT_MODE=true
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    --help|-h)
+      print_help
+      exit 0
+      ;;
+    *)
+      POSITIONAL_ARGS+=("$arg")
+      ;;
+  esac
+done
+# 重置位置参数为非 flag 参数,后续 ${1:-} / ${2:-} 只引用位置参数
+set -- "${POSITIONAL_ARGS[@]}"
+
+if [ "$STRICT_MODE" = "true" ]; then
+  echo "[R66 P1-11] Strict mode enabled — all assertions must pass"
+fi
+if [ "$DRY_RUN" = "true" ]; then
+  echo "[R66 P1-11] Dry-run mode — failures will still exit 1 (use || in caller for non-fatal)"
 fi
 
 # ─── 1. 解析 OWNER / REPO(GITHUB_REPOSITORY 优先,其次环境变量,最后位置参数 / gh repo view / git remote) ───
 # GITHUB_REPOSITORY 格式为 "owner/repo"(GitHub Actions 自动注入)
-if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -z "${OWNER:-${1:-}}" ]; then
+# R71 RC5 fix: 移除 ${1:-} 依赖 — flags 已在上方提取,$1 现在只引用位置参数。
+if [ -n "${GITHUB_REPOSITORY:-}" ] && [ -z "${OWNER:-}" ]; then
   OWNER="${GITHUB_REPOSITORY%%/*}"
   REPO="${GITHUB_REPOSITORY#*/}"
 fi

@@ -25,6 +25,36 @@
 
 set -eu
 
+# R71 RC5 fix: 诊断 trap — 在脚本失败时输出关键变量和输出文件状态
+# compose 输出不包含 oneshot 容器的 stdout/stderr,导致无法定位
+# redis-acl-init exit 1 的根因。此 trap 确保失败时输出诊断信息到 stderr,
+# 可通过 `docker compose logs redis-acl-init` 或 compose_runtime_e2e.py 的
+# container_logs 捕获逻辑获取。
+# 注意: POSIX 兼容(Alpine BusyBox ash),不使用 bash 特有语法。
+_render_acl_on_exit() {
+    _exit_code=$?
+    set +u  # 关闭 nounset,防止变量未设置时 trap 本身失败
+    if [ "$_exit_code" -ne 0 ]; then
+        echo "" >&2
+        echo "[render_acl] FAILED (exit=$_exit_code)" >&2
+        echo "[render_acl] TEMPLATE_PATH=${TEMPLATE_PATH:-<unset>}" >&2
+        _tp_exists="no"
+        if [ -f "${TEMPLATE_PATH:-/nonexistent}" ]; then _tp_exists="yes"; fi
+        echo "[render_acl] TEMPLATE_PATH exists=$_tp_exists" >&2
+        echo "[render_acl] OUTPUT_PATH=${OUTPUT_PATH:-<unset>}" >&2
+        echo "[render_acl] OUTPUT_DIR=${OUTPUT_DIR:-<unset>}" >&2
+        echo "[render_acl] PWD lengths: health=${#HEALTH_PWD} writer=${#WRITER_PWD} reader=${#READER_PWD} admin=${#ADMIN_PWD}" >&2
+        if [ -f "${OUTPUT_PATH:-/nonexistent}" ]; then
+            echo "[render_acl] Output file exists, content:" >&2
+            cat "${OUTPUT_PATH:-/dev/null}" >&2 2>/dev/null || echo "(cannot read)" >&2
+        else
+            echo "[render_acl] Output file does NOT exist" >&2
+        fi
+    fi
+    exit "$_exit_code"
+}
+trap _render_acl_on_exit EXIT
+
 # 模板与输出路径(支持环境变量覆盖,容器内由 docker-compose 挂载决定)
 TEMPLATE_PATH="${ACL_TEMPLATE_PATH:-/app/config/redis/users.acl.template}"
 OUTPUT_PATH="${ACL_OUTPUT_PATH:-/data/users.acl}"

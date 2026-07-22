@@ -552,6 +552,19 @@ def phase_start_core(timeout: int) -> PhaseResult:
         )
 
     if result.returncode != 0:
+        # R71 RC5 fix: compose 输出不包含 oneshot 容器的实际错误输出。
+        # 捕获 redis-acl-init / redis / migration / db_writer 的容器日志,
+        # 用于诊断 redis-acl-init render_acl.sh 等脚本的实际失败原因。
+        container_logs: dict[str, Any] = {}
+        for svc in ("redis-acl-init", "redis", "migration", "db_writer"):
+            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "100", svc])
+            try:
+                logs_result = _run(logs_cmd, timeout=15, cwd=REPO_ROOT)
+                svc_log = (logs_result.stdout or "") + (logs_result.stderr or "")
+                if svc_log.strip():
+                    container_logs[svc] = svc_log[-4000:]
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         return _fail_result(
             phase="start_core",
             description=description,
@@ -563,6 +576,7 @@ def phase_start_core(timeout: int) -> PhaseResult:
             stdout=result.stdout,
             stderr=result.stderr,
             returncode=result.returncode,
+            evidence={"container_logs": container_logs} if container_logs else {},
             readiness_checks=[
                 {"check": "docker_daemon", "status": "pass"},
                 {"check": "compose_up", "status": "fail"},
