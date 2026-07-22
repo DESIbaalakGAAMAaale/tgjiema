@@ -487,6 +487,16 @@ def _extract_expected_schema(ddl_statements: list[str]) -> dict[str, dict[str, d
         columns: dict[str, dict] = {}
         pk_cols: set[str] = set()
 
+        # R71 RC20 fix: strip -- line comments before comma splitting.
+        # Some CREATE TABLE statements have inline comments like:
+        #   is_tombstone INTEGER DEFAULT 0  -- R44 7.2: tombstone 标记列,使 ...
+        # The comma inside the Chinese comment was being treated as a top-level
+        # column separator by _split_top_level_commas, causing "使" (a single
+        # Chinese char) to be parsed as a column name. Stripping -- comments
+        # before splitting prevents this. (DDL_STATEMENTS has no string
+        # literals containing -- so this is safe.)
+        body = re.sub(r"--[^\n]*", "", body)
+
         # 按逗号分割列定义(注意括号内逗号不分割)
         parts = _split_top_level_commas(body)
         for part in parts:
