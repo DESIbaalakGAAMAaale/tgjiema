@@ -637,9 +637,25 @@ async def _check_ddl_version(client) -> tuple[bool, str]:
     return True, "unknown"
 
 
-async def main():
-    """CLI 入口: python -m services.migration_runner"""
+async def main() -> int:
+    """CLI 入口: python -m services.migration_runner
+
+    R71 RC21 fix: 显式调用 close_db() 清理全局资源(cache_store SQLite
+    连接 + 全局 _client asyncpg 连接池)。run_migration() 内部创建的
+    CockroachDBClient 在其 finally 块中已关闭,但 cache_store.init() /
+    record_migration_usage() 可能创建全局资源。若不关闭,asyncio 事件
+    循环会有 pending tasks(如 aiosqlite 后台线程 / asyncpg pool
+    heartbeat),导致 asyncio.run(main()) 永不返回 → migration 容器
+    保持 "running" 状态 → docker compose up 等待
+    service_completed_successfully 永不满足 → start_core 600s 超时。
+
+    Returns:
+        0 — 迁移成功(无严重错误)
+        1 — 迁移完成但有严重错误(DDL 已执行但 schema 验证/版本写入失败)
+        2 — 迁移过程抛出异常
+    """
     from database.session import close_db
+    exit_code = 0
     try:
         result = await run_migration()
         if result["errors"]:
@@ -647,15 +663,24 @@ async def main():
                 f"[migration_runner] 迁移完成但有 {len(result['errors'])} 严重错误: "
                 f"{result['errors'][:3]}"
             )
-            # 退出码 1 表示有严重错误(但 DDL 本身已执行)
-            import sys
-            sys.exit(1)
-        logger.info("[migration_runner] 迁移成功完成,退出码 0")
+            exit_code = 1
+        else:
+            logger.info("[migration_runner] 迁移成功完成,退出码 0")
     except Exception as e:
         logger.exception(f"[migration_runner] 迁移失败: {e}")
-        import sys
-        sys.exit(2)
+        exit_code = 2
+    finally:
+        # R71 RC21: 关闭全局资源(cache_store + _client),防止
+        # asyncio 事件循环因 pending tasks 永不退出。
+        try:
+            await close_db()
+        except Exception as cleanup_err:
+            logger.debug(
+                f"[migration_runner] close_db 清理失败(可忽略): {cleanup_err}"
+            )
+    return exit_code
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import sys
+    sys.exit(asyncio.run(main()))
