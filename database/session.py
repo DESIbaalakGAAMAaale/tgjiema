@@ -367,7 +367,14 @@ class CockroachDBClient:
                     f"[DB] SET default_transaction_use_follower_reads 跳过"
                     f"(非 CockroachDB,可忽略): {_e}"
                 )
-            await conn.execute("SET application_name = $1", app_name)
+            # R71 RC18 fix: PostgreSQL 的 SET 语句不支持 prepared-statement 参数($1),
+            # asyncpg 的 conn.execute("SET application_name = $1", val) 会触发
+            # PostgresSyntaxError: syntax error at or near "$1"。
+            # CockroachDB 更宽松,允许 SET 使用参数。改用 set_config() 函数,
+            # 它在 CockroachDB(v21.1+)和 PostgreSQL 都支持 prepared-statement 参数。
+            await conn.execute(
+                "SELECT set_config('application_name', $1, false)", app_name
+            )
 
         min_size = _settings.CRDB_POOL_MIN_SIZE  # R36: 不再强制 max(1, ...)
         # R37 P0-3: crdb_sync 角色放宽上限(独占同步需要更多连接);
