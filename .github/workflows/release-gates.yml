@@ -391,7 +391,11 @@ jobs:
           WAIT=$((WAIT * 2))
         done
         # 验证镜像可启动并执行 python 命令
-        docker run --rm "${IMAGE_REF}" python -c "import sys; print(f'Python {sys.version}'); print('image OK (digest-pinned)')"
+        # R71 RC2 fix: 用 --entrypoint python 绕过 docker/entrypoint.py,
+        # 这一步只验证镜像内容地址(digest-pinned)可拉取且 python 可执行,
+        # 不需要走完整应用启动流程(APP_ENV / SERVICE_ROLE / 数据库等)。
+        # entrypoint.py 的强制检查是给生产部署用的,CI 镜像验证不需要。
+        docker run --rm --entrypoint python "${IMAGE_REF}" -c "import sys; print(f'Python {sys.version}'); print('image OK (digest-pinned)')"
 
     # R66 P1-12: 同候选不可变重验证 (fixed digest, 3x verification, replay not rebuild)
     # 审计发现 docker-build 仅单次 pull 验证 digest,未做"同候选 3 次重放验证"。
@@ -678,7 +682,7 @@ jobs:
   compose-runtime-e2e:
     runs-on: ubuntu-latest
     needs: [docker-build]
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v-')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v')
     environment: rc-candidate
     permissions:
       contents: read
