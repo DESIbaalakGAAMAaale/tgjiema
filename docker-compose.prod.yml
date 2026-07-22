@@ -34,6 +34,12 @@ services:
     image: redis:7-alpine
     container_name: tgjiema-redis-acl-init
     restart: "no"
+    # R71 RC7 fix: redis:7-alpine 默认以 `redis` 用户运行(Dockerfile USER redis),
+    # /data named volume 默认 owner=root,redis 用户无写权限,导致
+    # render_acl.sh 写入 /data/users.acl 时 Permission denied。
+    # oneshot 容器仅渲染 ACL 后立即退出,安全性由 cap_drop: ALL +
+    # no-new-privileges + restart: "no" 保证,root 用户无长期运行风险。
+    user: root
     environment:
       - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:?REDIS_HEALTH_PASSWORD must be set in .env}
       - REDIS_WRITER_PASSWORD=${REDIS_WRITER_PASSWORD:?REDIS_WRITER_PASSWORD must be set in .env}

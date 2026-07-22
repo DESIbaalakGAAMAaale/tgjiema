@@ -241,29 +241,81 @@ echo "=== 当前 Repository Rulesets 列表(共 ${RULESETS_COUNT} 个)==="
 echo "$RULESETS_JSON" | jq '.[] | {id, name, target, source_type, enforcement}' 2>/dev/null || true
 echo "================================================="
 
-# ─── 4. 查找 target=tags 且 conditions.ref_name.include 包含 refs/tags/* 的 ruleset ───
-# 优先按 RULESET_NAME 查找;若未找到,则按 target=tags + ref_name 匹配任意 tag ruleset
-TAG_RULESET_JSON=$(echo "$RULESETS_JSON" \
+# ─── 4. 查找 target=tag 的 ruleset ───
+# R71 RC7 fix: 列表端点 GET /repos/{owner}/{repo}/rulesets 返回简化 JSON,
+# 不含 conditions 和 rules 字段(只有 id/name/target/source_type/enforcement/
+# source/_links/created_at/updated_at)。因此:
+# 1. 先从列表端点按 name 或 target=tag 找到 ruleset id(只用列表端点返回的字段)
+# 2. 再用 id 调用详情端点 GET /repos/{owner}/{repo}/rulesets/{id} 获取完整 JSON
+#    (含 conditions.ref_name.include 和 rules 数组)
+# 3. 用完整 JSON 进行后续 conditions/rules 断言
+TAG_RULESET_SUMMARY=$(echo "$RULESETS_JSON" \
   | jq -c --arg name "$RULESET_NAME" \
     '.[] | select(.name == $name)' \
   | head -n 1)
 
-if [ -z "$TAG_RULESET_JSON" ]; then
-  # 未按名称找到,回退到按 target=tags + ref_name 匹配
-  TAG_RULESET_JSON=$(echo "$RULESETS_JSON" \
+if [ -z "$TAG_RULESET_SUMMARY" ]; then
+  # 未按名称找到,回退到按 target == "tag" 匹配
+  # R71 RC6 fix: GitHub API 返回 target=="tag"(单数)
+  # R71 RC7 fix: 不检查 conditions(列表端点不返回此字段),只按 target 匹配
+  TAG_RULESET_SUMMARY=$(echo "$RULESETS_JSON" \
     | jq -c \
-      '.[] | select(.target == "tag" and ((.conditions.ref_name.include // []) | index("refs/tags/*") != null))' \
+      '.[] | select(.target == "tag")' \
     | head -n 1)
 fi
 
-if [ -z "$TAG_RULESET_JSON" ]; then
-  fail_diag "未找到 target=tags 且 conditions.ref_name.include 包含 refs/tags/* 的 ruleset (R66 P1-11)"
+if [ -z "$TAG_RULESET_SUMMARY" ]; then
+  fail_diag "未找到 target=tag 的 ruleset (R66 P1-11)"
 fi
 
-RULESET_ID=$(echo "$TAG_RULESET_JSON" | jq -r '.id')
-RULESET_NAME_ACTUAL=$(echo "$TAG_RULESET_JSON" | jq -r '.name')
+RULESET_ID=$(echo "$TAG_RULESET_SUMMARY" | jq -r '.id')
+RULESET_NAME_ACTUAL=$(echo "$TAG_RULESET_SUMMARY" | jq -r '.name')
 echo ""
-echo "=== 找到匹配的 Tag Ruleset (id=${RULESET_ID}, name='${RULESET_NAME_ACTUAL}') ==="
+echo "=== 找到匹配的 Tag Ruleset 摘要 (id=${RULESET_ID}, name='${RULESET_NAME_ACTUAL}') ==="
+echo "$TAG_RULESET_SUMMARY" | jq '.'
+echo "========================================================================="
+
+# R71 RC7 fix: 调用详情端点获取完整 ruleset JSON(含 conditions + rules 字段)
+# 列表端点 GET /repos/{owner}/{repo}/rulesets 返回简化 JSON,不含 conditions/rules。
+# 详情端点 GET /repos/{owner}/{repo}/rulesets/{id} 返回完整 JSON。
+echo ""
+echo "=== 调用详情端点获取完整 Tag Ruleset (id=${RULESET_ID}) ==="
+if [ "$USE_GH_CLI" = "true" ]; then
+  if ! DETAIL_RESPONSE=$(gh api "repos/${OWNER}/${REPO}/rulesets/${RULESET_ID}" 2>&1); then
+    echo "::error::[R66 P1-11] 无法获取 ruleset 详情 (id=${RULESET_ID})"
+    echo "::error::gh api 输出: $DETAIL_RESPONSE"
+    exit 1
+  fi
+else
+  DETAIL_RESPONSE=$(curl -sS \
+    -H "Authorization: token ${TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/${OWNER}/${REPO}/rulesets/${RULESET_ID}")
+  # 如果 curl 失败(返回非完整对象),尝试用 gh CLI fallback
+  if ! echo "$DETAIL_RESPONSE" | jq -e 'type == "object" and has("rules") and has("conditions")' > /dev/null 2>&1; then
+    echo "[diag] curl 返回非完整对象(缺 rules/conditions),尝试用 gh CLI fallback..."
+    if command -v gh >/dev/null 2>&1; then
+      GH_DETAIL=$(gh api "repos/${OWNER}/${REPO}/rulesets/${RULESET_ID}" 2>&1 || echo "")
+      if echo "$GH_DETAIL" | jq -e 'type == "object" and has("rules") and has("conditions")' > /dev/null 2>&1; then
+        echo "[diag] gh CLI fallback 成功"
+        DETAIL_RESPONSE="$GH_DETAIL"
+      else
+        echo "[diag] gh CLI fallback 也失败: $GH_DETAIL"
+      fi
+    fi
+  fi
+fi
+
+# 校验详情响应是合法 JSON 对象且包含 rules 和 conditions 字段
+if ! echo "$DETAIL_RESPONSE" | jq -e 'type == "object" and has("rules") and has("conditions")' > /dev/null 2>&1; then
+  echo "::error::[R66 P1-11] ruleset 详情响应不是完整对象(缺少 rules/conditions 字段)"
+  echo "::error::响应: $DETAIL_RESPONSE"
+  exit 1
+fi
+
+TAG_RULESET_JSON="$DETAIL_RESPONSE"
+echo "=== 完整 Tag Ruleset 详情 (id=${RULESET_ID}) ==="
 echo "$TAG_RULESET_JSON" | jq '.'
 echo "========================================================================="
 
