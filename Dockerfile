@@ -42,6 +42,12 @@ RUN apt-get update && \
 
 # 从 builder 复制已安装的虚拟环境(位于可读路径 /app/venv)
 COPY --from=builder /app/venv /app/venv
+# R71 RC4 fix: COPY 可能保留 builder 阶段的 0777 权限(world-writable),
+# 导致 validate_oci_rootfs.py 的 permission_anomaly 检查失败。
+# chmod go-w 移除 group/other 的写权限,保留执行和读权限。
+# find -type l -exec chmod -h: 修复 symlink 自身的权限位(chmod -R 默认跟随 symlink)。
+RUN chmod -R go-w /app/venv && \
+    find /app/venv -type l -exec chmod -h go-w {} + 2>/dev/null || true
 ENV PATH=/app/venv/bin:$PATH
 
 # 项目代码 — R68 P0-07: 显式 allowlist COPY(不再使用全量复制)

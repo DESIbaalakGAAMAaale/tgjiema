@@ -740,6 +740,12 @@ jobs:
           # TGJIEMA_IMAGE(line 411),而不是从 .env 文件。必须在 step env 中
           # 显式注入,否则 preflight 的 image_digest 检查失败。
           TGJIEMA_IMAGE: ${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}
+          # R71 RC4 fix: preflight 还检查 REDIS_*_PASSWORD 环境变量非空。
+          # .env 文件中的值不会自动加载到 os.environ,必须在 step env 中显式注入。
+          REDIS_WRITER_PASSWORD: ci-placeholder-writer
+          REDIS_READER_PASSWORD: ci-placeholder-reader
+          REDIS_HEALTH_PASSWORD: ci-placeholder-health
+          REDIS_ADMIN_PASSWORD: ci-placeholder-admin
         run: |
           set -euo pipefail
           echo "=== R71 Wave 2: Compose Runtime E2E (11 phases) ==="
@@ -4115,7 +4121,9 @@ jobs:
     - name: R71 P1-04/P1-05/P0-13 — Validate runtime config + artifacts binding
       id: validate
       env:
-        TGJIEMA_IMAGE: ${{ env.TGJIEMA_IMAGE }}
+        # R71 RC4 fix: TGJIEMA_IMAGE 之前从 env.TGJIEMA_IMAGE 读取(为空)。
+        # 必须从 docker-build job 的 outputs 直接注入,与 compose-runtime-e2e 一致。
+        TGJIEMA_IMAGE: ${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}
         GITHUB_SHA: ${{ github.sha }}
         GITHUB_RUN_ID: ${{ github.run_id }}
         GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}

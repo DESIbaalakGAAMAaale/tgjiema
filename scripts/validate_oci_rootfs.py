@@ -455,11 +455,22 @@ def _validate_rootfs(
             unexpected_app_files.append(f.path)
 
     # 3. 检查权限异常(对所有 /app 文件, 包括 base 文件)
+    # R71 RC4 fix: Python venv 的 symlink(bin/python, bin/python3, lib64 等)
+    # 在 Docker tar 中的 mode 可能是 0777,这是 tar 格式的已知行为,
+    # 不代表实际文件系统权限( symlink 权限在 Linux 上被忽略)。
+    # 跳过 /app/venv/ 下 symlink 类型的 world-writable 检查。
     for path, meta in app_rootfs.items():
         if not _is_under_app(path):
             continue
         has_anomaly, desc = _check_permission_anomaly(meta.mode)
         if has_anomaly:
+            # venv symlink 的 world-writable 是 tar 格式假阳性
+            is_venv_symlink = (
+                path.lstrip("/").startswith("app/venv/")
+                and meta.type in ("symlink", "hardlink")
+            )
+            if is_venv_symlink and "world-writable" in desc:
+                continue
             permission_anomalies.append({
                 "path": path,
                 "mode": meta.mode,
@@ -467,11 +478,23 @@ def _validate_rootfs(
             })
 
     # 4. 检查 symlink 逃逸 /app
+    # R71 RC4 fix: Python venv 的 bin/python 等符号链接指向 /usr/local/bin/python
+    # (系统 Python 解释器)是 venv 标准行为,不是安全风险。
+    # 允许 /app/venv/ 下的 symlink 指向 /usr/local/(系统 Python 安装路径)。
+    VENV_SYMLINK_ALLOWLIST_TARGETS = ("/usr/local/",)
     for path, meta in app_rootfs.items():
         if not _is_under_app(path):
             continue
         if meta.type in ("symlink", "hardlink") and meta.link_target:
             if _symlink_escapes_app(meta.link_target):
+                # 检查是否是 venv 合法 symlink(/app/venv/ 下的 symlink 指向 /usr/local/)
+                is_venv_symlink = path.lstrip("/").startswith("app/venv/")
+                target_allowed = any(
+                    meta.link_target.startswith(prefix)
+                    for prefix in VENV_SYMLINK_ALLOWLIST_TARGETS
+                )
+                if is_venv_symlink and target_allowed:
+                    continue
                 permission_anomalies.append({
                     "path": path,
                     "mode": meta.mode,
