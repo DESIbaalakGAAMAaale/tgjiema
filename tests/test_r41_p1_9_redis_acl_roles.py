@@ -438,10 +438,11 @@ class TestRenderAclScript:
         content = _read_render_acl()
         assert re.search(r'if\s+\[\s*-z\s+"\$ADMIN_PWD"\s*\]', content), \
             "render_acl.sh 缺少 ADMIN_PWD 空值检查(R41 P1-9 新增)"
-        # 查找 ADMIN_PWD 块内的 exit 1
-        admin_block_start = content.find('ADMIN_PWD')
-        admin_block = content[admin_block_start:admin_block_start + 1000]
-        assert 'exit 1' in admin_block, \
+        # R71 RC8 fix: 使用 regex 模式匹配(与 writer/reader 测试一致),
+        # 而非 content.find + 1000 字符窗口 — EXIT trap 诊断行中的
+        # admin=${#ADMIN_PWD} 会使 find 命中 trap 而非密码校验块。
+        pattern = r'if\s+\[\s*-z\s+"\$ADMIN_PWD"\s*\][^;]*;\s*then.*?exit\s+1'
+        assert re.search(pattern, content, re.DOTALL), \
             "ADMIN_PWD 块内缺少 exit 1(fail-closed 校验)"
 
     def test_sed_replaces_health_password(self):

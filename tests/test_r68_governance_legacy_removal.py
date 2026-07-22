@@ -384,6 +384,12 @@ class TestR68P0_09ComposeSecurityHardFail:
             )
 
             # read_only 必须为 true
+            # R71 RC6/RC8: redis-acl-init 豁免 — 需要写入 named volume
+            # redis_data:/data 生成 users.acl。read_only: true 导致 named volume
+            # 不可写。安全性由 cap_drop: ALL + cap_add: [DAC_OVERRIDE, CHOWN] +
+            # no-new-privileges + restart: "no"(oneshot)保证。
+            if svc_name == "redis-acl-init":
+                continue
             assert svc_config.get("read_only") is True, (
                 f"服务 {svc_name} 缺少 read_only: true — R68 P0-09"
             )

@@ -44,6 +44,18 @@ _render_acl_on_exit() {
         echo "[render_acl] OUTPUT_PATH=${OUTPUT_PATH:-<unset>}" >&2
         echo "[render_acl] OUTPUT_DIR=${OUTPUT_DIR:-<unset>}" >&2
         echo "[render_acl] PWD lengths: health=${#HEALTH_PWD} writer=${#WRITER_PWD} reader=${#READER_PWD} admin=${#ADMIN_PWD}" >&2
+        # R71 RC8 fix: 增加用户身份和 /data 权限诊断
+        # 用于确认 user:root 和 cap_add 是否生效
+        _my_id=$(id 2>/dev/null || echo "(id failed)")
+        echo "[render_acl] id=$_my_id" >&2
+        _my_whoami=$(whoami 2>/dev/null || echo "(whoami failed)")
+        echo "[render_acl] whoami=$_my_whoami" >&2
+        _data_ls=$(ls -la /data 2>&1 || echo "(ls failed)")
+        echo "[render_acl] ls -la /data:" >&2
+        echo "$_data_ls" >&2
+        _data_stat=$(stat /data 2>&1 || echo "(stat failed)")
+        echo "[render_acl] stat /data:" >&2
+        echo "$_data_stat" >&2
         if [ -f "${OUTPUT_PATH:-/nonexistent}" ]; then
             echo "[render_acl] Output file exists, content:" >&2
             cat "${OUTPUT_PATH:-/dev/null}" >&2 2>/dev/null || echo "(cannot read)" >&2

@@ -40,6 +40,21 @@ services:
     # oneshot 容器仅渲染 ACL 后立即退出,安全性由 cap_drop: ALL +
     # no-new-privileges + restart: "no" 保证,root 用户无长期运行风险。
     user: root
+    # R71 RC8 fix: cap_drop: ALL 移除了 CAP_DAC_OVERRIDE 和 CAP_CHOWN。
+    # redis:7-alpine 的 Dockerfile 执行 `chown redis:redis /data`,因此
+    # named volume redis_data:/data 的属主是 redis:redis(权限 755)。
+    # 即便 user: root 设置了 UID=0,没有 CAP_DAC_OVERRIDE 时 root 也必须
+    # 遵守文件权限位 — root 是 "other",对 /data 只有 r-x(无 write),
+    # 导致 sed ... > /data/users.acl Permission denied(RC7 复现)。
+    # cap_add 恢复两个最小 capabilities:
+    #   DAC_OVERRIDE — root 可绕过权限位检查,写入 redis:redis 拥有的 /data
+    #   CHOWN        — root 可 chown users.acl 为 redis:redis,使 redis
+    #                  主容器以 redis 用户身份读取 600 权限的 ACL 文件
+    # 安全性保证:oneshot 容器(渲染后立即退出)、cap_drop: ALL(其余全部移除)、
+    # no-new-privileges、restart: "no"、资源限制 0.5 CPU / 64M。
+    cap_add:
+      - DAC_OVERRIDE
+      - CHOWN
     environment:
       - REDIS_HEALTH_PASSWORD=${REDIS_HEALTH_PASSWORD:?REDIS_HEALTH_PASSWORD must be set in .env}
       - REDIS_WRITER_PASSWORD=${REDIS_WRITER_PASSWORD:?REDIS_WRITER_PASSWORD must be set in .env}
