@@ -425,15 +425,22 @@ async def _check_database(role: str = "") -> tuple[bool, Optional[str]]:
         # SQLite 不可用 → 尝试 CRDB(记录原因,不伪装成功)
         logger.debug(f"SQLite check skipped, falling back to CRDB: {_sqlite_err}")
 
-    # 2. 尝试 CRDB(asyncpg)— 通过 DATABASE_URL 判断
+    # 2. 尝试 CRDB(asyncpg)— 通过 DATABASE_URL 或 COCKROACHDB_URL 判断
+    # settings.py canonical 字段是 COCKROACHDB_URL,DATABASE_URL 向后兼容
     try:
         from config import settings
 
-        db_url = getattr(settings, "DATABASE_URL", "") or os.getenv(
-            "DATABASE_URL", ""
+        db_url = (
+            getattr(settings, "DATABASE_URL", "")
+            or os.getenv("DATABASE_URL", "")
+            or getattr(settings, "COCKROACHDB_URL", "")
+            or os.getenv("COCKROACHDB_URL", "")
         )
     except Exception:
-        db_url = os.getenv("DATABASE_URL", "")
+        db_url = (
+            os.getenv("DATABASE_URL", "")
+            or os.getenv("COCKROACHDB_URL", "")
+        )
 
     if db_url and not db_url.startswith("sqlite"):
         try:
@@ -453,7 +460,7 @@ async def _check_database(role: str = "") -> tuple[bool, Optional[str]]:
             return False, f"CRDB connection failed: {e}"
 
     # 既无 SQLite 也无 CRDB
-    return False, "No database configured (SQLite not found, no DATABASE_URL)"
+    return False, "No database configured (SQLite not found, no DATABASE_URL/COCKROACHDB_URL)"
 
 
 async def _check_database_crdb(role: str = "") -> tuple[bool, Optional[str]]:
@@ -470,24 +477,32 @@ async def _check_database_crdb(role: str = "") -> tuple[bool, Optional[str]]:
         - healthy=True, error=None: CRDB 可用
         - healthy=False, error="...": CRDB 不可用(描述原因)
     """
-    # 通过 config.settings 或环境变量获取 DATABASE_URL
+    # 通过 config.settings 或环境变量获取 DB URL。
+    # settings.py 的 canonical 字段是 COCKROACHDB_URL(非 DATABASE_URL),
+    # 因此优先检查 DATABASE_URL(向后兼容),回退到 COCKROACHDB_URL。
     try:
         from config import settings
 
-        db_url = getattr(settings, "DATABASE_URL", "") or os.getenv(
-            "DATABASE_URL", ""
+        db_url = (
+            getattr(settings, "DATABASE_URL", "")
+            or os.getenv("DATABASE_URL", "")
+            or getattr(settings, "COCKROACHDB_URL", "")
+            or os.getenv("COCKROACHDB_URL", "")
         )
     except Exception:
-        db_url = os.getenv("DATABASE_URL", "")
+        db_url = (
+            os.getenv("DATABASE_URL", "")
+            or os.getenv("COCKROACHDB_URL", "")
+        )
 
     if not db_url:
         return False, (
-            f"DATABASE_URL not configured but required by role {role!r}"
+            f"DATABASE_URL/COCKROACHDB_URL not configured but required by role {role!r}"
         )
     if db_url.startswith("sqlite"):
         # 角色要求 CRDB,但配置了 SQLite → fail-closed
         return False, (
-            f"Role {role!r} requires CRDB but DATABASE_URL is SQLite: "
+            f"Role {role!r} requires CRDB but DATABASE_URL/COCKROACHDB_URL is SQLite: "
             f"{db_url[:32]}..."
         )
 

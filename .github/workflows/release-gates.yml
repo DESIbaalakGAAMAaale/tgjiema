@@ -762,7 +762,10 @@ jobs:
           echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.migration
           echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.crdb_sync
           echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.db_backup
-          touch .env.shared
+          # R71 RC14 fix: db_writer 的 env_file 只有 .env.shared(无独立 secrets
+          # 文件),且 health.py _check_database_crdb 现已回退到 COCKROACHDB_URL。
+          # 将 COCKROACHDB_URL 写入 .env.shared 使 db_writer 也能通过 readiness gate。
+          echo "COCKROACHDB_URL=${CRDB_URL}" > .env.shared
 
       - name: Run Compose Runtime E2E (11 phases, fail-closed)
         env:

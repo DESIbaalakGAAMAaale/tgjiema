@@ -359,24 +359,29 @@ class TestCheckDatabaseRoleAware:
         assert called_with.get("role") == "admin"
 
     def test_database_crdb_fail_closed_no_url(self, health, monkeypatch):
-        """_check_database_crdb 在 DATABASE_URL 缺失时 fail-closed。"""
-        mock_settings = type("MockSettings", (), {"DATABASE_URL": ""})()
+        """_check_database_crdb 在 DATABASE_URL 和 COCKROACHDB_URL 均缺失时 fail-closed。"""
+        mock_settings = type(
+            "MockSettings", (), {"DATABASE_URL": "", "COCKROACHDB_URL": ""}
+        )()
         monkeypatch.setattr(
             "config.settings", mock_settings, raising=False
         )
         monkeypatch.delenv("DATABASE_URL", raising=False)
+        monkeypatch.delenv("COCKROACHDB_URL", raising=False)
 
         healthy, error = asyncio.run(
             health._check_database_crdb("db_writer")
         )
         assert healthy is False
-        assert "DATABASE_URL not configured" in error
+        assert "not configured" in error
         assert "db_writer" in error
 
     def test_database_crdb_fail_closed_sqlite_url(self, health, monkeypatch):
-        """_check_database_crdb 在 DATABASE_URL 为 SQLite 时 fail-closed。"""
+        """_check_database_crdb 在 DB URL 为 SQLite 时 fail-closed。"""
         mock_settings = type(
-            "MockSettings", (), {"DATABASE_URL": "sqlite:///test.db"}
+            "MockSettings",
+            (),
+            {"DATABASE_URL": "sqlite:///test.db", "COCKROACHDB_URL": ""},
         )()
         monkeypatch.setattr(
             "config.settings", mock_settings, raising=False
@@ -388,6 +393,27 @@ class TestCheckDatabaseRoleAware:
         assert healthy is False
         assert "requires CRDB" in error
         assert "SQLite" in error
+
+    def test_database_crdb_fallback_to_cockroachdb_url(self, health, monkeypatch):
+        """_check_database_crdb 在 DATABASE_URL 缺失时回退到 COCKROACHDB_URL。"""
+        mock_settings = type(
+            "MockSettings",
+            (),
+            {"DATABASE_URL": "", "COCKROACHDB_URL": "postgresql://test@localhost/test"},
+        )()
+        monkeypatch.setattr(
+            "config.settings", mock_settings, raising=False
+        )
+        monkeypatch.delenv("DATABASE_URL", raising=False)
+
+        # COCKROACHDB_URL 已设置 → 不应返回 "not configured" 错误
+        # 实际连接会失败(无真实 DB),但不应该是配置缺失错误
+        healthy, error = asyncio.run(
+            health._check_database_crdb("migration")
+        )
+        # 连接失败(非配置缺失),error 描述连接问题
+        if not healthy:
+            assert "not configured" not in error
 
 
 # ════════════════════════════════════════════════════════════════
