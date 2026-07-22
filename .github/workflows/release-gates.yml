@@ -690,16 +690,20 @@ jobs:
     services:
       # R71 RC11 fix: migration / crdb_sync / db_backup 需要 COCKROACHDB_URL。
       # CI 环境没有外部 CRDB,用 CockroachDB single-node service container 提供。
-      # 介于 compose-runtime-e2e 与 compose up 启动的 redis 容器在同一 Docker
-      # network,但 CRDB 是 host network(127.0.0.1:26257),需用 host.docker.internal
-      # 或 --host networking。这里用 service container + ports 暴露到 runner。
+      # service container 与 compose 容器在同一 Docker bridge network,通过
+      # ports: 26257:26257 暴露到 runner host,compose 容器经 172.17.0.1 访问。
       cockroach:
         image: cockroachdb/cockroach:latest-v24.3
         ports:
           - 26257:26257
         env:
           # insecure 模式仅用于 CI,生产必须用 TLS
-          COCKROACH_ARGS: start-single-node --insecure --listen-addr=0.0.0.0:26257
+          # R71 RC12 fix: cockroach v24.3 insecure 模式禁止 --listen-addr=0.0.0.0:26257
+          # (报错 "hostname of listen_addr must be 127.0.0.1 or localhost")。
+          # 不指定 --listen-addr,使用默认 :26257(empty host = all interfaces,
+          # 通过 insecure 模式 loopback 校验)。端口经 service container ports
+          # 映射暴露到 host network,compose 容器通过 172.17.0.1 访问。
+          COCKROACH_ARGS: start-single-node --insecure
         options: >-
           --health-cmd "cockroach sql --insecure --host=localhost:26257 -e 'SELECT 1'"
           --health-interval 10s
