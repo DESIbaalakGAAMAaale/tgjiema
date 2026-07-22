@@ -640,14 +640,19 @@ async def _check_ddl_version(client) -> tuple[bool, str]:
 async def main() -> int:
     """CLI 入口: python -m services.migration_runner
 
-    R71 RC21 fix: 显式调用 close_db() 清理全局资源(cache_store SQLite
-    连接 + 全局 _client asyncpg 连接池)。run_migration() 内部创建的
-    CockroachDBClient 在其 finally 块中已关闭,但 cache_store.init() /
-    record_migration_usage() 可能创建全局资源。若不关闭,asyncio 事件
-    循环会有 pending tasks(如 aiosqlite 后台线程 / asyncpg pool
-    heartbeat),导致 asyncio.run(main()) 永不返回 → migration 容器
-    保持 "running" 状态 → docker compose up 等待
+    R71 RC21/RC22 fix: 显式清理 + 强制退出。
+
+    R71 RC21 引入 close_db() 关闭 cache_store SQLite + _client asyncpg pool,
+    但 asyncio.run() 的清理阶段(loop.shutdown_default_executor)仍可能因
+    pending background tasks(asyncpg heartbeat / async generator / aiosqlite
+    thread 残留)卡住,导致 migration 进程永不退出 → docker compose up 等待
     service_completed_successfully 永不满足 → start_core 600s 超时。
+
+    R71 RC22 fix: 在 main 协程内部完成 close_db 后直接 os._exit() 绕过
+    asyncio.run() 的清理阶段。所有显式资源(cache_store, _client,
+    migration 本地 client)已通过 close_db / run_migration finally 块
+    关闭,跳过 asyncio 清理是安全的(它只是 cancel pending tasks +
+    shutdown executor,不会丢失已写数据)。
 
     Returns:
         0 — 迁移成功(无严重错误)
@@ -669,16 +674,32 @@ async def main() -> int:
     except Exception as e:
         logger.exception(f"[migration_runner] 迁移失败: {e}")
         exit_code = 2
-    finally:
-        # R71 RC21: 关闭全局资源(cache_store + _client),防止
-        # asyncio 事件循环因 pending tasks 永不退出。
-        try:
-            await close_db()
-        except Exception as cleanup_err:
-            logger.debug(
-                f"[migration_runner] close_db 清理失败(可忽略): {cleanup_err}"
-            )
-    return exit_code
+
+    # R71 RC21/RC22: 显式关闭全局资源,然后绕过 asyncio 清理直接退出。
+    # 所有显式资源(cache_store aiosqlite + _client asyncpg pool + migration
+    # 本地 client)在这里关闭;asyncio 内部 pending tasks 不持有外部资源。
+    try:
+        await close_db()
+        logger.info("[migration_runner] close_db 完成,所有显式资源已释放")
+    except Exception as cleanup_err:
+        logger.debug(
+            f"[migration_runner] close_db 清理失败(可忽略): {cleanup_err}"
+        )
+
+    # 给 loguru sink 一点时间 flush 到 stdout/stderr
+    await asyncio.sleep(0.3)
+    logger.info(f"[migration_runner] 准备强制退出(exit_code={exit_code})")
+    # R71 RC22: 显式 flush stdout/stderr + loguru sinks,然后 os._exit
+    # 绕过 asyncio.run() 的 shutdown_default_executor(可能卡住)
+    import sys as _sys
+    import os as _os
+    try:
+        _sys.stdout.flush()
+        _sys.stderr.flush()
+    except Exception:
+        pass
+    _os._exit(exit_code)
+    return exit_code  # 不可达,保持类型完整
 
 
 if __name__ == "__main__":
