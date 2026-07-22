@@ -544,12 +544,12 @@ def phase_start_core(timeout: int) -> PhaseResult:
         # (migration 挂起 / redis healthcheck 失败 / redis-acl-init 卡住等)
         container_logs: dict[str, Any] = {}
         for svc in ("redis-acl-init", "redis", "migration", "db_writer"):
-            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "100", svc])
+            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "500", svc])
             try:
                 logs_result = _run(logs_cmd, timeout=15, cwd=REPO_ROOT)
                 svc_log = (logs_result.stdout or "") + (logs_result.stderr or "")
                 if svc_log.strip():
-                    container_logs[svc] = svc_log[-4000:]
+                    container_logs[svc] = svc_log[-8000:]
             except (subprocess.TimeoutExpired, OSError):
                 pass
         return _fail_result(
@@ -570,12 +570,12 @@ def phase_start_core(timeout: int) -> PhaseResult:
         # 用于诊断 redis-acl-init render_acl.sh 等脚本的实际失败原因。
         container_logs: dict[str, Any] = {}
         for svc in ("redis-acl-init", "redis", "migration", "db_writer"):
-            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "100", svc])
+            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "500", svc])
             try:
                 logs_result = _run(logs_cmd, timeout=15, cwd=REPO_ROOT)
                 svc_log = (logs_result.stdout or "") + (logs_result.stderr or "")
                 if svc_log.strip():
-                    container_logs[svc] = svc_log[-4000:]
+                    container_logs[svc] = svc_log[-8000:]
             except (subprocess.TimeoutExpired, OSError):
                 pass
         return _fail_result(

@@ -36,7 +36,13 @@ import re
 from typing import Any
 
 from loguru import logger
-from services.i18n import translate as _i18n_t
+# R71 RC19 fix: use internal _i18n_t (defaults to _DEFAULT_LOCALE) instead of
+# public translate (requires explicit locale binding). The public translate()
+# triggers i18n strict-export-boundary-gate "locale not bound" error when
+# called from migration_runner (which doesn't bind a user/session locale).
+# The internal _i18n_t defaults to _DEFAULT_LOCALE (zh-CN), suitable for
+# internal log/error messages that are not user-facing output.
+from services.i18n import _i18n_t
 
 # R44 7.2: 延迟导入避免循环依赖(record_migration_usage 在函数内调用)
 
