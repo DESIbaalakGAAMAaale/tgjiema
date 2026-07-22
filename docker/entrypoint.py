@@ -41,6 +41,13 @@ import os
 import sys
 from pathlib import Path
 
+# R71 fix: 确保 /app 在 sys.path 中,使 `from config.environment import` 可用
+# entrypoint.py 位于 /app/docker/,sys.path[0] 默认是 /app/docker 而非 /app
+# 需要将 /app(父目录)加入 sys.path,才能导入 config / services / bots 等顶层包
+_APP_ROOT = str(Path(__file__).resolve().parent.parent)
+if _APP_ROOT not in sys.path:
+    sys.path.insert(0, _APP_ROOT)
+
 
 # ──────────────────────────────────────────────────────────────────
 # SERVICE_ROLE 显式枚举

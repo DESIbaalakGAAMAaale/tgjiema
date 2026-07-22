@@ -139,14 +139,19 @@ else
 fi
 
 # ─── 3. 构造 bypass_actors(限制 tag 创建权限) ───
-# 默认仅允许 RepositoryRole(admin) bypass creation 规则。
+# 默认仅允许仓库 owner(admin) bypass creation 规则。
 # 用户可通过 BYPASS_ACTORS_JSON 环境变量覆盖。
 # 参考: https://docs.github.com/rest/repos/rules#create-a-repository-ruleset
 # bypass_mode:
 #   - "always"         总是 bypass
 #   - "pull_request"   通过 PR review 后 bypass
-# actor_id=1 + actor_type=RepositoryRole 在 GitHub ruleset API 中表示
-# "Repository admin" 角色(参考 bypass_actors schema)。
+#
+# R71 RC1 fix: RepositoryRole(actor_id=1) 在个人仓库中会报
+# "Actor base role does not have write permissions"(HTTP 422)。
+# 个人仓库的 owner 是 User 类型,不是 RepositoryRole。
+# 因此默认改为动态获取仓库 owner 的 user ID,用 User 类型。
+# 组织仓库仍可使用 BYPASS_ACTORS_JSON 环境变量传递 RepositoryRole:
+#   BYPASS_ACTORS_JSON='[{"actor_id":1,"actor_type":"RepositoryRole","bypass_mode":"always"}]'
 if [ -n "${BYPASS_ACTORS_JSON:-}" ]; then
   echo "[INFO] 使用用户通过 BYPASS_ACTORS_JSON 提供的 bypass_actors"
   # 校验是合法 JSON 数组
@@ -156,9 +161,24 @@ if [ -n "${BYPASS_ACTORS_JSON:-}" ]; then
     exit 1
   fi
 else
-  # 默认 bypass_actors:仅 RepositoryRole(admin) 总是 bypass creation 规则
-  BYPASS_ACTORS_JSON='[{"actor_id":1,"actor_type":"RepositoryRole","bypass_mode":"always"}]'
-  echo "[INFO] 使用默认 bypass_actors(RepositoryRole admin always bypass creation)"
+  # 默认 bypass_actors:动态获取仓库 owner user ID,用 User 类型 always bypass creation
+  # R71 RC1 fix: 个人仓库 RepositoryRole(actor_id=1) 报 422,改用 User + owner ID
+  if [ "$USE_GH_CLI" = "true" ]; then
+    OWNER_USER_ID=$(gh api user --jq '.id' 2>/dev/null || echo "")
+  else
+    OWNER_USER_ID=$(curl -sS \
+      -H "Authorization: token ${TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/user" 2>/dev/null | jq -r '.id // ""' 2>/dev/null || echo "")
+  fi
+  if [ -z "$OWNER_USER_ID" ]; then
+    echo "ERROR: [R66 P1-11] 无法获取当前认证用户的 GitHub user ID"
+    echo "  请通过 BYPASS_ACTORS_JSON 环境变量显式指定 bypass_actors"
+    exit 1
+  fi
+  BYPASS_ACTORS_JSON=$(jq -n --argjson actor_id "$OWNER_USER_ID" \
+    '[{"actor_id":$actor_id,"actor_type":"User","bypass_mode":"always"}]')
+  echo "[INFO] 使用默认 bypass_actors(User id=${OWNER_USER_ID} always bypass creation)"
 fi
 
 # ─── 4. 构造 ruleset payload ───
@@ -183,7 +203,7 @@ PAYLOAD=$(jq -n \
   --argjson bypass_actors "$BYPASS_ACTORS_JSON" '{
   name: $name,
   description: $description,
-  target: "tags",
+  target: "tag",
   source_type: "Repository",
   enforcement: "active",
   bypass_actors: $bypass_actors,
