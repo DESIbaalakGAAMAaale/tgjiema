@@ -41,7 +41,11 @@ CLI 退出码:
     0 — 全部步骤通过
     1 — 任一步骤失败(fail-closed)
 """
-from __future__ import annotations
+# R71 RC33: 移除 `from __future__ import annotations`。
+# 根因: `from __future__ import annotations` + `@dataclass` + PEP 604 `str | None`
+# 在 `dataclasses._is_type` 中触发 `AttributeError: 'NoneType' object has no attribute '__dict__'`。
+# CI 使用 Python 3.11,本地使用 Python 3.10,均原生支持 `str | None` / `dict[str, Any]` 语法,
+# 无需 `from __future__ import annotations`。移除后 @dataclass 直接处理实际类型对象(非字符串)。
 
 import argparse
 import datetime as _dt
