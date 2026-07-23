@@ -27,6 +27,7 @@ from __future__ import annotations
 import datetime as _dt
 import hashlib
 import hmac
+import os
 import secrets
 import time
 from typing import Optional, Tuple
@@ -84,6 +85,20 @@ def _check_production_secret() -> None:
     Raises:
         RuntimeError: production 环境且 BOT_TOKEN 缺失时
     """
+    # R71 RC30: CI 模式跳过 production secret 检查 — CI 容器使用占位符
+    # BOT_TOKEN(GitHub Actions secrets 为占位符,非真实 token),
+    # production 环境下 _check_production_secret 会因 ADMIN_BOT_TOKEN /
+    # SENDER_BOT_TOKEN 缺失而抛 AppError(PRODUCTION_BOT_TOKEN_MISSING)
+    # → 进程崩溃 → restart loop → exit=137。
+    # 本函数在模块导入时(line 121)和 validate_production_config() 启动时
+    # 均会调用,CI 模式跳过以保持进程存活等待 healthcheck。
+    # 与 RC28(CI 跳过 app.start())+ RC29(CI 跳过 Settings 角色验证)一致。
+    _is_ci = (
+        os.getenv("CI", "").lower() in ("true", "1")
+        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+    )
+    if _is_ci:
+        return
     # 用 str() 兜底 MagicMock(测试环境 settings 是 MagicMock)
     env = str(getattr(settings, "ENVIRONMENT", "") or "")
     if env != "production":

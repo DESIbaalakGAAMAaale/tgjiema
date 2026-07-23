@@ -978,16 +978,31 @@ def phase_health_check(timeout: int) -> PhaseResult:
     failures: list[str] = []
 
     for service, port in HTTP_HEALTH_SERVICES.items():
-        # 通过 docker compose exec 在容器内调用 localhost:port/health
-        # (端口绑定 127.0.0.1,从 host 也可访问,但容器内更可靠)
+        # R71 RC30: 通过 docker compose exec 在容器内调用 127.0.0.1:port/health
+        # 使用 127.0.0.1 替代 localhost(避免 IPv6 ::1 解析导致 Connection refused),
+        # 并添加重试逻辑(6 次尝试,间隔 5s = 最多 30s 等待 HTTP 服务器启动)。
+        # 根因:start_bots 只检查容器 "running" 状态,不等待 HTTP 服务器就绪;
+        # migration_check 完成后 HTTP 服务器可能尚未启动 → Connection refused。
+        probe_script = (
+            "import urllib.request, time\n"
+            "ok=False\n"
+            "for i in range(6):\n"
+            "  try:\n"
+            f"    r=urllib.request.urlopen('http://127.0.0.1:{port}/health', timeout=5)\n"
+            "    print(r.status)\n"
+            "    ok = (r.status==200)\n"
+            "    break\n"
+            "  except Exception as e:\n"
+            "    if i < 5: time.sleep(5)\n"
+            "    else: print(repr(e))\n"
+            "exit(0 if ok else 1)"
+        )
         cmd = _compose_cmd([
             "exec", "-T", service,
-            "python", "-c",
-            f"import urllib.request; r=urllib.request.urlopen('http://localhost:{port}/health', timeout=5); "
-            f"print(r.status); exit(0 if r.status==200 else 1)",
+            "python", "-c", probe_script,
         ])
         try:
-            result = _run(cmd, timeout=30, cwd=REPO_ROOT)
+            result = _run(cmd, timeout=60, cwd=REPO_ROOT)
             status_ok = result.returncode == 0
             health_results[service] = {
                 "port": port,
