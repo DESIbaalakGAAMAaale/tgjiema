@@ -875,6 +875,18 @@ def phase_migration_check(timeout: int) -> PhaseResult:
         )
 
     if result.returncode != 0:
+        # R71 RC23 fix: migration_check 失败时捕获 db_writer 容器日志,
+        # 诊断 db_writer restart loop 的根因(readiness gate 失败 / 主进程崩溃)。
+        container_logs: dict[str, Any] = {}
+        for svc in ("db_writer", "migration", "redis"):
+            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "500", svc])
+            try:
+                logs_result = _run(logs_cmd, timeout=15, cwd=REPO_ROOT)
+                svc_log = (logs_result.stdout or "") + (logs_result.stderr or "")
+                if svc_log.strip():
+                    container_logs[svc] = svc_log[-8000:]
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         return _fail_result(
             phase="migration_check",
             description=description,
@@ -886,6 +898,7 @@ def phase_migration_check(timeout: int) -> PhaseResult:
             stdout=result.stdout,
             stderr=result.stderr,
             returncode=result.returncode,
+            evidence={"container_logs": container_logs} if container_logs else {},
             readiness_checks=[
                 {"check": "docker_daemon", "status": "pass"},
                 {"check": "migration_exec", "status": "fail"},

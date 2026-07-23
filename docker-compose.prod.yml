@@ -180,6 +180,10 @@ services:
       - SERVICE_ROLE=db_writer
       - APP_ENV=production
       - PYTHONUNBUFFERED=1
+      # R71 RC23 fix: db_writer 需要 REDIS_URL 消费 Redis Stream(XREADGROUP)。
+      # 缺失会导致 readiness gate _check_redis("db_writer") fail-closed →
+      # exit(4) → restart loop → migration_check phase "Container is restarting"。
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
       - I18N_ALLOW_FALLBACK=
       - ALLOW_LEGACY_RESTORE=
       - TEST_ONLY=
