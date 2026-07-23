@@ -740,6 +740,12 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
     检查 Redis Stream Consumer Group 是否有 consumer 在消费。
     未配置 REDIS_URL 时视为健康(not_configured,不 fail-closed)。
 
+    R71 RC24 fix: NOGROUP(Stream/Consumer Group 不存在)视为健康。
+    全新部署中 Stream 尚未被 XADD 创建,Consumer Group 尚未被
+    DBWriter.init() 的 ensure_consumer_group() 创建。这是正常的初始
+    状态,不应阻断 readiness gate(否则 db_writer 永远无法启动来创建
+    Consumer Group — 先有鸡还是先有蛋问题)。
+
     Returns:
         (healthy, error)
     """
@@ -795,6 +801,12 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
             except Exception as _close_err:
                 logger.debug(f"Redis aclose cleanup: {_close_err}")
     except Exception as e:
+        err_str = str(e)
+        # R71 RC24: NOGROUP/No such key 在全新部署中是正常状态
+        # (Stream 尚未被 XADD 创建,Consumer Group 尚未被
+        # DBWriter.init() 创建)。不阻断 readiness gate。
+        if "NOGROUP" in err_str or "no such key" in err_str.lower():
+            return True, None
         return False, f"Redis stream consumer check failed: {e}"
 
 
