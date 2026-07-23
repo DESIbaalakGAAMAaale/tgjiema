@@ -323,6 +323,44 @@ def reset_redis_queue_state():
 
 
 @pytest.fixture(autouse=True)
+def reset_dsp_bot_module_state():
+    """R71 RC40: 每个⽤例前重置 bots.dsp_bot 模块级可变状态,防⽌跨测试污染。
+
+    根因:_bot_limiter / _user_limiter 是模块级 PerChannelRateLimiter 实例,
+    在跨测试⽂件累积调⽤次数(25/20 次/分钟上限)。当累积达到上限后,
+    _send_one_job 中的 asyncio.sleep(60) 会导致测试套件挂起。
+
+    同时重置 _channel_failures / _pagination_states / _sent_msg_tracker /
+    _send_semaphore / _report_debounce 等模块级 dict 和 asyncio.Lock,
+    确保每个⽤例以干净状态启动。
+    """
+    import sys as _sys
+    _dsp = _sys.modules.get("bots.dsp_bot")
+    if _dsp is not None:
+        # 重置 PerChannelRateLimiter 实例(清空 channel 调⽤记录 + 重置 Lock)
+        for _limiter_attr in ("_bot_limiter", "_user_limiter"):
+            _limiter = getattr(_dsp, _limiter_attr, None)
+            if _limiter is not None:
+                _limiter._channels.clear()
+                _limiter._lock = None
+        # 重置 utils.per_channel_limiter._channel_limiter(dsp_bot 导入的共享实例)
+        _pcl = _sys.modules.get("utils.per_channel_limiter")
+        if _pcl is not None and hasattr(_pcl, "_channel_limiter"):
+            _pcl._channel_limiter._channels.clear()
+            _pcl._channel_limiter._lock = None
+        # 重置其他模块级可变状态
+        _dsp._channel_failures.clear()
+        _dsp._cf_lock = None
+        _dsp._pagination_states.clear()
+        _dsp._pg_lock = None
+        _dsp._sent_msg_tracker.clear()
+        _dsp._send_semaphore = None
+        _dsp._report_debounce.clear()
+        _dsp._report_debounce_last_gc = 0.0
+    yield
+
+
+@pytest.fixture(autouse=True)
 def allow_legacy_restore_writer(monkeypatch):
     """R65 P0-07 / P1-07: 测试环境逃生舱 — 设置 ALLOW_LEGACY_RESTORE=1。
 
