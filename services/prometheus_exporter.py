@@ -176,25 +176,23 @@ def _read_kv_value(key: str, default: str = "0") -> str:
     """从 cache_store 的 kv_store 表读取 value。
 
     Args:
-        key: kv_store.key
+        key: kv_store.key(来自代码常量,非用户输入)
         default: 缺失时返回的默认值(字符串)
 
     Returns:
         value 字符串(default if missing)
     """
+    # R71 RC29: 直接用安全字符串拼接 — key 来自代码常量(kv_store.py 中的
+    # _CRDB_SYNC_LAST_SUCCESS_KEY 等),非用户输入,无 SQL 注入风险。
+    # 旧实现先用 `WHERE key = ?` 但 _read_sqlite_single 不传 params,
+    # 导致 "Incorrect number of bindings supplied" 错误,所有 kv_store
+    # 读取都失败(包括 crdb_sync_last_success / r2_last_collect_time),
+    # collect_dependency_status 的 sqlite_readable 检查也会受影响。
     val = _read_sqlite_single(
         CACHE_STORE_DB,
-        f"SELECT value FROM kv_store WHERE key = ? LIMIT 1",
+        f"SELECT value FROM kv_store WHERE key = '{key}' LIMIT 1",
         default,
     )
-    # 占位符 ? 无法在静态 SQL 中传递,改用安全字符串拼接(key 来自代码常量,非用户输入)
-    if val == default:
-        # 回退: 用字符串拼接(仅用于已知安全 key)
-        val = _read_sqlite_single(
-            CACHE_STORE_DB,
-            f"SELECT value FROM kv_store WHERE key = '{key}' LIMIT 1",
-            default,
-        )
     return str(val) if val is not None else default
 
 

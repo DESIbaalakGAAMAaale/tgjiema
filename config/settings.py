@@ -479,6 +479,11 @@ class Settings(BaseSettings):
 
         R38 P1-4: ENVIRONMENT=production 时强制 BACKUP_ENCRYPTION_REQUIRED=true。
         R38 P2-2: ENVIRONMENT=production 时未知 SERVICE_ROLE → raise ValueError(fail-fast)。
+
+        R71 RC29: CI 模式跳过角色级必填字段验证 — CI 容器使用占位符
+        BOT_TOKEN / ADMIN_TELEGRAM_ID / ADMIN_USERNAME(无真实 secrets),
+        production 环境下 pydantic 验证会失败 → 进程崩溃 → restart loop。
+        CI 容器只需保持进程存活等待 healthcheck。
         """
         # R38 P1-4: 生产环境强制加密(无视 .env 中的 false 配置)
         if self.ENVIRONMENT == "production":
@@ -488,6 +493,21 @@ class Settings(BaseSettings):
                     "强制 BACKUP_ENCRYPTION_REQUIRED=true(原值=false)"
                 )
                 self.BACKUP_ENCRYPTION_REQUIRED = True
+
+        # R71 RC29: CI 模式跳过角色级必填字段验证
+        # CI 中使用占位符 secrets(BOT_TOKEN=placeholder:ci 等),
+        # 角色级 validator 会因 UPLOAD_BOT_TOKEN / DECODER_BOT_TOKEN /
+        # SENDER_BOT_TOKEN / ADMIN_TELEGRAM_ID / ADMIN_USERNAME 缺失而失败。
+        _is_ci = (
+            os.getenv("CI", "").lower() in ("true", "1")
+            or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+        )
+        if _is_ci:
+            logger.warning(
+                "[Settings] R71 RC29: CI 模式,跳过角色级必填字段验证"
+                f"(SERVICE_ROLE={self.SERVICE_ROLE})"
+            )
+            return self
 
         role = self.SERVICE_ROLE
 

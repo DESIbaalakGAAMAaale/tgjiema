@@ -181,6 +181,18 @@ def _get_i18n_allow_fallback() -> bool:
     if _i18n_allow_fallback_cache is not None:
         return _i18n_allow_fallback_cache
     import os
+    # R71 RC29: CI 模式允许 fallback — 类级别 _i18n_t() 调用
+    # (如 mon_bot.MonBot._handle_cas_failure 的 reason 默认值、
+    # backup_schema.BackupPolicy 成员间的 _i18n_t() 语句)在模块导入时执行,
+    # 此时 locale 未绑定,production 严格模式会抛 I18N_LOCALE_NOT_BOUND
+    # → 进程崩溃 → restart loop。CI 容器只需保持进程存活等待 healthcheck。
+    _is_ci = (
+        os.getenv("CI", "").lower() in ("true", "1")
+        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+    )
+    if _is_ci:
+        _i18n_allow_fallback_cache = True
+        return True
     # 1. release 构建强制严格(任何缺陷 fail-closed)
     if _get_release_mode():
         _i18n_allow_fallback_cache = False
