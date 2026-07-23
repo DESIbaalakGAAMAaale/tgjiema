@@ -47,7 +47,14 @@ CLI 选项:
     - docker-compose.prod.yml 存在
     - CI 需要 self-hosted runner 或 Docker-enabled runner
 """
-from __future__ import annotations
+# R71 RC35: 移除 `from __future__ import annotations`(防御性修复)。
+# 根因(RC33 同类): `from __future__ import annotations` + `@dataclass` + PEP 604
+# `int | None` / `str | None` 在 `dataclasses._is_type` 中可能触发
+# `AttributeError: 'NoneType' object has no attribute '__dict__'`。
+# 本脚本的 PhaseResult @dataclass 字段含 PEP 604 union 字段(虽然历史未触发,
+# 但通过 importlib 加载的 verify_restore_integrity / synthetic_transaction 同类
+# 模块已触发)。CI 使用 Python 3.12,本地 Python 3.10,均原生支持 PEP 604/585,
+# 无需 `from __future__ import annotations`。统一移除避免后续 RC 再次失败。
 
 import argparse
 import ast

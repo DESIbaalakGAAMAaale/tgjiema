@@ -43,7 +43,15 @@ R71 Wave 4 整改(P0-12):
         --base-tar base-rootfs.tar \\
         --output oci-file-manifest.json
 """
-from __future__ import annotations
+# R71 RC35: 移除 `from __future__ import annotations`(防御性修复)。
+# 根因(RC33 同类): `from __future__ import annotations` + `@dataclass` + PEP 604
+# `str | None` 在 `dataclasses._is_type` 中可能触发
+# `AttributeError: 'NoneType' object has no attribute '__dict__'`。
+# 本脚本的 ValidationReport @dataclass 字段含 PEP 604 union 字段
+# (sbom_path / provenance_path / candidate_manifest_path / error)。
+# 虽然 validate-oci-rootfs job 历史未触发错误,但与 verify_restore_integrity /
+# synthetic_transaction 同类问题,统一移除避免后续 RC 再次失败。
+# CI 使用 Python 3.12,本地 Python 3.10,均原生支持 PEP 604/585。
 
 import argparse
 import datetime as _dt

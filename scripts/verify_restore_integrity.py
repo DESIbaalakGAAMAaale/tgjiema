@@ -56,7 +56,15 @@
     - scripts/synthetic_transaction.py 的 run_full_transaction()
     - services.restore_orchestrator 的 import check(不实际执行切换)
 """
-from __future__ import annotations
+# R71 RC35: 移除 `from __future__ import annotations`。
+# 根因(RC33 同类): `from __future__ import annotations` + `@dataclass` + PEP 604
+# `str | None` 在 `dataclasses._is_type` 中触发
+# `AttributeError: 'NoneType' object has no attribute '__dict__'`。
+# compose_runtime_e2e.py 通过 importlib 加载本模块时,该错误导致
+# backup_restore 阶段直接失败。CI 使用 Python 3.12,本地 Python 3.10,
+# 均原生支持 `str | None` / `dict[str, Any]` / `list[str]` / `Path | None`
+# 语法,无需 `from __future__ import annotations`。移除后 @dataclass 直接
+# 处理实际类型对象(非字符串),_is_type 跳过评估,不再触发 AttributeError。
 
 import argparse
 import datetime as _dt
