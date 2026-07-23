@@ -1236,10 +1236,13 @@ def phase_redis_acl_check(timeout: int) -> PhaseResult:
     })
 
     # 3. 验证每个 Redis 用户(writer/reader/health/admin)能 AUTH
+    # R71 RC32: health 用户在 users.acl.template 中名为 `health`(无 tgjiema_ 前缀),
+    # 与 writer/reader/admin 的 `tgjiema_*` 前缀不一致。e2e 原代码用 `tgjiema_health`
+    # 导致 AUTH 失败。此处按 ACL 实际用户名匹配。
     redis_passwords = {
         "tgjiema_writer": os.environ.get("REDIS_WRITER_PASSWORD", ""),
         "tgjiema_reader": os.environ.get("REDIS_READER_PASSWORD", ""),
-        "tgjiema_health": os.environ.get("REDIS_HEALTH_PASSWORD", ""),
+        "health": os.environ.get("REDIS_HEALTH_PASSWORD", ""),
         "tgjiema_admin": os.environ.get("REDIS_ADMIN_PASSWORD", ""),
     }
     auth_results: dict[str, bool] = {}
