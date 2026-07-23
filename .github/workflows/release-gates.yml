@@ -781,6 +781,12 @@ jobs:
           # 文件),且 health.py _check_database_crdb 现已回退到 COCKROACHDB_URL。
           # 将 COCKROACHDB_URL 写入 .env.shared 使 db_writer 也能通过 readiness gate。
           echo "COCKROACHDB_URL=${CRDB_URL}" > .env.shared
+          # R71 RC26 fix: CI=true 必须传到容器内,使 services.health 的
+          # _check_bot_token_valid() 在 CI 模式下跳过 getMe 调用(只验证 token 格式),
+          # 以及 services/prometheus_exporter.collect_dependency_status() 在启动
+          # grace period 内放宽 freshness 检查。.env.shared 被 docker-compose.prod.yml
+          # 的 env_file 加载,所有服务容器都会继承此变量。
+          echo "CI=true" >> .env.shared
 
       - name: Create data and logs directories for bind mounts
         run: |

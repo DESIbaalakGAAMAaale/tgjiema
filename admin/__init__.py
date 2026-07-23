@@ -29,6 +29,14 @@ from loguru import logger
 app = FastAPI(title=_i18n_t('admin.__init__.s4'))
 security = HTTPBasic()
 
+# R71 RC26: 进程启动时间戳 + grace period。
+# 启动后 _STARTUP_GRACE_PERIOD 秒内,/health 端点的 bots_healthy 检查
+# 不阻塞 ready — 刚启动时 5 个 bot 容器(up/idx/dsp/mon/admin_bot)可能
+# 还没来得及写入第一次心跳(cache_store.bot_heartbeat),此时不应判定 admin 不健康。
+# Grace period 过后恢复严格检查(所有 bot 必须有心跳)。
+_ADMIN_STARTUP_TS: float = _time.time()
+_ADMIN_STARTUP_GRACE_PERIOD: float = 120.0  # 2 分钟
+
 
 def _t(principal_or_user_id: int, key: str, **kwargs) -> str:
     """R44 6.2: 获取 admin principal 的 locale 并翻译 key(带插值)。
@@ -1608,8 +1616,19 @@ async def health_check(response: Response):
     }
     bots_healthy = all(bot_status.values())
 
-    # 整体就绪 = Bot 心跳 + 角色化依赖检查(critical 全通过)
-    ready = bots_healthy and deps_ready
+    # R71 RC26: 启动 grace period — 启动后 _ADMIN_STARTUP_GRACE_PERIOD 秒内,
+    # bots_healthy 不阻塞 ready(刚启动时 bot 容器可能还没写入第一次心跳)。
+    # Grace period 过后恢复严格检查(所有 bot 必须有心跳)。
+    in_startup_grace = (
+        _ADMIN_STARTUP_TS > 0
+        and (_time.time() - _ADMIN_STARTUP_TS) < _ADMIN_STARTUP_GRACE_PERIOD
+    )
+    if in_startup_grace and not bots_healthy:
+        # grace period 内:bots_healthy 不阻塞,但仍报告状态
+        ready = deps_ready
+    else:
+        # 整体就绪 = Bot 心跳 + 角色化依赖检查(critical 全通过)
+        ready = bots_healthy and deps_ready
 
     if not ready:
         response.status_code = 503

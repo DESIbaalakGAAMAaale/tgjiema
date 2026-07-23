@@ -97,6 +97,14 @@ _DATA_AGE_ALERT_THRESHOLD = 300  # 5 分钟无成功采集 → 不 ready
 _last_crdb_sync_ts: float = 0.0
 _last_r2_collect_ts: float = 0.0
 _acl_configured: bool = False
+
+# R71 RC26: 进程启动时间戳 + grace period。
+# 启动后 _STARTUP_GRACE_PERIOD 秒内,collect_dependency_status() 中的
+# "freshness" 类检查(recent_scrape / crdb_sync_fresh / r2_collector_fresh)
+# 不视为 ready 阻塞条件 — 刚启动的进程还没机会做 scrape / sync / collect,
+# 不应因此判定 /health=503。Grace period 过后恢复严格检查。
+_STARTUP_TS: float = 0.0
+_STARTUP_GRACE_PERIOD: float = 120.0  # 2 分钟
 _schema_valid: bool = False
 # R41 P1-10: 依赖新鲜度阈值(秒)
 # CRDB 同步与 R2 采集为周期任务,允许较长间隔(默认 1 小时)
@@ -1170,7 +1178,28 @@ def collect_dependency_status() -> dict:
             ru_daily_usage = "unknown"
 
     passed = sum(1 for v in checks.values() if v)
-    ready = all(checks.values())
+    # R71 RC26: 启动 grace period — 启动后 _STARTUP_GRACE_PERIOD 秒内,
+    # freshness 类检查(recent_scrape / crdb_sync_fresh / r2_collector_fresh)
+    # 不阻塞 ready(刚启动的进程还没机会做 scrape/sync/collect)。
+    # 仍报告 checks 真实状态(用于 /readiness 详情和 metrics),只是不因此判定 503。
+    # Grace period 过后恢复严格检查(all checks must pass)。
+    in_grace = (
+        _STARTUP_TS > 0
+        and (time.time() - _STARTUP_TS) < _STARTUP_GRACE_PERIOD
+    )
+    if in_grace:
+        # grace period: 只要求 critical 检查通过
+        # (sqlite_readable / key_schema_exists / schema_valid / acl_configured)
+        # freshness 类检查不阻塞,但仍计入 passed(若实际通过)
+        critical_checks = (
+            checks.get("sqlite_readable", False),
+            checks.get("key_schema_exists", False),
+            checks.get("schema_valid", False),
+            checks.get("acl_configured", False),
+        )
+        ready = all(critical_checks)
+    else:
+        ready = all(checks.values())
     return {
         "ready": ready,
         "passed": passed,
@@ -1840,6 +1869,9 @@ def main() -> None:
     在容器中作为单独 service 运行:
       docker run ... python -m services.prometheus_exporter
     """
+    global _STARTUP_TS
+    _STARTUP_TS = time.time()  # R71 RC26: 记录启动时间,用于 grace period
+
     logger.info(
         f"[prometheus_exporter] listening on http://{LISTEN_HOST}:{LISTEN_PORT}/metrics"
     )
@@ -1849,6 +1881,18 @@ def main() -> None:
 
     # R40: 启动 R40 指标采集后台线程
     _start_r40_collector()
+
+    # R71 RC26: 启动 HTTP server 前做一次初始 scrape,设置 _last_scrape_ok=True
+    # 和 _last_scrape_ts=now,使 /health 端点的 recent_scrape 检查能通过
+    # (否则首次 /health 探测会因 _last_scrape_ok=False 返回 503)。
+    try:
+        collect_metrics()
+        logger.info("[prometheus_exporter] R71 RC26: 初始 scrape 完成")
+    except Exception as e:
+        logger.warning(
+            f"[prometheus_exporter] R71 RC26: 初始 scrape 异常(可忽略,"
+            f"grace period 内不阻塞): {e}"
+        )
 
     server = create_server()
     try:

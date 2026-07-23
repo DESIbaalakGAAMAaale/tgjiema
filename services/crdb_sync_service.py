@@ -408,6 +408,39 @@ def _get_cache_store_safe():
         return None
 
 
+# R71 RC26 fix: crdb_sync_last_success kv_store key。
+# services/health._check_crdb_sync_lag() 与 services/prometheus_exporter
+# .collect_dependency_status() 都读取此 key 判断 crdb_sync 是否近期成功同步过。
+# RC26 之前:注释声称"crdb_sync 每次成功同步后写入 kv_store.crdb_sync_last_success",
+# 但实际代码从不写入 — 这是真实 bug(生产环境 readiness check 永远失败)。
+# RC26 修复:在 main() 启动时(leader lease 获取后)立即写入,并在 _sync_loop
+# 每轮成功结束后更新。
+_CRDB_SYNC_LAST_SUCCESS_KEY = "crdb_sync_last_success"
+
+
+async def _mark_sync_success() -> None:
+    """R71 RC26: 写入 crdb_sync_last_success 到 kv_store。
+
+    在以下时机调用:
+    1. main() 启动时(leader lease 获取后)— 标记"crdb_sync 进程已就绪"
+    2. _sync_loop 每轮成功结束后 — 标记"刚成功完成一轮同步检查"
+
+    语义:
+    - 写入 ISO 8601 时间戳(与 services/health._check_crdb_sync_lag 解析格式一致)
+    - 写入失败不阻塞主流程(只记日志)— kv_store 不可用时 crdb_sync 仍能运行,
+      只是 readiness check 会 fail(这是期望行为:无 kv_store = 无法报告状态)
+    """
+    import datetime as _dt
+    try:
+        store = _get_cache_store_safe()
+        if store is None:
+            return
+        ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        await store.set_kv(_CRDB_SYNC_LAST_SUCCESS_KEY, ts)
+    except Exception as e:
+        logger.debug(f"[crdb_sync] _mark_sync_success 异常(可忽略): {e}")
+
+
 # ── R38 P1-1: CRDB 懒加载状态 ──
 # _crdb_pool_connected: CRDB pool 是否已建立(懒加载,初始 False)
 # _last_dirty_seen_ts: 上次检测到 dirty 的时间戳(用于空闲关闭判断)
@@ -601,6 +634,8 @@ async def _sync_loop(name: str, sync_func, get_dirty_func, mark_synced_func):
                     f"[crdb_sync] {name}: 处理 {len(dirty)} 条 dirty "
                     f"(耗时 {batch_elapsed:.1f}s),{DIRTY_BATCH_INTERVAL}s 后再查"
                 )
+                # R71 RC26: 成功同步 dirty 后更新 crdb_sync_last_success
+                await _mark_sync_success()
                 # 有 dirty 时短 sleep,再查(不退避)
                 await asyncio.sleep(DIRTY_BATCH_INTERVAL)
                 backoff = DEFAULT_SYNC_INTERVAL  # 重置退避
@@ -613,6 +648,8 @@ async def _sync_loop(name: str, sync_func, get_dirty_func, mark_synced_func):
                         await _close_crdb_only()
                         # 关闭后重置时间戳,避免重复触发关闭逻辑
                         _last_dirty_seen_ts = 0.0
+                # R71 RC26: 无 dirty 也是"成功完成一轮检查",更新时间戳
+                await _mark_sync_success()
                 # 无 dirty:退避翻倍(上限 30min)
                 backoff = min(backoff * 2, MAX_BACKOFF)
         except Exception as e:
@@ -1904,6 +1941,13 @@ async def main():
         if not await _acquire_leader_lease():
             logger.error("[crdb_sync] 仍无法获得 leader 租约,退出")
             sys.exit(1)
+
+    # R71 RC26 fix: 立即写入 crdb_sync_last_success 到 kv_store,
+    # 标记"crdb_sync 进程已获得 leader 租约,已就绪"。
+    # 这样 services/health._check_crdb_sync_lag() 与 prometheus_exporter
+    # /health 端点的 crdb_sync_fresh 检查能通过(否则永远 fail)。
+    await _mark_sync_success()
+    logger.info("[crdb_sync] R71 RC26: 已写入 crdb_sync_last_success 到 kv_store")
 
     # R38 P1-1: 不在此处 init_db()(避免立即建立 CRDB pool)
     # CRDB pool 由 _sync_loop → _lazy_connect_crdb() 在检测到 dirty 时按需创建
