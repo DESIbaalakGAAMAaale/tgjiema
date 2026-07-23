@@ -400,6 +400,7 @@ jobs:
     - name: Migration dry-run (AST validation)
       env:
         SERVICE_ROLE: prometheus_exporter
+        APP_ENV: development
       run: |
         python -c "
         import ast

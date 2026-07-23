@@ -696,8 +696,8 @@ async def main() -> int:
     try:
         _sys.stdout.flush()
         _sys.stderr.flush()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"[migration_runner] stdout/stderr flush failed: {e}")
     _os._exit(exit_code)
     return exit_code  # 不可达,保持类型完整
 

@@ -522,8 +522,12 @@ class TestRestoreDelegation:
         mock_sqlite = AsyncMock()
 
         # 使用 patch 替换内部函数
-        with patch("services.db_restore._restore_crdb_tables", mock_crdb), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", mock_sqlite):
+        # R71 RC37: mock 路径改为 services.restore_writer(_restore_from_backup_data
+        # 在 restore_writer.py 中直接调用同模块的 _restore_crdb_tables,
+        # mock services.db_restore._restore_crdb_tables 只 mock 了 re-export 的引用,
+        # 不影响 restore_writer 中原始函数的调用)
+        with patch("services.restore_writer._restore_crdb_tables", mock_crdb), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", mock_sqlite):
             result = await _restore_from_backup_data(
                 verified_payload, _capability=_cap, merge=False,
             )

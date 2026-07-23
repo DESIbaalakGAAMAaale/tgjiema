@@ -2344,8 +2344,8 @@ async def _async_main():
             try:
                 from utils.redis_client import close_redis
                 await asyncio.wait_for(close_redis(), timeout=5.0)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[Dsp] Redis close failed during shutdown: {e}")
             logger.info("[Dsp] 优雅关闭完成")
     else:
         async with app:

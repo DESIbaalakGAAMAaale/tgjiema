@@ -1674,8 +1674,8 @@ def _cli_main() -> int:
     parser = argparse.ArgumentParser(
         prog="services.health",
         description=(
-            "R71 Wave 1 角色级 fail-closed readiness 检查"
-            "(供 docker-compose healthcheck 使用)"
+            "R71 Wave 1 role-level fail-closed readiness check"
+            " (for docker-compose healthcheck)"
         ),
     )
     parser.add_argument(

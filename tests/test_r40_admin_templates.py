@@ -200,6 +200,7 @@ def _build_service_mocks():
     mm = types.ModuleType("services.maintenance_mode")
     mm.get_status = AsyncMock(return_value={"enabled": False})
     mm.check_readiness = AsyncMock(return_value={})
+    mm.check_maintenance_safe = AsyncMock(return_value={})
     mm.enable = AsyncMock(return_value=True)
     mm.disable = AsyncMock(return_value=True)
     mods["services.maintenance_mode"] = mm
