@@ -2882,6 +2882,31 @@ async def _async_main():
     asyncio.create_task(start_counter_reporter("up_bot"))
 
     logger.info("[Up] 启动上传机器人（Up Bot）...")
+
+    # R71 RC31: CI 模式跳过 Application.builder().token(TOKEN).build()
+    # CI 中 settings.UPLOAD_BOT_TOKEN 为空占位符(CI 仅设置 UP_BOT_TOKEN,
+    # 但 Settings 读取 UPLOAD_BOT_TOKEN → 为空字符串)。
+    # Application.builder().token("").build() 会抛 InvalidToken
+    # → 进程崩溃 → Docker restart loop → docker compose exec 失败。
+    # CI 模式跳过整个 Application 构建 + handler 注册 + bg_tasks + outbox,
+    # 直接等待 stop 信号(与 admin_bot/run.py RC31 一致)。
+    _is_ci = (
+        os.getenv("CI", "").lower() in ("true", "1")
+        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+    )
+    if _is_ci:
+        from run_all import _set_stop_event
+        stop_event = asyncio.Event()
+        _set_stop_event(stop_event)
+        logger.warning("[Up] CI 模式: 跳过 Application 构建(占位符 token)")
+        try:
+            await stop_event.wait()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            logger.info("[Up] CI 模式关闭完成")
+        return
+
     app = Application.builder().token(TOKEN).build()
     global _bot
     _bot = app.bot

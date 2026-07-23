@@ -41,11 +41,44 @@ async def _init():
 
 
 async def _async_main():
+    # R71 RC31: CI 模式保持进程存活辅助函数
+    # _async_main 在 TOKEN/AUTHORIZED_USER_ID 为空时 return → 进程退出
+    # → Docker restart → 紧密重启循环 → docker compose exec 报 "Container is restarting"。
+    # CI 模式下等待 stop 信号保持存活(与 up/idx/dsp RC31 一致)。
+    def _ci_keep_alive(reason: str):
+        _is_ci = (
+            os.getenv("CI", "").lower() in ("true", "1")
+            or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+        )
+        return _is_ci
+
     if not TOKEN:
         logger.warning("管理员机器人 Token 未配置（ADMIN_BOT_TOKEN），跳过启动")
+        if _ci_keep_alive("TOKEN"):
+            from run_all import _set_stop_event
+            stop_event = asyncio.Event()
+            _set_stop_event(stop_event)
+            logger.warning("[Admin] CI 模式: TOKEN 未配置,等待 stop 信号...")
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                logger.info("[Admin] CI 模式关闭完成")
         return
     if not AUTHORIZED_USER_ID:
         logger.warning("管理员 Telegram ID 未配置（ADMIN_TELEGRAM_ID），跳过启动")
+        if _ci_keep_alive("AUTHORIZED_USER_ID"):
+            from run_all import _set_stop_event
+            stop_event = asyncio.Event()
+            _set_stop_event(stop_event)
+            logger.warning("[Admin] CI 模式: AUTHORIZED_USER_ID 未配置,等待 stop 信号...")
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                logger.info("[Admin] CI 模式关闭完成")
         return
 
     # R48 P1-b: 每次 Bot 启动时显式触发 production secret 检查(fail-closed)
