@@ -521,15 +521,57 @@ def inject_failure_scenario(timeout: int = 60) -> StepResult:
         )
 
     # 等待 db_worker 消费并将畸形消息转入 DLQ
-    # 验证方式:检查 dead_letter.jsonl 文件或 DLQ stream
-    # 由于 db_writer 处理畸形 JSON 时会写入 dead_letter.jsonl,
-    # 我们轮询检查该文件是否包含我们的畸形消息
+    # 验证方式:检查 Redis DLQ Stream(优先) + dead_letter.jsonl 文件(降级回退)
+    # R71 RC34: push_dead() 在 Redis 可用时写入 Redis DLQ Stream
+    # (tgjiema:writer:dead),仅在 Redis 不可达时降级写 dead_letter.jsonl。
+    # CI 环境中 Redis 可用,畸形消息进入 Redis DLQ Stream 而非文件。
+    # 原代码仅检查文件 → 永远找不到 → failure_scenario 永远失败。
+    # 修复:同时检查 Redis DLQ Stream(XRANGE)和文件。
     deadline = time.time() + timeout
     dlq_found = False
     last_dlq_output = ""
+    admin_pwd = os.environ.get("REDIS_ADMIN_PASSWORD", "")
+    reader_pwd = os.environ.get("REDIS_READER_PASSWORD", "")
 
     while time.time() < deadline:
-        # 检查 dead_letter.jsonl 是否有新增(通过文件大小或尾部内容)
+        # 1. 优先检查 Redis DLQ Stream(tgjiema:writer:dead)
+        # push_dead() 通过 redis.xadd() 写入,畸形 JSON 的 "BROKEN" 标记
+        # 会出现在 dead_msg.original.raw 字段中
+        if admin_pwd:
+            redis_check_cmd = _compose_cmd([
+                "exec", "-T", "redis",
+                "redis-cli",
+                "--user", "tgjiema_admin",
+                "-a", admin_pwd,
+                "--no-auth-warning",
+                "XRANGE", "tgjiema:writer:dead", "-", "+", "COUNT", "100",
+            ])
+        elif reader_pwd:
+            redis_check_cmd = _compose_cmd([
+                "exec", "-T", "redis",
+                "redis-cli",
+                "--user", "tgjiema_reader",
+                "-a", reader_pwd,
+                "--no-auth-warning",
+                "XRANGE", "tgjiema:writer:dead", "-", "+", "COUNT", "100",
+            ])
+        else:
+            redis_check_cmd = _compose_cmd([
+                "exec", "-T", "redis",
+                "redis-cli",
+                "XRANGE", "tgjiema:writer:dead", "-", "+", "COUNT", "100",
+            ])
+        try:
+            redis_result = _run(redis_check_cmd, timeout=15, cwd=REPO_ROOT)
+            redis_output = redis_result.stdout
+            if redis_result.returncode == 0 and "BROKEN" in redis_output:
+                dlq_found = True
+                last_dlq_output = "REDIS_DLQ:OK"
+                break
+        except subprocess.TimeoutExpired:
+            pass
+
+        # 2. 降级检查 dead_letter.jsonl 文件(Redis 不可达时的回退路径)
         check_cmd = _compose_cmd([
             "exec", "-T", "db_writer",
             "python", "-c",
