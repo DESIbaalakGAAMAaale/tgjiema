@@ -1111,6 +1111,20 @@ def phase_health_check(timeout: int) -> PhaseResult:
             error_parts.append(f"健康检查失败: {failures}")
         if role_mismatches:
             error_parts.append(f"SERVICE_ROLE 不匹配: {role_mismatches}")
+
+        # R71 RC28: 捕获失败容器的 docker compose logs,用于诊断崩溃根因。
+        # 之前 health_check 失败时没有容器日志,无法判断 bot 进程为何崩溃。
+        container_logs: dict[str, str] = {}
+        for service in SERVICE_ROLES:
+            if service in ("redis", "redis-acl-init", "migration"):
+                continue
+            cmd = _compose_cmd(["logs", "--tail", "50", service])
+            try:
+                result = _run(cmd, timeout=15, cwd=REPO_ROOT)
+                container_logs[service] = result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout
+            except Exception:
+                container_logs[service] = "<failed to capture logs>"
+
         return _fail_result(
             phase="health_check",
             description=description,
@@ -1120,6 +1134,7 @@ def phase_health_check(timeout: int) -> PhaseResult:
                 "health_results": health_results,
                 "role_health_results": role_health_results,
                 "role_mismatches": role_mismatches,
+                "container_logs": container_logs,
             },
             readiness_checks=readiness_checks,
         )

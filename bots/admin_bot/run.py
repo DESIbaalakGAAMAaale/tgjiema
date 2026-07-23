@@ -138,58 +138,66 @@ async def _async_main():
 
     create_safe_task(health_ping(), name="health-ping")
 
-    async with app:
-        await app.start()
-        # R71 RC27: CI 模式跳过 start_polling — 占位符 token 无法通过 Telegram API
-        _is_ci = (
-            os.getenv("CI", "").lower() in ("true", "1")
-            or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-        )
-        if _is_ci:
-            logger.warning("[Admin] CI 模式: 跳过 start_polling()(占位符 token)")
-        else:
-            await app.updater.start_polling()
-        # 注册全局停止事件,让信号 handler 能 set 它触发优雅关闭
-        from run_all import _set_stop_event
-        stop_event = asyncio.Event()
-        _set_stop_event(stop_event)
+    # R71 RC28: CI 模式跳过 async with app: — app.start() → bot.initialize()
+    # → get_me() 会用占位符 token 调用 Telegram API → 401 → 崩溃 → restart loop。
+    _is_ci = (
+        os.getenv("CI", "").lower() in ("true", "1")
+        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+    )
+    from run_all import _set_stop_event
+    stop_event = asyncio.Event()
+    _set_stop_event(stop_event)
+
+    if _is_ci:
+        logger.warning("[Admin] CI 模式: 跳过 Application 启动(占位符 token)")
         try:
             await stop_event.wait()
         except asyncio.CancelledError:
             pass
         finally:
-            logger.info("[Admin] 收到停止信号,正在优雅关闭 polling...")
-            try:
-                await asyncio.wait_for(app.updater.stop(), timeout=15.0)
-            except asyncio.TimeoutError:
-                logger.warning("[Admin] polling 关闭超时(15s),强制继续")
-            except Exception as e:
-                logger.warning(f"[Admin] polling 关闭异常: {e}")
-            try:
-                await asyncio.wait_for(app.stop(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("[Admin] app.stop 超时(10s),强制继续")
-            except Exception as e:
-                logger.warning(f"[Admin] app.stop 异常: {e}")
-            # 取消所有剩余后台任务,防止进程卡死无法退出
-            import os as _os
-            pending = asyncio.all_tasks() - {asyncio.current_task()}
-            for task in pending:
-                task.cancel()
-            if pending:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*pending, return_exceptions=True),
-                        timeout=5.0,
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(f"[Admin] {len(pending)} 个后台任务未在 5s 内完成")
+            logger.info("[Admin] 收到停止信号,正在优雅关闭...")
             logger.info("[Admin] 优雅关闭完成")
-            # 如果仍有未完成任务,强制退出避免 systemd SIGKILL
-            remaining = asyncio.all_tasks() - {asyncio.current_task()}
-            if any(not t.done() for t in remaining):
-                logger.warning(f"[Admin] {sum(1 for t in remaining if not t.done())} 个任务仍运行,强制退出")
-                _os._exit(0)
+    else:
+        async with app:
+            await app.start()
+            await app.updater.start_polling()
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                logger.info("[Admin] 收到停止信号,正在优雅关闭 polling...")
+                try:
+                    await asyncio.wait_for(app.updater.stop(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[Admin] polling 关闭超时(15s),强制继续")
+                except Exception as e:
+                    logger.warning(f"[Admin] polling 关闭异常: {e}")
+                try:
+                    await asyncio.wait_for(app.stop(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[Admin] app.stop 超时(10s),强制继续")
+                except Exception as e:
+                    logger.warning(f"[Admin] app.stop 异常: {e}")
+                # 取消所有剩余后台任务,防止进程卡死无法退出
+                import os as _os
+                pending = asyncio.all_tasks() - {asyncio.current_task()}
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*pending, return_exceptions=True),
+                            timeout=5.0,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[Admin] {len(pending)} 个后台任务未在 5s 内完成")
+                logger.info("[Admin] 优雅关闭完成")
+                # 如果仍有未完成任务,强制退出避免 systemd SIGKILL
+                remaining = asyncio.all_tasks() - {asyncio.current_task()}
+                if any(not t.done() for t in remaining):
+                    logger.warning(f"[Admin] {sum(1 for t in remaining if not t.done())} 个任务仍运行,强制退出")
+                    _os._exit(0)
 
 
 def run():

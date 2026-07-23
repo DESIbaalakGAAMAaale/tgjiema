@@ -22,6 +22,7 @@ from services.user_message import UserMessage
 
 import asyncio
 import datetime as _dt
+import os
 import re
 import time
 
@@ -1105,7 +1106,16 @@ class MonBot:
         await init_db()
         from database.cache_store import report_bot_heartbeat
         await report_bot_heartbeat("mon_bot")
-        await self.bot.initialize()
+        # R71 RC28: CI 模式跳过 bot.initialize() — 会用占位符 token 调用
+        # get_me() → 401 → 崩溃 → restart loop。CI 中只保持进程存活。
+        _is_ci = (
+            os.getenv("CI", "").lower() in ("true", "1")
+            or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+        )
+        if _is_ci:
+            logger.warning("[Mon] CI 模式: 跳过 bot.initialize()(占位符 token)")
+        else:
+            await self.bot.initialize()
         self._running = True
         # C3: 启动 cells 变更监听(5s 轮询,加速外部变更感知)
         await self._start_cells_change_watcher()
@@ -1122,6 +1132,15 @@ class MonBot:
         if hb_data:
             logger.info(f"[Mon] 从 SQLite 恢复 {len(hb_data)} 条心跳记录")
         logger.info("[Mon] 监控机器人 v2 已启动")
+
+        # R71 RC28: CI 模式跳过主循环 — 主循环中使用 self.bot 调用 Telegram API
+        # (心跳检测、文件同步、智能替补等),占位符 token 会 401 崩溃。
+        # CI 中只保持进程存活等待 healthcheck / stop 信号。
+        if _is_ci:
+            logger.warning("[Mon] CI 模式: 跳过主循环,等待 stop 信号")
+            if self._stop_event:
+                await self._stop_event.wait()
+            return
 
         while self._running and not (self._stop_event and self._stop_event.is_set()):
             try:

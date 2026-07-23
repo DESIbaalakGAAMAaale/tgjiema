@@ -2955,49 +2955,59 @@ async def _async_main():
     )
     await outbox_worker.start()
 
-    async with app:
-        await app.start()
-        # R71 RC27: CI 模式跳过 start_polling — 占位符 token 无法通过 Telegram API,
-        # start_polling 会抛 401 异常导致进程崩溃 → restart loop。
-        # CI 中只保持进程存活等待 healthcheck / stop 信号。
-        _is_ci = (
-            os.getenv("CI", "").lower() in ("true", "1")
-            or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-        )
-        if _is_ci:
-            logger.warning("[Up] CI 模式: 跳过 start_polling()(占位符 token)")
-        else:
-            await app.updater.start_polling()
-        # 注册全局停止事件,让信号 handler 能 set 它触发优雅关闭
-        from run_all import _set_stop_event
-        stop_event = asyncio.Event()
-        _set_stop_event(stop_event)
+    # R71 RC28: CI 模式跳过 async with app: — app.start() → bot.initialize()
+    # → get_me() 会用占位符 token 调用 Telegram API → 401 → 崩溃 → restart loop。
+    # CI 中跳过整个 Application 启动,只保持进程存活等待 healthcheck / stop 信号。
+    _is_ci = (
+        os.getenv("CI", "").lower() in ("true", "1")
+        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+    )
+    from run_all import _set_stop_event
+    stop_event = asyncio.Event()
+    _set_stop_event(stop_event)
+
+    if _is_ci:
+        logger.warning("[Up] CI 模式: 跳过 Application 启动(占位符 token)")
         try:
             await stop_event.wait()
         except asyncio.CancelledError:
             pass
         finally:
             logger.info("[Up] 收到停止信号,正在优雅关闭...")
-            # R36 B0-2: 先停止 OutboxWorker(等待当前条目处理完成或超时)
             try:
                 await asyncio.wait_for(outbox_worker.stop(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("[Up] OutboxWorker 停止超时(10s),强制继续")
             except Exception as e:
                 logger.warning(f"[Up] OutboxWorker 停止异常: {e}")
-            try:
-                await asyncio.wait_for(app.updater.stop(), timeout=15.0)
-            except asyncio.TimeoutError:
-                logger.warning("[Up] polling 关闭超时(15s),强制继续")
-            except Exception as e:
-                logger.warning(f"[Up] polling 关闭异常: {e}")
-            try:
-                await asyncio.wait_for(app.stop(), timeout=10.0)
-            except asyncio.TimeoutError:
-                logger.warning("[Up] app.stop 超时(10s),强制继续")
-            except Exception as e:
-                logger.warning(f"[Up] app.stop 异常: {e}")
             logger.info("[Up] 优雅关闭完成")
+    else:
+        async with app:
+            await app.start()
+            await app.updater.start_polling()
+            try:
+                await stop_event.wait()
+            except asyncio.CancelledError:
+                pass
+            finally:
+                logger.info("[Up] 收到停止信号,正在优雅关闭...")
+                try:
+                    await asyncio.wait_for(outbox_worker.stop(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[Up] OutboxWorker 停止超时(10s),强制继续")
+                except Exception as e:
+                    logger.warning(f"[Up] OutboxWorker 停止异常: {e}")
+                try:
+                    await asyncio.wait_for(app.updater.stop(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[Up] polling 关闭超时(15s),强制继续")
+                except Exception as e:
+                    logger.warning(f"[Up] polling 关闭异常: {e}")
+                try:
+                    await asyncio.wait_for(app.stop(), timeout=10.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[Up] app.stop 超时(10s),强制继续")
+                except Exception as e:
+                    logger.warning(f"[Up] app.stop 异常: {e}")
+                logger.info("[Up] 优雅关闭完成")
 
 
 def run():
