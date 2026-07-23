@@ -1,4 +1,5 @@
 import asyncio
+import os
 from services.sink_adapters.telegram_helpers import (
     Application,
     CommandHandler,
@@ -139,7 +140,15 @@ async def _async_main():
 
     async with app:
         await app.start()
-        await app.updater.start_polling()
+        # R71 RC27: CI 模式跳过 start_polling — 占位符 token 无法通过 Telegram API
+        _is_ci = (
+            os.getenv("CI", "").lower() in ("true", "1")
+            or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+        )
+        if _is_ci:
+            logger.warning("[Admin] CI 模式: 跳过 start_polling()(占位符 token)")
+        else:
+            await app.updater.start_polling()
         # 注册全局停止事件,让信号 handler 能 set 它触发优雅关闭
         from run_all import _set_stop_event
         stop_event = asyncio.Event()

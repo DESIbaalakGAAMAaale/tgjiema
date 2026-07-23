@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import os
 import time
 import uuid
 try:
@@ -2956,7 +2957,17 @@ async def _async_main():
 
     async with app:
         await app.start()
-        await app.updater.start_polling()
+        # R71 RC27: CI 模式跳过 start_polling — 占位符 token 无法通过 Telegram API,
+        # start_polling 会抛 401 异常导致进程崩溃 → restart loop。
+        # CI 中只保持进程存活等待 healthcheck / stop 信号。
+        _is_ci = (
+            os.getenv("CI", "").lower() in ("true", "1")
+            or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+        )
+        if _is_ci:
+            logger.warning("[Up] CI 模式: 跳过 start_polling()(占位符 token)")
+        else:
+            await app.updater.start_polling()
         # 注册全局停止事件,让信号 handler 能 set 它触发优雅关闭
         from run_all import _set_stop_event
         stop_event = asyncio.Event()

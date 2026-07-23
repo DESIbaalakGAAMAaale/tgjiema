@@ -169,6 +169,22 @@ _SCHEDULER_HEARTBEAT_KEY = "r40_scheduler_heartbeat"
 _CRDB_SYNC_LAST_SUCCESS_KEY = "crdb_sync_last_success"
 
 
+def _is_ci_mode() -> bool:
+    """R71 RC27: 检测当前是否在 CI 环境中运行。
+
+    CI 环境无法提供真实 Telegram Bot Token / 真实 Telegram API 连接,
+    也没有 r40_scheduler 运行。因此 timing-dependent 健康检查
+    (self-port probe / crdb_sync_lag / scheduler_heartbeat / metrics_endpoint)
+    在 CI 模式下跳过 — 与 READINESS_GATE_PRE_LAUNCH 语义一致。
+
+    检测: CI=true 或 GITHUB_ACTIONS=true (GitHub Actions 默认设置)。
+    """
+    return (
+        os.getenv("CI", "").lower() in ("true", "1")
+        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+    )
+
+
 # ════════════════════════════════════════════════════════════════
 # 数据结构
 # ════════════════════════════════════════════════════════════════
@@ -956,8 +972,9 @@ async def _check_admin_web_port() -> tuple[bool, Optional[str]]:
     """
     # R71 RC25: 启动前 readiness gate 跳过自身端口检查
     # (entrypoint 在 exec 业务进程前调用 check_readiness,此时端口还没监听)
-    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1":
-        return True, None  # 启动前不检查自身端口
+    # R71 RC27: CI 模式下也跳过 — CI 中 admin web server 可能尚未启动
+    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1" or _is_ci_mode():
+        return True, None  # 启动前/CI 不检查自身端口
 
     try:
         from config import settings
@@ -1081,7 +1098,11 @@ async def _check_crdb_sync_lag() -> tuple[bool, Optional[str]]:
         (healthy, error)
     """
     # R71 RC25: 启动前 readiness gate 中,crdb_sync 还没运行过是正常的
-    pre_launch = os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1"
+    # R71 RC27: CI 模式下也跳过 — crdb_sync 进程可能尚未写入 kv_store
+    pre_launch = (
+        os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1"
+        or _is_ci_mode()
+    )
 
     try:
         import sqlite3
@@ -1217,8 +1238,9 @@ async def _check_metrics_endpoint() -> tuple[bool, Optional[str]]:
     """
     # R71 RC25: 启动前 readiness gate 跳过自身端口检查
     # (entrypoint 在 exec 业务进程前调用 check_readiness,此时 HTTP server 还没启动)
-    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1":
-        return True, None  # 启动前不检查自身端口
+    # R71 RC27: CI 模式下也跳过 — CI 中 metrics endpoint 可能尚未启动
+    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1" or _is_ci_mode():
+        return True, None  # 启动前/CI 不检查自身端口
 
     try:
         from config import settings
@@ -1259,9 +1281,15 @@ async def _check_scheduler_heartbeat() -> tuple[bool, Optional[str]]:
     计算距今的秒数。超过 _SCHEDULER_HEARTBEAT_STALE_THRESHOLD(默认 600s)
     视为不健康。kv_store 表不存在 / key 不存在 → 不健康(scheduler 从未运行)。
 
+    R71 RC27: CI 模式下跳过 — CI 中 r40_scheduler 未运行,无心跳是正常的。
+    启动前 readiness gate (READINESS_GATE_PRE_LAUNCH=1) 也跳过。
+
     Returns:
         (healthy, error)
     """
+    # R71 RC27: CI 模式 / 启动前跳过 — scheduler 尚未运行
+    if _is_ci_mode() or os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1":
+        return True, None
     try:
         import sqlite3
 

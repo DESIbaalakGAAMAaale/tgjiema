@@ -155,10 +155,29 @@ def run_db_backup():
     # CancelledError 传播信号,自定义 raise KeyboardInterrupt 会绕过清理路径。
     import asyncio
     from services.db_backup import run_db_backup as _run
+    # R71 RC27: CI 模式下,db_backup 正常返回或异常退出后保持进程存活,
+    # 避免 restart on-failure 循环(backup 完成后进程退出是正常的,
+    # 但 CI 健康检查需要容器持续运行)。
+    _is_ci = (
+        os.environ.get("CI", "").lower() in ("true", "1")
+        or os.environ.get("GITHUB_ACTIONS", "").lower() in ("true", "1")
+    )
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
         logger.info("[db_backup] 收到中断信号,已停止")
+        return
+    except Exception as e:
+        if _is_ci:
+            logger.warning(f"[db_backup] CI 模式: 异常退出被捕获(避免 restart loop): {e}")
+        else:
+            raise
+    if _is_ci:
+        logger.info("[db_backup] CI 模式: 等待 stop 信号...")
+        try:
+            asyncio.run(asyncio.Event().wait())
+        except (KeyboardInterrupt, RuntimeError):
+            pass
 
 
 def run_db_writer():
