@@ -175,6 +175,12 @@ def _run_readiness_gate(app_env: str, service_role: str) -> None:
         f"role={service_role})"
     )
 
+    # R71 RC25 fix: 标记启动前 readiness gate 模式。
+    # services.health 中的 _check_admin_web_port() 和 _check_metrics_endpoint()
+    # 检测此环境变量,在启动前跳过自身端口检查(进程还没 exec,端口自然没监听 —
+    # 先有鸡还是先有蛋)。运行时 healthcheck 不设置此变量,正常执行端口检查。
+    os.environ["READINESS_GATE_PRE_LAUNCH"] = "1"
+
     try:
         import asyncio
 
@@ -195,6 +201,9 @@ def _run_readiness_gate(app_env: str, service_role: str) -> None:
             f"R71 readiness gate 崩溃: {type(e).__name__}: {e}"
         )
         sys.exit(4)
+
+    # RC25: 清除启动前标记,避免影响业务进程
+    del os.environ["READINESS_GATE_PRE_LAUNCH"]
 
     if not result.healthy:
         # critical 检查失败 → fail-closed

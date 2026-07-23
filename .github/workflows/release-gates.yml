@@ -752,6 +752,21 @@ jobs:
           for svc in db_writer up idx dsp mon admin_bot admin prometheus_exporter; do
             touch ".env.secrets.${svc}"
           done
+          # R71 RC25 fix: CI 环境无法提供真实 Telegram Bot Token。
+          # 设置占位符 BOT_TOKEN 使 Settings 验证通过 + readiness gate 的
+          # _check_bot_token_valid() 在 CI 模式下(CI=true)跳过 getMe 调用,
+          # 只验证 token 格式(数字:字母数字混合,>= 10 字符)。
+          # 占位符格式: 0000000000:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
+          PLACEHOLDER_TOKEN="0000000000:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
+          echo "UP_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.up
+          echo "IDX_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.idx
+          echo "DSP_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.dsp
+          echo "MON_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.mon
+          echo "ADMIN_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.admin_bot
+          # admin 服务也需要 ADMIN_BOT_TOKEN(ROLE_REQUIREMENTS["admin"] 包含
+          # bot_token_valid 全部检查,_get_bot_token_for_role("admin") 读取
+          # ADMIN_BOT_TOKEN 环境变量)
+          echo "ADMIN_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.admin
           # R71 RC13 fix: 改用 PostgreSQL service container (cockroach insecure
           # 模式 listen-addr 限制导致多次失败)。PostgreSQL 监听 0.0.0.0:5432,
           # Docker port publishing 可正常工作。asyncpg 兼容两种 DB wire protocol。

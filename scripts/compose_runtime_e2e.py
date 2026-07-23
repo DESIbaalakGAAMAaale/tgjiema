@@ -1023,6 +1023,10 @@ def phase_health_check(timeout: int) -> PhaseResult:
             continue  # 基础设施服务无 SERVICE_ROLE
         if expected_role == "infrastructure":
             continue
+        # R71 RC25 fix: migration 是 oneshot,启动后立即退出(service_completed_successfully)。
+        # "service is not running" 是正常状态,不应视为健康检查失败。
+        if service == "migration":
+            continue
         cmd = _compose_cmd([
             "exec", "-T", service,
             "python", "-m", "services.health",
@@ -1077,6 +1081,9 @@ def phase_health_check(timeout: int) -> PhaseResult:
         if service in ("redis", "redis-acl-init"):
             continue  # 基础设施服务无 SERVICE_ROLE
         if expected_role == "infrastructure":
+            continue
+        # R71 RC25 fix: migration 是 oneshot,已退出,printenv 不可用
+        if service == "migration":
             continue
         # 通过 docker compose exec 验证 SERVICE_ROLE
         cmd = _compose_cmd([
