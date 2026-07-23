@@ -145,8 +145,11 @@ class TestReadinessChecks:
             assert isinstance(val, bool), \
                 f"checks[{name}] 应为 bool,实际: {type(val)}={val}"
 
-    def test_details_has_entry_for_each_check(self):
+    def test_details_has_entry_for_each_check(self, monkeypatch):
         """R41 P1-10: details 应为每个 check 提供详细信息。"""
+        # R71 RC38: 清除 CI 环境变量,绕过 prometheus_exporter CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         from services.prometheus_exporter import check_readiness
         result = check_readiness()
         for name in result["checks"]:
@@ -163,6 +166,9 @@ class TestAclConfiguredCheck:
 
     def test_acl_configured_false_when_no_redis_envs(self, monkeypatch):
         """无任何 REDIS_*_PASSWORD 时,acl_configured 应为 False。"""
+        # R71 RC38: 清除 CI 环境变量,绕过 prometheus_exporter CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         # 清空所有 REDIS_*_PASSWORD 环境变量
         for var in ("REDIS_HEALTH_PASSWORD", "REDIS_WRITER_PASSWORD",
                     "REDIS_READER_PASSWORD", "REDIS_ADMIN_PASSWORD"):
@@ -176,6 +182,9 @@ class TestAclConfiguredCheck:
 
     def test_acl_configured_false_when_partial_redis_envs(self, monkeypatch):
         """仅配置 3 个 REDIS_*_PASSWORD(缺 REDIS_ADMIN_PASSWORD)时,acl_configured 应为 False。"""
+        # R71 RC38: 清除 CI 环境变量,绕过 prometheus_exporter CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         monkeypatch.setenv("REDIS_HEALTH_PASSWORD", "health_pwd")
         monkeypatch.setenv("REDIS_WRITER_PASSWORD", "writer_pwd")
         monkeypatch.setenv("REDIS_READER_PASSWORD", "reader_pwd")
@@ -187,6 +196,9 @@ class TestAclConfiguredCheck:
 
     def test_acl_configured_true_when_all_redis_envs_set(self, monkeypatch):
         """4 个 REDIS_*_PASSWORD 全部配置时,acl_configured 应为 True。"""
+        # R71 RC38: 清除 CI 环境变量,绕过 prometheus_exporter CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         monkeypatch.setenv("REDIS_HEALTH_PASSWORD", "health_pwd")
         monkeypatch.setenv("REDIS_WRITER_PASSWORD", "writer_pwd")
         monkeypatch.setenv("REDIS_READER_PASSWORD", "reader_pwd")
@@ -199,6 +211,9 @@ class TestAclConfiguredCheck:
 
     def test_acl_details_mentions_missing_vars(self, monkeypatch):
         """acl_configured 失败时,details 应提及缺失的变量名。"""
+        # R71 RC38: 清除 CI 环境变量,绕过 prometheus_exporter CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         for var in ("REDIS_HEALTH_PASSWORD", "REDIS_WRITER_PASSWORD",
                     "REDIS_READER_PASSWORD", "REDIS_ADMIN_PASSWORD"):
             monkeypatch.delenv(var, raising=False)
@@ -218,6 +233,9 @@ class TestRuUnknownOnCollectionFailure:
 
     def test_ru_daily_usage_is_unknown_when_sqlite_missing(self, monkeypatch, tmp_path):
         """SQLite 文件不存在时,ru_daily_usage 应为 "unknown"。"""
+        # R71 RC38: 清除 CI 环境变量,绕过 prometheus_exporter CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         # 指向不存在的 SQLite 路径
         from services.prometheus_exporter import CACHE_STORE_DB
         monkeypatch.setattr(
@@ -231,6 +249,9 @@ class TestRuUnknownOnCollectionFailure:
 
     def test_ru_daily_usage_is_string_not_zero(self, monkeypatch):
         """ru_daily_usage 应为字符串类型(可能是 "unknown" 或数字字符串)。"""
+        # R71 RC38: 清除 CI 环境变量,绕过 prometheus_exporter CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         for var in ("REDIS_HEALTH_PASSWORD", "REDIS_WRITER_PASSWORD",
                     "REDIS_READER_PASSWORD", "REDIS_ADMIN_PASSWORD"):
             monkeypatch.delenv(var, raising=False)
@@ -245,6 +266,9 @@ class TestRuUnknownOnCollectionFailure:
 
     def test_ru_daily_usage_never_returns_zero_string_on_failure(self, monkeypatch, tmp_path):
         """SQLite 不可读时,ru_daily_usage 不应为 "0"(应显示 unknown)。"""
+        # R71 RC38: 清除 CI 环境变量,绕过 prometheus_exporter CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         monkeypatch.setattr(
             "services.prometheus_exporter.CACHE_STORE_DB",
             tmp_path / "nonexistent.db",

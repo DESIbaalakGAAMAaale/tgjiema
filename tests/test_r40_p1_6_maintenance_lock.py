@@ -175,7 +175,7 @@ class TestMaintenanceWorkflowFailureKeepsEnabled:
             new=AsyncMock(return_value="backup_test_001"),
         ), patch.object(
             maintenance_mode,
-            "check_readiness",
+            "check_maintenance_safe",
             new=AsyncMock(return_value={
                 "ready": False,
                 "pending_uploads": 0,
@@ -220,7 +220,7 @@ class TestMaintenanceWorkflowSuccessDisable:
             new=AsyncMock(return_value="backup_success_001"),
         ), patch.object(
             maintenance_mode,
-            "check_readiness",
+            "check_maintenance_safe",
             new=AsyncMock(return_value={
                 "ready": True,
                 "pending_uploads": 0,
@@ -274,7 +274,7 @@ class TestMaintenanceWorkflowSuccessDisable:
             new=AsyncMock(return_value="backup_success_002"),
         ), patch.object(
             maintenance_mode,
-            "check_readiness",
+            "check_maintenance_safe",
             new=AsyncMock(return_value={
                 "ready": True,
                 "pending_uploads": 0,

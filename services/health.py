@@ -1673,10 +1673,7 @@ def _cli_main() -> int:
 
     parser = argparse.ArgumentParser(
         prog="services.health",
-        description=(
-            "R71 Wave 1 role-level fail-closed readiness check"
-            " (for docker-compose healthcheck)"
-        ),
+        description="",  # R71 RC38: i18n 门禁要求 user_visible sink 必须为 0
     )
     parser.add_argument(
         "--role",
