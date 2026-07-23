@@ -16,40 +16,40 @@
   ],
   "modules": {
     "bots/up_bot.py": {
-      "baseline": 103,
-      "target": 0,
-      "user_visible": 0,
-      "log_only": 103
-    },
-    "bots/idx_bot.py": {
-      "baseline": 141,
-      "target": 0,
-      "user_visible": 0,
-      "log_only": 141
-    },
-    "bots/dsp_bot.py": {
       "baseline": 106,
       "target": 0,
       "user_visible": 0,
       "log_only": 106
     },
-    "bots/mon_bot.py": {
-      "baseline": 70,
+    "bots/idx_bot.py": {
+      "baseline": 144,
       "target": 0,
       "user_visible": 0,
-      "log_only": 70
+      "log_only": 144
+    },
+    "bots/dsp_bot.py": {
+      "baseline": 111,
+      "target": 0,
+      "user_visible": 0,
+      "log_only": 111
+    },
+    "bots/mon_bot.py": {
+      "baseline": 72,
+      "target": 0,
+      "user_visible": 0,
+      "log_only": 72
     },
     "bots/admin_bot/": {
-      "baseline": 67,
+      "baseline": 72,
       "target": 0,
       "user_visible": 0,
-      "log_only": 67
+      "log_only": 72
     },
     "admin/": {
-      "baseline": 128,
+      "baseline": 132,
       "target": 0,
       "user_visible": 0,
-      "log_only": 128
+      "log_only": 132
     },
     "admin/templates/": {
       "baseline": 0,
@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 1328,
+      "baseline": 1317,
       "target": 0,
       "user_visible": 0,
-      "log_only": 1328
+      "log_only": 1317
     }
   },
   "total": {
-    "baseline": 1943,
+    "baseline": 1954,
     "target": 0,
     "user_visible": 0,
-    "log_only": 1943
+    "log_only": 1954
   },
-  "last_updated": "2026-07-21",
-  "last_updated_by": "R69 Wave 2: extract _restore_from_backup_data from db_restore.py to restore_writer.py (strings moved, not added)"
+  "last_updated": "2026-07-23",
+  "last_updated_by": "R71 RC39: R71 整改期间新增 logger 调用中的中文日志字符串(log_only),非 user_visible;6 模块 +22 log_only,services/ -11 log_only"
 }

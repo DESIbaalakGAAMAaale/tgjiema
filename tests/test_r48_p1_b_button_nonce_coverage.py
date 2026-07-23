@@ -565,6 +565,9 @@ class TestValidateProductionConfig:
         import config
         from services.button_security import validate_production_config
 
+        # R71 RC39: 清除 CI 环境变量,绕过 _check_production_secret CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         monkeypatch.setattr(config.settings, "ENVIRONMENT", "production")
         monkeypatch.setattr(config.settings, "ADMIN_BOT_TOKEN", "")
         monkeypatch.setattr(config.settings, "SENDER_BOT_TOKEN", "")
@@ -610,6 +613,9 @@ class TestValidateProductionConfig:
             _check_production_secret,
         )
 
+        # R71 RC39: 清除 CI 环境变量,绕过 _check_production_secret CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         monkeypatch.setattr(config.settings, "ENVIRONMENT", "production")
         monkeypatch.setattr(config.settings, "ADMIN_BOT_TOKEN", "")
         monkeypatch.setattr(config.settings, "SENDER_BOT_TOKEN", "")

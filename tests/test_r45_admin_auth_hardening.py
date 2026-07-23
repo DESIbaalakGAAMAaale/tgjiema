@@ -313,8 +313,11 @@ class TestEnsureReadinessOrExit:
     """ensure_readiness_or_exit() 行为测试。"""
 
     @pytest.mark.asyncio
-    async def test_exit_when_not_bootstrapped(self, real_store):
+    async def test_exit_when_not_bootstrapped(self, real_store, monkeypatch):
         """用例 4: 未 bootstrap 时 ensure_readiness_or_exit 调用 sys.exit(1)。"""
+        # R71 RC39: 清除 CI 环境变量,绕过 ensure_readiness_or_exit CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         from admin import ensure_readiness_or_exit
         with pytest.raises(SystemExit) as exc_info:
             await ensure_readiness_or_exit()
@@ -331,8 +334,11 @@ class TestEnsureReadinessOrExit:
         await ensure_readiness_or_exit()
 
     @pytest.mark.asyncio
-    async def test_exit_when_verify_raises_exception(self, real_store):
+    async def test_exit_when_verify_raises_exception(self, real_store, monkeypatch):
         """verify_admin_bootstrap 抛异常时也退出(代码 1)。"""
+        # R71 RC39: 清除 CI 环境变量,绕过 ensure_readiness_or_exit CI 模式提前返回
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         from admin import ensure_readiness_or_exit
         with patch(
             "admin.verify_admin_bootstrap",
