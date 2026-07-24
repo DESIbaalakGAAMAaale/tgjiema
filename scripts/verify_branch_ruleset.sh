@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # R71 P1-01/02/03 (Wave 6): 验证 GitHub Repository Ruleset 配置
-# (Solo Founder 模式 — 0 reviewers / strict_merge=true / 36 contexts / no bypass)
+# (Solo Founder 模式 — 0 reviewers / strict_merge=true / 29 contexts / no bypass)
 #
 # 本脚本在 CI 中运行,验证仓库实际配置的 branch ruleset 与
 # .github/branch_ruleset.expected.json 期望配置一致(solo-founder 语义)。
@@ -21,8 +21,11 @@
 #       * required_review_thread_resolution == true
 #   - rules 包含 required_status_checks (R71 P1-02/03):
 #       * strict_merge == true (current-SHA, 不允许 stale parent commit)
-#       * required_checks 包含 36 个 context (覆盖所有真实 release-gates.yml job 名)
-#       * 必含 R71 Wave 2/4/5/7 新增: compose-runtime-e2e / validate-oci-rootfs / verify-rc-identity / bind-runtime-config
+#       * required_checks 包含 29 个 context (仅 PR/master 事件可产生的 release-gates.yml job 名)
+#       * 必含 R71 Wave 4/7 新增: validate-oci-rootfs / bind-runtime-config
+#       * R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
+#         sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
+#         migration-binding-gate / verify-rc-identity / production-promotion-gate)
 #   - bypass_actors 为空(禁止任何角色 bypass,包括 admin;紧急情况通过 record_break_glass.py)
 #
 # 使用方法:
@@ -36,8 +39,11 @@ set -euo pipefail
 
 RULESET_NAME="${RULESET_NAME:-R71 Solo Founder Branch Ruleset}"
 
-# R71 P1-02: 必需 status checks 列表(36 项,覆盖所有真实 release-gates.yml job 名)
+# R71 P1-02 / R72 P1-06: 必需 status checks 列表(29 项,仅 PR/master 事件可产生的 check)
 # 与 .github/branch_ruleset.expected.json / scripts/configure_branch_ruleset.sh 保持一致
+# R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
+# sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
+# migration-binding-gate / verify-rc-identity / production-promotion-gate)
 EXPECTED_REQUIRED_CHECKS=(
   "lint"
   "static-gates"
@@ -50,30 +56,22 @@ EXPECTED_REQUIRED_CHECKS=(
   "restore-legacy-seal-gate"
   "i18n-strict-export-boundary-gate"
   "migration-manifest-gate"
-  "migration-binding-gate"
   "button-flow-real-ux-gate"
   "backup-restore-drill"
   "sbom"
   "pip-audit"
   "trivy"
-  "sign-image"
   "sign-artifacts"
   "verify-branch-protection"
   "verify-branch-ruleset"
   "verify-git-source-governance"
   "rc-continuity"
-  "publish-attestation"
-  "attestation-semantics-verify"
-  "verify-only-3x"
   "tag-ruleset-verify"
   "crdb-ru-72h-attribution-gate"
   "production-evidence"
-  "production-promotion-gate"
   "oci-allowlist-verify"
   "validate-oci-rootfs"
   "runtime-smoke-compose"
-  "compose-runtime-e2e"
-  "verify-rc-identity"
   "bind-runtime-config"
   "release-summary"
 )
@@ -84,7 +82,7 @@ print_help() {
 用法: $0 [OWNER] [REPO]
 
 R71 P1-01/02/03 (Wave 6): 验证 master/main branch Repository Ruleset 配置
-(Solo Founder 模式 — 0 reviewers / strict_merge=true / 36 contexts / no bypass)。
+(Solo Founder 模式 — 0 reviewers / strict_merge=true / 29 contexts / no bypass)。
 
 参数(可选):
   OWNER  仓库 owner(默认从 gh repo view / git remote 推断)
@@ -313,7 +311,7 @@ assert_contains "pull_request.required_review_thread_resolution == true" \
   "$RULESET_JSON" \
   '[.rules[] | select(.type == "pull_request") | .parameters.required_review_thread_resolution] | add == true'
 
-# R71 P1-02: required_status_checks 必须存在,且包含全部 36 个 context
+# R71 P1-02 / R72 P1-06: required_status_checks 必须存在,且包含全部 29 个 context
 assert_contains "rules 含 required_status_checks (R71 P1-02)" \
   "$RULESET_JSON" \
   '[.rules[].type] | any(. == "required_status_checks")'
@@ -334,18 +332,10 @@ for ctx in "${EXPECTED_REQUIRED_CHECKS[@]}"; do
     "c" "$ctx"
 done
 
-# R71 P1-02: 特别验证 R71 Wave 2/4/5/7 新增的 context
-assert_contains "R71 Wave 2: required_status_checks 含 'compose-runtime-e2e'" \
-  "$RULESET_JSON" \
-  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "compose-runtime-e2e")'
-
+# R71 P1-02: 特别验证 R71 Wave 4/7 新增的 context(R72 P1-06 移除 Wave 2/5)
 assert_contains "R71 Wave 4: required_status_checks 含 'validate-oci-rootfs'" \
   "$RULESET_JSON" \
   '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "validate-oci-rootfs")'
-
-assert_contains "R71 Wave 5: required_status_checks 含 'verify-rc-identity'" \
-  "$RULESET_JSON" \
-  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "verify-rc-identity")'
 
 assert_contains "R71 Wave 7: required_status_checks 含 'bind-runtime-config'" \
   "$RULESET_JSON" \

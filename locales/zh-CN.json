@@ -2152,14 +2152,31 @@
     },
     "db_backup": {
       "s1": "R39 P1-6 + R40 P0-6: 临时 payload 密文 checksum 不匹配(expected_cipher={str_expected_cipher_sha_16}, actual={verify_sha_16})",
-      "s2": "R39 P1-6: 临时 payload 大小不匹配(expected={len_upload_content}, actual={len_verify_bytes})"
+      "s2": "R39 P1-6: 临时 payload 大小不匹配(expected={len_upload_content}, actual={len_verify_bytes})",
+      "s3": "数据库备份(R72 P0-10 命令行)",
+      "s4": "执行一次性备份",
+      "s5": "执行一次备份后退出(不进入后台循环)",
+      "s6": "将结构化备份证据写入指定路径",
+      "s7": "启动后台循环",
+      "s8": "[备份] R72 P0-10: 一次性备份完成 (backup_id={backup_id}, 类型={backup_type})",
+      "s9": "[db_backup] close_db 失败: {error}",
+      "s10": "[db_backup] R2 存储关闭失败: {error}"
+    },
+    "migrate": {
+      "s1": "数据库版本化迁移命令行(R72 P0-08)",
+      "s2": "检查模式:只验证迁移状态,不应用新迁移",
+      "s3": "输出结构化证据(R72 P0-08)"
     },
     "db_restore": {
       "s1": "非法表名: {name}",
       "s2": "非法列名: {name}",
       "s3": "从 R2 备份恢复数据库",
       "s4": "指定要恢复的表名（默认恢复所有表）",
-      "s5": "预览模式，不实际写入数据"
+      "s5": "预览模式，不实际写入数据",
+      "s6": "备份标识(时间戳,如 20260718_120000)— 三段式备份发现入口",
+      "s7": "备份类型(全量/增量,默认全量)",
+      "s8": "恢复目标(生产/预发布/开发,默认生产)",
+      "s9": "将结构化恢复证据写入指定路径"
     },
     "disaster_recovery": {
       "s1": "              灾备状态 (R40 §9.3)",

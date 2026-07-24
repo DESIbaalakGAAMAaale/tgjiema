@@ -431,6 +431,8 @@ async def run_restore(
         logger.info(f"[{tbl}] 恢复完成: {count} 条记录")
 
     logger.info("数据库恢复完成")
+    # R72 P0-10: 返回结构化结果,使 --output-json 路径生效
+    return result
 
 
 def _build_cli_decryptor():
@@ -454,7 +456,7 @@ def main():
     parser = argparse.ArgumentParser(description=_i18n_t('services.db_restore.s3'))
     parser.add_argument(
         "--backup-id", type=str, required=True,
-        help="备份 ID(timestamp,如 20260718_120000)— 三段式备份发现入口",
+        help=_i18n_t('services.db_restore.s6'),
     )
     parser.add_argument(
         "--table", type=str, default=None,
@@ -467,15 +469,42 @@ def main():
     parser.add_argument(
         "--backup-type", type=str, default="full",
         choices=["full", "incremental"],
-        help="备份类型(full/incremental,默认 full)",
+        help=_i18n_t('services.db_restore.s7'),
+    )
+    # R72 P0-10/P0-11: --target 参数指定恢复目标
+    # production: 恢复到生产数据库(受 _production_guard 保护)
+    # staging: 恢复到隔离的 staging 数据库(/app/data/staging/cache_store.db)
+    parser.add_argument(
+        "--target", type=str, default="production",
+        choices=["production", "staging", "development"],
+        help=_i18n_t('services.db_restore.s8'),
+    )
+    parser.add_argument(
+        "--output-json", type=str, default=None,
+        help=_i18n_t('services.db_restore.s9'),
     )
     args = parser.parse_args()
-    asyncio.run(run_restore(
+
+    # R72 P0-11: --target staging 时设置 RESTORE_TARGET 环境变量
+    # 使恢复流程使用隔离的 staging 数据库路径,不覆盖生产数据库
+    if args.target in ("staging", "development"):
+        os.environ["RESTORE_TARGET"] = args.target
+        os.environ.setdefault("ALLOW_LEGACY_RESTORE", "1")  # scripts 场景逃生舱
+
+    result = asyncio.run(run_restore(
         backup_id=args.backup_id,
         table=args.table,
         dry_run=args.dry_run,
         backup_type=args.backup_type,
     ))
+
+    # R72 P0-10: 输出结构化 evidence
+    if args.output_json and result:
+        from pathlib import Path
+        Path(args.output_json).write_text(
+            json.dumps(result, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
 
 
 if __name__ == "__main__":

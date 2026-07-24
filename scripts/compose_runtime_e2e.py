@@ -177,21 +177,20 @@ SERVICE_ROLES: dict[str, str] = {
     "admin_bot": "admin_bot",
     "admin": "admin",
     "db_backup": "db_backup",
+    "r40_scheduler": "r40_scheduler",
     "prometheus_exporter": "prometheus_exporter",
 }
 
 # 阶段 2:核心服务(基础设施 + DBWriter)
 CORE_SERVICES: list[str] = ["redis", "db_writer"]
 
-# 阶段 3:Bot 服务 + 全部业务角色服务(R71 Wave 2 扩展)
-# R71 P0-05: 旧版只启动 up/idx/dsp/mon/admin_bot 5 个 bot,
-# 缺少 admin/crdb_sync/db_backup/prometheus_exporter。
-# R71 Wave 2: 扩展为全部业务服务(migration 是 oneshot,
-# 通过 depends_on 自动触发,不在此列表中;
-# r40_scheduler 不在 docker-compose.prod.yml 中,故不启动)
+# 阶段 3:Bot 服务 + 全部业务角色服务(R72 P0-04 扩展)
+# R72 P0-04: r40_scheduler 已加入 docker-compose.prod.yml,
+# 不再是半部署状态。migration 是 oneshot,通过 depends_on 自动触发。
 BOT_SERVICES: list[str] = [
     "up", "idx", "dsp", "mon", "admin_bot",  # 5 个 Bot 服务
-    "admin", "crdb_sync", "db_backup", "prometheus_exporter",  # 4 个业务服务
+    "admin", "crdb_sync", "db_backup", "r40_scheduler",  # 4 个业务服务
+    "prometheus_exporter",
 ]
 
 # 阶段 5:暴露 HTTP /health 端点的服务(端口映射)
@@ -348,6 +347,124 @@ def _pass_result(
     )
 
 
+def _get_compose_ps_info(
+    include_exited: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """R72 P0-06/07/13/14: 解析 docker compose ps --format json,返回每个服务的状态。
+
+    替代旧版在各 phase 内联的 ps 解析逻辑,统一返回结构化状态信息,
+    供 start_core / start_bots / sigterm / restart 阶段做严格断言。
+
+    返回 dict[service_name] = {
+        "state": str,           # running / exited / restarting / dead / ...
+        "health": str,          # healthy / unhealthy / starting / "" (无 healthcheck)
+        "exit_code": int | None,
+    }
+
+    Args:
+        include_exited: True 时使用 `docker compose ps -a`(包含已退出容器),
+                       False 时只包含运行中容器。
+
+    fail-closed:docker compose ps 失败或输出无法解析时返回空 dict
+    (调用方必须显式检查期望服务是否存在,空 dict 会导致断言失败)。
+    """
+    cmd_args = ["ps"]
+    if include_exited:
+        cmd_args.append("-a")
+    cmd_args.extend(["--format", "json"])
+    ps_cmd = _compose_cmd(cmd_args)
+    ps_result = _run(ps_cmd, timeout=30, cwd=REPO_ROOT)
+    info: dict[str, dict[str, Any]] = {}
+    if ps_result.returncode != 0:
+        return info
+
+    stdout_stripped = ps_result.stdout.strip()
+    parsed_entries: list[dict[str, Any]] = []
+    # 支持多行 JSON 对象(旧版 docker compose)
+    for line in stdout_stripped.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, list):
+                parsed_entries.extend(e for e in obj if isinstance(e, dict))
+            elif isinstance(obj, dict):
+                parsed_entries.append(obj)
+        except json.JSONDecodeError:
+            continue
+    # 支持单行 JSON 数组(新版 docker compose)
+    if not parsed_entries and stdout_stripped.startswith("["):
+        try:
+            arr = json.loads(stdout_stripped)
+            if isinstance(arr, list):
+                parsed_entries = [e for e in arr if isinstance(e, dict)]
+        except json.JSONDecodeError:
+            pass
+
+    for svc_info in parsed_entries:
+        svc_name = svc_info.get("Service") or svc_info.get("service", "")
+        if not svc_name:
+            continue
+        state = (
+            svc_info.get("State")
+            or svc_info.get("state", "")
+            or svc_info.get("Status", "")
+            or ""
+        )
+        health = svc_info.get("Health") or svc_info.get("health", "") or ""
+        exit_code = svc_info.get("ExitCode")
+        if exit_code is not None:
+            try:
+                exit_code = int(exit_code)
+            except (ValueError, TypeError):
+                exit_code = None
+        info[svc_name] = {
+            "state": str(state),
+            "health": str(health),
+            "exit_code": exit_code,
+        }
+    return info
+
+
+def _wait_for_services(
+    expected: dict[str, dict[str, str]],
+    timeout_seconds: int = 180,
+    poll_interval: int = 5,
+) -> tuple[bool, dict[str, dict[str, Any]]]:
+    """R72 P0-06/07/14: 轮询 docker compose ps 直到所有服务达到期望状态。
+
+    Args:
+        expected: dict[service_name] = {"state": "...", "health": "..."}
+                  health 为空字符串表示不检查 health(如 oneshot 服务)。
+        timeout_seconds: 总等待秒数。
+        poll_interval: 轮询间隔秒数。
+
+    Returns:
+        (all_ready, final_info) — all_ready=True 表示所有服务达到期望状态。
+    """
+    deadline = time.time() + timeout_seconds
+    last_info: dict[str, dict[str, Any]] = {}
+    while time.time() < deadline:
+        last_info = _get_compose_ps_info(include_exited=True)
+        all_ready = True
+        for svc, req in expected.items():
+            si = last_info.get(svc)
+            if si is None:
+                all_ready = False
+                break
+            if si["state"] != req["state"]:
+                all_ready = False
+                break
+            if req["health"] and si["health"] != req["health"]:
+                all_ready = False
+                break
+        if all_ready:
+            return True, last_info
+        time.sleep(poll_interval)
+    return False, last_info
+
+
 # ════════════════════════════════════════════════════════════════
 # 阶段 1:preflight
 # ════════════════════════════════════════════════════════════════
@@ -429,39 +546,38 @@ def phase_preflight(timeout: int) -> PhaseResult:
                 {"check": "image_digest", "status": "fail"},
             ],
         )
-    # R71 P1-04: 严格格式校验
-    if _RUNTIME_CONFIG_BINDING_AVAILABLE:
-        parsed, img_errors = validate_image_reference(
-            tgjiema_image,
-            DEFAULT_EXPECTED_REGISTRY,
-            DEFAULT_EXPECTED_REPOSITORY,
-        )
-        if parsed is None:
-            return _fail_result(
-                phase="preflight",
-                description=description,
-                started=started,
-                error=(
-                    f"TGJIEMA_IMAGE 格式不合法(R71 P1-04 严格校验)— "
-                    + "; ".join(img_errors)
-                ),
-                readiness_checks=[
-                    {"check": "docker_daemon", "status": "pass"},
-                    {"check": "compose_file", "status": "pass"},
-                    {"check": "env_file", "status": "pass"},
-                    {"check": "image_digest", "status": "fail"},
-                ],
-            )
-    elif "@sha256:" not in tgjiema_image:
-        # 回退到宽松检查(仅当 validate_runtime_config_binding 模块不可用时)
+    # R72 P1-01: runtime binding 必须 fail-closed — 模块缺失、binding 失败
+    # 或 inspect 失败即整体失败,禁止回退到宽松字符串包含检查。
+    if not _RUNTIME_CONFIG_BINDING_AVAILABLE:
+        # R72 P1-01: 模块不可用是代码缺陷,不允许回退
         return _fail_result(
             phase="preflight",
             description=description,
             started=started,
             error=(
-                f"TGJIEMA_IMAGE 必须指向不可变 digest(@sha256:),"
-                f"实际值: {tgjiema_image!r} — "
-                f"R70 Wave 4 不可变镜像要求"
+                "R72 P1-01: validate_runtime_config_binding 模块不可用,"
+                "runtime binding 校验 fail-closed — 禁止回退到宽松字符串检查"
+            ),
+            readiness_checks=[
+                {"check": "docker_daemon", "status": "pass"},
+                {"check": "compose_file", "status": "pass"},
+                {"check": "env_file", "status": "pass"},
+                {"check": "image_digest", "status": "fail"},
+            ],
+        )
+    parsed, img_errors = validate_image_reference(
+        tgjiema_image,
+        DEFAULT_EXPECTED_REGISTRY,
+        DEFAULT_EXPECTED_REPOSITORY,
+    )
+    if parsed is None:
+        return _fail_result(
+            phase="preflight",
+            description=description,
+            started=started,
+            error=(
+                f"TGJIEMA_IMAGE 格式不合法(R72 P1-01 严格校验)— "
+                + "; ".join(img_errors)
             ),
             readiness_checks=[
                 {"check": "docker_daemon", "status": "pass"},
@@ -494,6 +610,79 @@ def phase_preflight(timeout: int) -> PhaseResult:
             ],
         )
 
+    # 6. R72 P0-05: 严格角色集合等价检查
+    # entrypoint 生产角色 == Compose SERVICE_ROLE 集合 == health ROLE_REQUIREMENTS 角色
+    entrypoint_roles = _get_entrypoint_roles()
+    compose_roles = {
+        v for v in SERVICE_ROLES.values() if v != "infrastructure"
+    }
+
+    health_roles: set[str] = set()
+    try:
+        from services.health import ROLE_REQUIREMENTS as _health_roles
+        health_roles = set(_health_roles.keys())
+    except ImportError:
+        health_roles = set()
+
+    # 别名归一化: health 使用 up_bot/idx_bot 等,entrypoint/compose 使用 up/idx
+    try:
+        from services.health import _ROLE_ALIASES as _aliases
+        normalized_health = set()
+        for r in health_roles:
+            found = False
+            for short_name, canonical in _aliases.items():
+                if canonical == r and short_name:
+                    normalized_health.add(short_name)
+                    found = True
+                    break
+            if not found:
+                normalized_health.add(r)
+        health_roles = normalized_health
+    except ImportError:
+        pass
+
+    role_mismatches: list[str] = []
+    if entrypoint_roles != compose_roles:
+        only_entrypoint = entrypoint_roles - compose_roles
+        only_compose = compose_roles - entrypoint_roles
+        if only_entrypoint or only_compose:
+            role_mismatches.append(
+                f"entrypoint vs compose: only_entrypoint={only_entrypoint or '{}'}, "
+                f"only_compose={only_compose or '{}'}"
+            )
+    if entrypoint_roles != health_roles:
+        only_entrypoint = entrypoint_roles - health_roles
+        only_health = health_roles - entrypoint_roles
+        if only_entrypoint or only_health:
+            role_mismatches.append(
+                f"entrypoint vs health: only_entrypoint={only_entrypoint or '{}'}, "
+                f"only_health={only_health or '{}'}"
+            )
+
+    base_checks = [
+        {"check": "docker_daemon", "status": "pass"},
+        {"check": "compose_file", "status": "pass"},
+        {"check": "env_file", "status": "pass"},
+        {"check": "image_digest", "status": "pass"},
+        {"check": "redis_passwords", "status": "pass"},
+    ]
+
+    if role_mismatches:
+        base_checks.append({"check": "role_set_equality", "status": "fail"})
+        return _fail_result(
+            phase="preflight",
+            description=description,
+            started=started,
+            error=(
+                f"R72 P0-05: 角色集合不一致 — "
+                f"{'; '.join(role_mismatches)} — "
+                f"entrypoint/compose/health 三方角色集合必须完全等价"
+            ),
+            readiness_checks=base_checks,
+        )
+
+    base_checks.append({"check": "role_set_equality", "status": "pass"})
+
     return _pass_result(
         phase="preflight",
         description=description,
@@ -506,14 +695,13 @@ def phase_preflight(timeout: int) -> PhaseResult:
             "redis_passwords_set": [
                 v for v in REQUIRED_ENV_VARS if v.startswith("REDIS_")
             ],
+            "role_sets": {
+                "entrypoint": sorted(entrypoint_roles),
+                "compose": sorted(compose_roles),
+                "health": sorted(health_roles),
+            },
         },
-        readiness_checks=[
-            {"check": "docker_daemon", "status": "pass"},
-            {"check": "compose_file", "status": "pass"},
-            {"check": "env_file", "status": "pass"},
-            {"check": "image_digest", "status": "pass"},
-            {"check": "redis_passwords", "status": "pass"},
-        ],
+        readiness_checks=base_checks,
     )
 
 
@@ -603,87 +791,89 @@ def phase_start_core(timeout: int) -> PhaseResult:
             ],
         )
 
-    # 等待 redis 健康检查通过(docker compose ps --format json)
+    # R72 P0-06: 逐服务严格断言(替代旧版"发现至少一个核心服务"弱断言)
+    # - redis-acl-init: exited 0
+    # - redis: running + healthy
+    # - migration: completed + exit 0
+    # - db_writer: running + healthy
+    # 缺少任一服务、状态未知或无法解析都必须失败。
     readiness_checks: list[dict[str, Any]] = [
         {"check": "docker_daemon", "status": "pass"},
         {"check": "compose_up", "status": "pass"},
     ]
-    ps_cmd = _compose_cmd(["ps", "--format", "json"])
-    ps_result = _run(ps_cmd, timeout=30, cwd=REPO_ROOT)
-    if ps_result.returncode != 0:
-        return _fail_result(
-            phase="start_core",
-            description=description,
-            started=started,
-            error="docker compose ps 失败,无法验证服务状态",
-            stdout=ps_result.stdout,
-            stderr=ps_result.stderr,
-            returncode=ps_result.returncode,
-            readiness_checks=readiness_checks + [
-                {"check": "service_status", "status": "fail"},
-            ],
-        )
 
-    # 解析 ps 输出,验证每个核心服务都在运行
-    service_statuses: dict[str, str] = {}
-    for line in ps_result.stdout.strip().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            svc_info = json.loads(line)
-            svc_name = svc_info.get("Service") or svc_info.get("service", "")
-            svc_state = (
-                svc_info.get("State")
-                or svc_info.get("state", "")
-                or svc_info.get("Status", "")
-                or ""
+    # 轮询等待所有核心服务达到期望状态
+    # (db_writer healthcheck start_period=90s,需要等待)
+    expected_core: dict[str, dict[str, str]] = {
+        "redis-acl-init": {"state": "exited", "health": ""},
+        "redis": {"state": "running", "health": "healthy"},
+        "migration": {"state": "exited", "health": ""},
+        "db_writer": {"state": "running", "health": "healthy"},
+    }
+    all_ready, service_info = _wait_for_services(
+        expected=expected_core, timeout_seconds=180, poll_interval=5,
+    )
+
+    # 逐服务断言
+    service_failures: list[str] = []
+    for svc, req in expected_core.items():
+        si = service_info.get(svc)
+        if si is None:
+            service_failures.append(
+                f"{svc}: 服务不存在(docker compose ps 未发现)"
             )
-            if svc_name:
-                service_statuses[svc_name] = svc_state
-        except json.JSONDecodeError:
-            # docker compose ps --format json 在新版输出单行 JSON 数组,
-            # 旧版输出多行 JSON 对象。尝试解析为数组。
+            readiness_checks.append({
+                "check": f"service_{svc}",
+                "status": "fail",
+                "reason": "not_found",
+            })
             continue
-
-    # 若 ps 输出为单个 JSON 数组(新版 docker compose)
-    if not service_statuses and ps_result.stdout.strip().startswith("["):
-        try:
-            svc_list = json.loads(ps_result.stdout.strip())
-            for svc_info in svc_list:
-                svc_name = svc_info.get("Service") or svc_info.get("service", "")
-                svc_state = (
-                    svc_info.get("State")
-                    or svc_info.get("state", "")
-                    or svc_info.get("Status", "")
-                    or ""
+        svc_ok = si["state"] == req["state"]
+        if req["health"]:
+            svc_ok = svc_ok and si["health"] == req["health"]
+        # 对 oneshot 服务(redis-acl-init, migration)额外检查 exit_code == 0
+        if req["state"] == "exited":
+            exit_code = si.get("exit_code")
+            svc_ok = svc_ok and (exit_code == 0)
+        readiness_checks.append({
+            "check": f"service_{svc}",
+            "status": "pass" if svc_ok else "fail",
+            "state": si["state"],
+            "health": si["health"],
+            "exit_code": si.get("exit_code"),
+            "expected_state": req["state"],
+            "expected_health": req["health"],
+        })
+        if not svc_ok:
+            reasons = [f"state={si['state']!r}(expected={req['state']!r})"]
+            if req["health"]:
+                reasons.append(
+                    f"health={si['health']!r}(expected={req['health']!r})"
                 )
-                if svc_name:
-                    service_statuses[svc_name] = svc_state
-        except json.JSONDecodeError:
-            pass
+            if req["state"] == "exited":
+                reasons.append(
+                    f"exit_code={si.get('exit_code')!r}(expected=0)"
+                )
+            service_failures.append(f"{svc}: {', '.join(reasons)}")
 
-    expected_services = set(CORE_SERVICES) | {"redis-acl-init", "migration"}
-    found_services = set(service_statuses.keys()) & expected_services
-    if not found_services:
+    if service_failures or not all_ready:
         return _fail_result(
             phase="start_core",
             description=description,
             started=started,
             error=(
-                f"docker compose ps 未发现核心服务 "
-                f"(expected={sorted(expected_services)}, "
-                f"got={sorted(service_statuses.keys())})"
+                f"R72 P0-06: 核心服务状态断言失败 — "
+                f"{'; '.join(service_failures) if service_failures else '等待超时(180s)'}"
             ),
-            stdout=ps_result.stdout,
-            stderr=ps_result.stderr,
-            evidence={"service_statuses": service_statuses},
-            readiness_checks=readiness_checks + [
-                {"check": "service_status", "status": "fail"},
-            ],
+            evidence={
+                "service_info": service_info,
+                "expected": expected_core,
+                "failures": service_failures,
+                "wait_timeout_seconds": 180,
+                "all_ready": all_ready,
+            },
+            readiness_checks=readiness_checks,
         )
-
-    readiness_checks.append({"check": "service_status", "status": "pass"})
 
     return _pass_result(
         phase="start_core",
@@ -693,8 +883,8 @@ def phase_start_core(timeout: int) -> PhaseResult:
         stderr=result.stderr,
         returncode=result.returncode,
         evidence={
-            "started_services": sorted(found_services),
-            "service_statuses": service_statuses,
+            "started_services": sorted(expected_core.keys()),
+            "service_info": service_info,
         },
         readiness_checks=readiness_checks,
     )
@@ -711,7 +901,7 @@ def phase_start_bots(timeout: int) -> PhaseResult:
     R71 P0-05 整改:旧版只启动 up/idx/dsp/mon/admin_bot 5 个 bot,
     缺少 admin/crdb_sync/db_backup/prometheus_exporter。
     R71 Wave 2: 启动全部业务服务(migration 是 oneshot,通过
-    depends_on 自动触发;r40_scheduler 不在 compose 文件中,故不启动)。
+    depends_on 自动触发;r40_scheduler 已在 R72 P0-04 中加入 compose)。
 
     readiness 检查点:
       - docker compose up -d <bots> 返回 0
@@ -759,68 +949,180 @@ def phase_start_bots(timeout: int) -> PhaseResult:
             ],
         )
 
-    # 验证所有 Bot 服务已启动
-    ps_cmd = _compose_cmd(["ps", "--format", "json"])
-    ps_result = _run(ps_cmd, timeout=30, cwd=REPO_ROOT)
-    service_statuses: dict[str, str] = {}
-    if ps_result.returncode == 0:
-        for line in ps_result.stdout.strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                svc_info = json.loads(line)
-                svc_name = svc_info.get("Service") or svc_info.get("service", "")
-                svc_state = (
-                    svc_info.get("State")
-                    or svc_info.get("state", "")
-                    or svc_info.get("Status", "")
-                    or ""
-                )
-                if svc_name:
-                    service_statuses[svc_name] = svc_state
-            except json.JSONDecodeError:
-                continue
-        # 新版 docker compose ps 输出 JSON 数组
-        if not service_statuses and ps_result.stdout.strip().startswith("["):
-            try:
-                svc_list = json.loads(ps_result.stdout.strip())
-                for svc_info in svc_list:
-                    svc_name = svc_info.get("Service") or svc_info.get("service", "")
-                    svc_state = (
-                        svc_info.get("State")
-                        or svc_info.get("state", "")
-                        or svc_info.get("Status", "")
-                        or ""
-                    )
-                    if svc_name:
-                        service_statuses[svc_name] = svc_state
-            except json.JSONDecodeError:
-                pass
-
-    missing_bots = [
-        s for s in BOT_SERVICES if s not in service_statuses
-    ]
-
-    readiness_checks = [
+    # R72 P0-07: 对每个长驻角色验证服务存在 + running + healthy
+    # restarting / exited / dead / unhealthy / starting / 状态未知 均失败
+    readiness_checks: list[dict[str, Any]] = [
         {"check": "docker_daemon", "status": "pass"},
         {"check": "compose_up", "status": "pass"},
-        {
-            "check": "bot_services_running",
-            "status": "pass" if not missing_bots else "fail",
-            "missing": missing_bots,
-        },
     ]
 
-    if missing_bots:
+    # 轮询等待所有 Bot 服务达到 running + healthy
+    # (healthcheck start_period 最高 90s)
+    expected_bots: dict[str, dict[str, str]] = {
+        svc: {"state": "running", "health": "healthy"} for svc in BOT_SERVICES
+    }
+    all_ready, service_info = _wait_for_services(
+        expected=expected_bots, timeout_seconds=180, poll_interval=5,
+    )
+
+    # 逐服务断言
+    service_failures: list[str] = []
+    for svc, req in expected_bots.items():
+        si = service_info.get(svc)
+        if si is None:
+            service_failures.append(f"{svc}: 服务不存在(docker compose ps 未发现)")
+            readiness_checks.append({
+                "check": f"service_{svc}",
+                "status": "fail",
+                "reason": "not_found",
+            })
+            continue
+        svc_ok = si["state"] == "running" and si["health"] == "healthy"
+        readiness_checks.append({
+            "check": f"service_{svc}",
+            "status": "pass" if svc_ok else "fail",
+            "state": si["state"],
+            "health": si["health"],
+        })
+        if not svc_ok:
+            service_failures.append(
+                f"{svc}: state={si['state']!r}, health={si['health']!r} "
+                f"(expected state='running', health='healthy')"
+            )
+
+    readiness_checks.append({
+        "check": "bot_services_healthy",
+        "status": "pass" if not service_failures else "fail",
+        "failures": service_failures,
+    })
+
+    if service_failures or not all_ready:
         return _fail_result(
             phase="start_bots",
             description=description,
             started=started,
-            error=f"Bot 服务未启动: {missing_bots}",
-            stdout=ps_result.stdout,
-            stderr=ps_result.stderr,
-            evidence={"service_statuses": service_statuses, "missing_bots": missing_bots},
+            error=(
+                f"R72 P0-07: Bot 服务状态断言失败 — "
+                f"{'; '.join(service_failures) if service_failures else '等待超时(180s)'}"
+            ),
+            stdout=result.stdout,
+            stderr=result.stderr,
+            evidence={
+                "service_info": service_info,
+                "failures": service_failures,
+                "wait_timeout_seconds": 180,
+                "all_ready": all_ready,
+            },
+            readiness_checks=readiness_checks,
+        )
+
+    # R72 P0-07: 验证每个 Bot 服务的 SERVICE_ROLE 环境变量 + RepoDigest
+    # 禁止只检查服务名存在,必须验证角色身份和镜像身份
+    role_failures: list[str] = []
+    digest_failures: list[str] = []
+    expected_image = os.environ.get("TGJIEMA_IMAGE", "")
+    expected_digest = ""
+    if "@" in expected_image:
+        expected_digest = expected_image.split("@", 1)[1]
+
+    for svc in BOT_SERVICES:
+        # 验证 SERVICE_ROLE 环境变量
+        role_cmd = _compose_cmd(["exec", "-T", svc, "printenv", "SERVICE_ROLE"])
+        role_result = _run(role_cmd, timeout=15, cwd=REPO_ROOT)
+        if role_result.returncode != 0 or not role_result.stdout.strip():
+            role_failures.append(f"{svc}: SERVICE_ROLE 未设置或读取失败")
+            readiness_checks.append({
+                "check": f"service_role_{svc}",
+                "status": "fail",
+                "reason": "env_not_set",
+            })
+        else:
+            actual_role = role_result.stdout.strip()
+            expected_role = SERVICE_ROLES.get(svc, "")
+            if actual_role != expected_role:
+                role_failures.append(
+                    f"{svc}: SERVICE_ROLE={actual_role!r} (expected={expected_role!r})"
+                )
+                readiness_checks.append({
+                    "check": f"service_role_{svc}",
+                    "status": "fail",
+                    "actual": actual_role,
+                    "expected": expected_role,
+                })
+            else:
+                readiness_checks.append({
+                    "check": f"service_role_{svc}",
+                    "status": "pass",
+                })
+
+        # R72 P1-02: 验证容器实际使用的 RepoDigest(不是环境变量请求的 digest)
+        inspect_cmd = [
+            "docker", "inspect",
+            "--format", "{{.Image}}|{{json .RepoDigests}}|{{.Config.Image}}",
+            f"tgjiema-{svc}",
+        ]
+        inspect_result = _run(inspect_cmd, timeout=10)
+        if inspect_result.returncode != 0:
+            digest_failures.append(f"{svc}: docker inspect 失败")
+            readiness_checks.append({
+                "check": f"repo_digest_{svc}",
+                "status": "fail",
+                "reason": "inspect_failed",
+            })
+        else:
+            inspect_output = inspect_result.stdout.strip()
+            parts = inspect_output.split("|")
+            container_image_id = parts[0] if len(parts) > 0 else ""
+            repo_digests_json = parts[1] if len(parts) > 1 else "[]"
+            config_image = parts[2] if len(parts) > 2 else ""
+            # 检查 RepoDigest 是否包含期望的 digest
+            if expected_digest and expected_digest not in repo_digests_json:
+                digest_failures.append(
+                    f"{svc}: RepoDigest 不匹配 "
+                    f"(expected contains {expected_digest[:24]}..., "
+                    f"actual={repo_digests_json[:60]}...)"
+                )
+                readiness_checks.append({
+                    "check": f"repo_digest_{svc}",
+                    "status": "fail",
+                    "expected_digest": expected_digest[:24] + "...",
+                    "actual_repo_digests": repo_digests_json[:60] + "...",
+                })
+            else:
+                readiness_checks.append({
+                    "check": f"repo_digest_{svc}",
+                    "status": "pass",
+                })
+
+    readiness_checks.append({
+        "check": "service_roles_verified",
+        "status": "pass" if not role_failures else "fail",
+        "failures": role_failures,
+    })
+    readiness_checks.append({
+        "check": "repo_digests_verified",
+        "status": "pass" if not digest_failures else "fail",
+        "failures": digest_failures,
+    })
+
+    if role_failures or digest_failures:
+        all_role_digest_failures = role_failures + digest_failures
+        return _fail_result(
+            phase="start_bots",
+            description=description,
+            started=started,
+            error=(
+                f"R72 P0-07: 角色身份/镜像 digest 验证失败 — "
+                f"{'; '.join(all_role_digest_failures)}"
+            ),
+            stdout=result.stdout,
+            stderr=result.stderr,
+            evidence={
+                "service_info": service_info,
+                "role_failures": role_failures,
+                "digest_failures": digest_failures,
+                "expected_image": expected_image,
+            },
             readiness_checks=readiness_checks,
         )
 
@@ -833,7 +1135,7 @@ def phase_start_bots(timeout: int) -> PhaseResult:
         returncode=result.returncode,
         evidence={
             "started_bots": BOT_SERVICES,
-            "service_statuses": service_statuses,
+            "service_info": service_info,
         },
         readiness_checks=readiness_checks,
     )
@@ -845,11 +1147,16 @@ def phase_start_bots(timeout: int) -> PhaseResult:
 
 
 def phase_migration_check(timeout: int) -> PhaseResult:
-    """阶段 4:运行 migration --check。
+    """阶段 4:运行 migration --check --json。
+
+    R72 P0-08: 不再依赖输出字符串是否含 "failed"。
+    使用结构化 JSON 输出,校验 applied/skipped/failed/pending/schema_version。
 
     readiness 检查点:
-      - docker compose exec db_writer python -m database.migrate --check 返回 0
-      - 输出包含 "applied" / "skipped"(无 "failed")
+      - docker compose exec db_writer python -m database.migrate --check --json 返回 0
+      - JSON 输出可解析
+      - failed 列表为空
+      - final_status == "ok"
     """
     description = PHASES[3][1]
     started = time.time()
@@ -863,9 +1170,10 @@ def phase_migration_check(timeout: int) -> PhaseResult:
             readiness_checks=[{"check": "docker_daemon", "status": "fail"}],
         )
 
+    # R72 P0-08: 使用 --json 获取结构化输出
     cmd = _compose_cmd([
         "exec", "-T", "db_writer",
-        "python", "-m", "database.migrate", "--check",
+        "python", "-m", "database.migrate", "--check", "--json",
     ])
     try:
         result = _run(cmd, timeout=timeout, cwd=REPO_ROOT)
@@ -874,7 +1182,7 @@ def phase_migration_check(timeout: int) -> PhaseResult:
             phase="migration_check",
             description=description,
             started=started,
-            error=f"migration --check 超时({timeout}s)",
+            error=f"migration --check --json 超时({timeout}s)",
             readiness_checks=[
                 {"check": "docker_daemon", "status": "pass"},
                 {"check": "migration_exec", "status": "timeout"},
@@ -899,7 +1207,7 @@ def phase_migration_check(timeout: int) -> PhaseResult:
             description=description,
             started=started,
             error=(
-                f"migration --check 失败 (exit={result.returncode}) — "
+                f"migration --check --json 失败 (exit={result.returncode}) — "
                 f"schema 可能未对齐"
             ),
             stdout=result.stdout,
@@ -912,26 +1220,92 @@ def phase_migration_check(timeout: int) -> PhaseResult:
             ],
         )
 
-    # 解析输出,验证无 failed
-    output = result.stdout + result.stderr
-    has_failed = "failed" in output.lower() and "0 failed" not in output.lower()
-    readiness_checks = [
+    # R72 P0-08: 解析结构化 JSON 输出
+    readiness_checks: list[dict[str, Any]] = [
         {"check": "docker_daemon", "status": "pass"},
         {"check": "migration_exec", "status": "pass"},
-        {
-            "check": "migration_no_failures",
-            "status": "fail" if has_failed else "pass",
-        },
     ]
-    if has_failed:
+
+    migration_evidence: dict[str, Any] = {}
+    try:
+        migration_evidence = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as e:
+        # R72 P0-08: JSON 解析失败是严重问题(fail-closed)
         return _fail_result(
             phase="migration_check",
             description=description,
             started=started,
-            error="migration 输出包含 failed — schema 漂移",
+            error=(
+                f"R72 P0-08: migration --json 输出不是合法 JSON: {e} — "
+                f"不得用字符串包含关系作为语义证据"
+            ),
             stdout=result.stdout,
             stderr=result.stderr,
             returncode=result.returncode,
+            readiness_checks=readiness_checks + [
+                {"check": "migration_json_parsed", "status": "fail"},
+            ],
+        )
+
+    readiness_checks.append({"check": "migration_json_parsed", "status": "pass"})
+
+    # R72 P0-08: 从结构化 JSON 中提取并校验关键字段
+    failed_migrations = migration_evidence.get("failed", [])
+    pending_migrations = migration_evidence.get("pending", [])
+    final_status = migration_evidence.get("final_status", "unknown")
+    current_version = migration_evidence.get("current_schema_version", 0)
+    expected_version = migration_evidence.get("expected_schema_version", 0)
+
+    readiness_checks.append({
+        "check": "migration_no_failures",
+        "status": "pass" if not failed_migrations else "fail",
+        "failed_count": len(failed_migrations),
+        "failed": failed_migrations,
+    })
+    readiness_checks.append({
+        "check": "migration_no_pending",
+        "status": "pass" if not pending_migrations else "fail",
+        "pending_count": len(pending_migrations),
+        "pending": pending_migrations,
+    })
+    readiness_checks.append({
+        "check": "migration_version_aligned",
+        "status": "pass" if current_version == expected_version else "fail",
+        "current_version": current_version,
+        "expected_version": expected_version,
+    })
+    readiness_checks.append({
+        "check": "migration_final_status",
+        "status": "pass" if final_status == "ok" else "fail",
+        "final_status": final_status,
+    })
+
+    # 任一结构化检查失败则整体失败
+    struct_failures = [
+        rc["check"] for rc in readiness_checks
+        if rc.get("status") == "fail"
+    ]
+    if struct_failures:
+        return _fail_result(
+            phase="migration_check",
+            description=description,
+            started=started,
+            error=(
+                f"R72 P0-08: 结构化 migration 校验失败 — "
+                f"failed_checks={struct_failures}, "
+                f"failed_migrations={failed_migrations}, "
+                f"pending_migrations={pending_migrations}, "
+                f"final_status={final_status}, "
+                f"current_version={current_version}, "
+                f"expected_version={expected_version}"
+            ),
+            stdout=result.stdout,
+            stderr=result.stderr,
+            returncode=result.returncode,
+            evidence={
+                "migration_evidence": migration_evidence,
+                "failed_checks": struct_failures,
+            },
             readiness_checks=readiness_checks,
         )
 
@@ -942,7 +1316,10 @@ def phase_migration_check(timeout: int) -> PhaseResult:
         stdout=result.stdout,
         stderr=result.stderr,
         returncode=result.returncode,
-        evidence={"output_contains_failed": has_failed},
+        evidence={
+            "migration_evidence": migration_evidence,
+            "exit_code": result.returncode,
+        },
         readiness_checks=readiness_checks,
     )
 
@@ -1713,143 +2090,18 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
         )
     readiness_checks.append({"check": "pre_snapshot", "status": "pass"})
 
-    # R71 RC36: CI 模式下跳过真实 R2 backup/restore(CI 无 R2 凭证 + 无真实 CockroachDB)。
-    # 原命令 `docker compose run --rm db_backup python -m services.db_backup` 会进入
-    # run_db_backup() 的 `while True:` 无限循环(守护进程模式),导致 600s 超时。
-    # 原命令 `docker compose run --rm db_writer python -m services.db_restore --staging`
-    # 缺少必需的 --backup-id 参数,且 --staging 未定义。
-    # CI 模式改为验证 verify_restore_integrity 模块的核心功能:
-    #   write_marker → take_snapshot → verify → cleanup(仅依赖 SQLite,不需要 R2)
-    # 真实 backup/restore 由 backup-restore-drill job(pytest 单元测试)和
-    # staging 环境验证。
-    _is_ci = (
-        os.environ.get("CI", "").lower() in ("true", "1")
-        or os.environ.get("GITHUB_ACTIONS", "").lower() in ("true", "1")
-    )
-    if _is_ci:
-        # CI 模式:验证 verify_restore_integrity 核心功能(不触发真实 R2 backup/restore)
-        # RC36 fix: 本文件无 _log_info(),改用 print 到 stderr(与 _print_result 模式一致)
-        print(
-            "[compose_runtime_e2e] R71 RC36: CI 模式,跳过真实 R2 backup/restore,"
-            "验证 verify_restore_integrity 核心功能",
-            file=sys.stderr, flush=True,
-        )
-
-        # 验证 verify() 基本校验(标记 + row count)
-        # verify() 返回 IntegrityEvidence 对象(不是 int),通过 .passed 判断
-        try:
-            verify_evidence = vri_module.verify(
-                trace_id=trace_id,
-                pre_snapshot_path=pre_snapshot_path,
-            )
-        except Exception as e:
-            cleanup_err = _safe_cleanup_marker(vri_module, trace_id)
-            if pre_snapshot_path.exists():
-                pre_snapshot_path.unlink(missing_ok=True)
-            return _fail_result(
-                phase="backup_restore",
-                description=description,
-                started=started,
-                error=f"CI 模式 verify() 异常: {type(e).__name__}: {e}"
-                     + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
-                readiness_checks=readiness_checks + [
-                    {"check": "backup_triggered", "status": "ci_skipped"},
-                    {"check": "restore_triggered", "status": "ci_skipped"},
-                    {"check": "data_integrity_verified", "status": "fail"},
-                ],
-            )
-        # verify() 返回 IntegrityEvidence,.passed 为 True 表示校验通过
-        verify_passed = bool(getattr(verify_evidence, "passed", False))
-        if not verify_passed:
-            cleanup_err = _safe_cleanup_marker(vri_module, trace_id)
-            if pre_snapshot_path.exists():
-                pre_snapshot_path.unlink(missing_ok=True)
-            _verify_err = getattr(verify_evidence, "error", None) or "未知错误"
-            _marker_found = getattr(verify_evidence, "marker_found", False)
-            _count_mismatches = getattr(verify_evidence, "count_mismatches", [])
-            return _fail_result(
-                phase="backup_restore",
-                description=description,
-                started=started,
-                error=(
-                    f"CI 模式 verify() 失败: passed=False, "
-                    f"marker_found={_marker_found}, "
-                    f"count_mismatches={_count_mismatches}, "
-                    f"error={_verify_err}"
-                ) + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
-                readiness_checks=readiness_checks + [
-                    {"check": "backup_triggered", "status": "ci_skipped"},
-                    {"check": "restore_triggered", "status": "ci_skipped"},
-                    {"check": "data_integrity_verified", "status": "fail"},
-                ],
-            )
-        readiness_checks.append({"check": "backup_triggered", "status": "ci_skipped"})
-        readiness_checks.append({"check": "restore_triggered", "status": "ci_skipped"})
-        readiness_checks.append({"check": "data_integrity_verified", "status": "pass"})
-        # CI 模式:schema_fingerprint / field_hashes / migration / app / synthetic / switch
-        # 标记为 ci_skipped(真实端到端 backup/restore 在 staging 环境验证)
-        for chk in [
-            "schema_fingerprint_captured",
-            "field_hashes_captured",
-            "migration_version_compatible",
-            "app_start_after_restore",
-            "app_read_write_after_restore",
-            "synthetic_transaction_after_restore",
-            "switch_rollback_evidence_generated",
-        ]:
-            readiness_checks.append({"check": chk, "status": "ci_skipped"})
-
-        # 清理测试标记
-        cleanup_err = _safe_cleanup_marker(vri_module, trace_id)
-        if cleanup_err:
-            return _fail_result(
-                phase="backup_restore",
-                description=description,
-                started=started,
-                error=f"CI 模式 cleanup_marker 失败: {cleanup_err}",
-                readiness_checks=readiness_checks + [
-                    {"check": "cleanup_marker", "status": "fail"},
-                ],
-            )
-        if pre_snapshot_path.exists():
-            pre_snapshot_path.unlink(missing_ok=True)
-        readiness_checks.append({"check": "cleanup_marker", "status": "pass"})
-
-        # 提取 verify() 证据的关键字段(避免 asdict 整对象序列化,
-        # 因 IntegrityEvidence @dataclass 含 Path 等不可序列化字段)
-        _verify_evidence_summary: dict[str, Any] = {
-            "passed": getattr(verify_evidence, "passed", None),
-            "marker_found": getattr(verify_evidence, "marker_found", None),
-            "timestamp": getattr(verify_evidence, "timestamp", None),
-            "count_mismatches": getattr(verify_evidence, "count_mismatches", []),
-            "error": getattr(verify_evidence, "error", None),
-        }
-
-        return PhaseResult(
-            phase="backup_restore",
-            description=description,
-            status="pass",
-            timestamp=_now_iso(),
-            duration_seconds=time.time() - started,
-            stdout="",
-            stderr="",
-            returncode=0,
-            error=None,
-            evidence={
-                "mode": "ci",
-                "trace_id": trace_id,
-                "verify_evidence": _verify_evidence_summary,
-                "note": "CI 模式: 跳过真实 R2 backup/restore, "
-                        "验证 verify_restore_integrity 核心功能(write_marker/take_snapshot/verify/cleanup)",
-            },
-            readiness_checks=readiness_checks,
-        )
-
-    # 非 CI 模式:执行真实 backup → restore → 完整结构化校验
-    # 触发 backup
+    # R72 P0-09/10: 删除 CI bypass — RC Runtime E2E 必须执行真实 backup/restore。
+    # 禁止 ci_skipped 后整体通过。缺少 R2 凭证或真实依赖时门禁必须 FAIL,
+    # 不得伪造成功。单元测试使用 mock;Compose RC 使用真实 production profile。
+    #
+    # R72 P0-10: 使用 db_backup backup --once(一次性备份,不进入 daemon 循环)
+    #             使用 db_restore --target staging --backup-id(显式恢复目标)
+    backup_evidence_path = REPO_ROOT / f".tmp_backup_evidence_{trace_id}.json"
     backup_cmd = _compose_cmd([
         "run", "--rm", "db_backup",
-        "python", "-m", "services.db_backup",
+        "python", "-m", "services.db_backup", "backup",
+        "--once",
+        "--output-json", str(backup_evidence_path),
     ])
     try:
         backup_result = _run(backup_cmd, timeout=timeout, cwd=REPO_ROOT)
@@ -1861,7 +2113,7 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
             phase="backup_restore",
             description=description,
             started=started,
-            error=f"backup 触发超时({timeout}s)"
+            error=f"R72 P0-10: backup --once 触发超时({timeout}s)"
                  + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
             readiness_checks=readiness_checks + [
                 {"check": "backup_triggered", "status": "timeout"},
@@ -1875,7 +2127,7 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
             phase="backup_restore",
             description=description,
             started=started,
-            error=f"backup 失败 (exit={backup_result.returncode})"
+            error=f"R72 P0-10: backup --once 失败 (exit={backup_result.returncode})"
                  + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
             stdout=backup_result.stdout,
             stderr=backup_result.stderr,
@@ -1886,10 +2138,57 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
         )
     readiness_checks.append({"check": "backup_triggered", "status": "pass"})
 
-    # 触发 restore(到 staging,不覆盖生产数据)
+    # R72 P0-10: 从 backup evidence JSON 解析 backup_id,传给 restore
+    backup_id = ""
+    backup_evidence: dict[str, Any] = {}
+    try:
+        if backup_evidence_path.is_file():
+            backup_evidence = json.loads(backup_evidence_path.read_text(encoding="utf-8"))
+            backup_id = str(backup_evidence.get("backup_id", ""))
+    except (json.JSONDecodeError, OSError) as e:
+        # evidence 解析失败是严重问题(fail-closed)
+        cleanup_err = _safe_cleanup_marker(vri_module, trace_id)
+        if pre_snapshot_path.exists():
+            pre_snapshot_path.unlink(missing_ok=True)
+        return _fail_result(
+            phase="backup_restore",
+            description=description,
+            started=started,
+            error=f"R72 P0-10: backup evidence JSON 解析失败: {type(e).__name__}: {e}"
+                 + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
+            stdout=backup_result.stdout,
+            stderr=backup_result.stderr,
+            readiness_checks=readiness_checks + [
+                {"check": "backup_id_parsed", "status": "fail"},
+            ],
+        )
+    if not backup_id:
+        # backup_id 为空说明 backup --once 未产生有效 evidence(fail-closed)
+        cleanup_err = _safe_cleanup_marker(vri_module, trace_id)
+        if pre_snapshot_path.exists():
+            pre_snapshot_path.unlink(missing_ok=True)
+        return _fail_result(
+            phase="backup_restore",
+            description=description,
+            started=started,
+            error="R72 P0-10: backup evidence 缺少 backup_id 字段 — backup --once 未产生有效证据"
+                 + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
+            stdout=backup_result.stdout,
+            stderr=backup_result.stderr,
+            readiness_checks=readiness_checks + [
+                {"check": "backup_id_parsed", "status": "fail"},
+            ],
+        )
+    readiness_checks.append({"check": "backup_id_parsed", "status": "pass"})
+
+    # R72 P0-10: 触发 restore --target staging --backup-id(隔离目标,不覆盖生产数据)
+    restore_evidence_path = REPO_ROOT / f".tmp_restore_evidence_{trace_id}.json"
     restore_cmd = _compose_cmd([
         "run", "--rm", "db_writer",
-        "python", "-m", "services.db_restore", "--staging",
+        "python", "-m", "services.db_restore",
+        "--backup-id", backup_id,
+        "--target", "staging",
+        "--output-json", str(restore_evidence_path),
     ])
     try:
         restore_result = _run(restore_cmd, timeout=timeout, cwd=REPO_ROOT)
@@ -2004,10 +2303,12 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
     })
 
     switch_ev = verify_evidence.get("switch_rollback_evidence", {}) or {}
+    # R72 P0-12: switch/rollback 必须 orchestrator_available + 实际执行 + 通过
+    # 不再只检查 has_switch_phase/has_rollback_phase 字段存在(import check)
     switch_ok = (
         bool(switch_ev.get("orchestrator_available", False))
-        and bool(switch_ev.get("has_switch_phase", False))
-        and bool(switch_ev.get("has_rollback_phase", False))
+        and bool(switch_ev.get("orchestrator_executed", False))
+        and bool(switch_ev.get("passed", False))
     )
     readiness_checks.append({
         "check": "switch_rollback_evidence_generated",
@@ -2024,6 +2325,13 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
         cleanup_err = None
     if pre_snapshot_path.exists():
         pre_snapshot_path.unlink(missing_ok=True)
+    # R72 P0-10: 清理 backup/restore evidence 临时文件
+    for _tmp in (backup_evidence_path, restore_evidence_path):
+        try:
+            if _tmp.exists():
+                _tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     readiness_checks.append({
         "check": "cleanup_marker",
@@ -2072,13 +2380,15 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
         returncode=restore_result.returncode,
         evidence={
             "trace_id": trace_id,
+            "backup_id": backup_id,
+            "backup_evidence": backup_evidence,
             "verify_evidence": verify_evidence,
             "backup_stdout_tail": backup_result.stdout[-500:],
             "restore_stdout_tail": restore_result.stdout[-500:],
             "integrity_method": "verify_full_structured_verification",
             "target_db": "staging",
             "cleanup_rc": cleanup_rc,
-            "wave": "r71-wave3-p0-08",
+            "wave": "r72-p0-09-10",
         },
         readiness_checks=readiness_checks,
     )
@@ -2092,10 +2402,18 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
 def phase_sigterm(timeout: int) -> PhaseResult:
     """阶段 9:发送 SIGTERM,验证优雅关闭。
 
+    R72 P0-13 整改:不再只阻断 exit code 137。
+    对每个长驻角色:
+      - exit code 0 或 143 (SIGTERM) 视为正常退出
+      - exit code 137 (SIGKILL) 失败
+      - exit code 1 失败
+      - 仍 running 失败
+      - 状态未知失败
+
     readiness 检查点:
       - docker compose kill -s SIGTERM 返回 0
-      - 所有容器退出码为 0(SIGTERM 优雅退出)或 137(SIGKILL,视为失败)
-      - 容器退出时间 < stop_timeout(无 SIGKILL)
+      - 每个长驻角色 exit code 为 0 或 143
+      - 无 SIGKILL(137)/ exit 1 / 仍 running / 状态未知
     """
     description = PHASES[8][1]
     started = time.time()
@@ -2145,57 +2463,97 @@ def phase_sigterm(timeout: int) -> PhaseResult:
         {"check": "sigterm_sent", "status": "pass"},
     ]
 
-    # 等待容器退出(最多 30s)
-    time.sleep(5)
+    # R72 P0-13: 轮询等待所有长驻角色退出,然后逐服务验证退出码
+    # 长驻服务 = redis + db_writer + 所有 BOT_SERVICES
+    # (redis-acl-init / migration 是 oneshot,不在此阶段验证)
+    long_running_services: set[str] = set(CORE_SERVICES) | set(BOT_SERVICES) | {"redis"}
 
-    # 检查每个容器退出码
-    ps_cmd = _compose_cmd(["ps", "-a", "--format", "json"])
-    ps_result = _run(ps_cmd, timeout=30, cwd=REPO_ROOT)
-    exit_codes: dict[str, int | None] = {}
-    if ps_result.returncode == 0:
-        for line in ps_result.stdout.strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                svc_info = json.loads(line)
-                svc_name = svc_info.get("Service") or svc_info.get("service", "")
-                if svc_name:
-                    # ExitCode 字段可能不存在(running 状态)
-                    exit_code = svc_info.get("ExitCode")
-                    if exit_code is None:
-                        # 尝试从 Status 解析
-                        status = svc_info.get("Status", "") or svc_info.get("State", "")
-                        if "exited" in str(status).lower():
-                            exit_code = -1
-                    exit_codes[svc_name] = (
-                        int(exit_code) if exit_code is not None else None
-                    )
-            except (json.JSONDecodeError, ValueError, TypeError):
-                continue
+    # 轮询等待所有长驻服务达到 exited 状态(最多 30s)
+    wait_deadline = time.time() + 30
+    service_info: dict[str, dict[str, Any]] = {}
+    all_exited = False
+    while time.time() < wait_deadline:
+        service_info = _get_compose_ps_info(include_exited=True)
+        all_exited = True
+        for svc in long_running_services:
+            si = service_info.get(svc)
+            if si is None or si["state"] != "exited":
+                all_exited = False
+                break
+        if all_exited:
+            break
+        time.sleep(2)
 
-    # 验证无 SIGKILL(exit code 137)
-    sigkill_services = [
-        name for name, code in exit_codes.items() if code == 137
-    ]
+    # 逐服务验证退出码
+    exit_code_results: dict[str, dict[str, Any]] = {}
+    failures: list[str] = []
+    for svc in sorted(long_running_services):
+        si = service_info.get(svc)
+        if si is None:
+            exit_code_results[svc] = {
+                "status": "unknown", "reason": "not_found",
+            }
+            failures.append(f"{svc}: 状态未知(docker compose ps 未发现)")
+            continue
+        state = si["state"]
+        exit_code = si.get("exit_code")
+        if state == "running":
+            exit_code_results[svc] = {
+                "state": state,
+                "exit_code": exit_code,
+                "status": "fail",
+                "reason": "still_running",
+            }
+            failures.append(f"{svc}: 仍 running(SIGTERM 后未退出)")
+            continue
+        if state == "exited":
+            if exit_code in (0, 143):
+                exit_code_results[svc] = {
+                    "state": state,
+                    "exit_code": exit_code,
+                    "status": "pass",
+                }
+                continue
+            exit_code_results[svc] = {
+                "state": state,
+                "exit_code": exit_code,
+                "status": "fail",
+                "reason": f"unexpected_exit_code_{exit_code}",
+            }
+            failures.append(
+                f"{svc}: exit code={exit_code}(期望 0 或 143 SIGTERM)"
+            )
+            continue
+        # restarting / dead / unknown state
+        exit_code_results[svc] = {
+            "state": state,
+            "exit_code": exit_code,
+            "status": "fail",
+            "reason": f"unexpected_state_{state}",
+        }
+        failures.append(f"{svc}: state={state}(期望 exited)")
+
     readiness_checks.append({
-        "check": "no_sigkill",
-        "status": "pass" if not sigkill_services else "fail",
-        "sigkill_services": sigkill_services,
+        "check": "exit_codes_verified",
+        "status": "pass" if not failures else "fail",
+        "services": exit_code_results,
+        "failures": failures,
     })
 
-    if sigkill_services:
+    if failures:
         return _fail_result(
             phase="sigterm",
             description=description,
             started=started,
             error=(
-                f"以下服务被 SIGKILL 强制终止(未优雅处理 SIGTERM): "
-                f"{sigkill_services}"
+                f"R72 P0-13: SIGTERM 退出码验证失败 — "
+                f"{'; '.join(failures)}"
             ),
-            stdout=ps_result.stdout,
-            stderr=ps_result.stderr,
-            evidence={"exit_codes": exit_codes, "sigkill_services": sigkill_services},
+            evidence={
+                "exit_codes": exit_code_results,
+                "failures": failures,
+                "all_exited": all_exited,
+            },
             readiness_checks=readiness_checks,
         )
 
@@ -2206,7 +2564,7 @@ def phase_sigterm(timeout: int) -> PhaseResult:
         stdout=kill_result.stdout,
         stderr=kill_result.stderr,
         returncode=kill_result.returncode,
-        evidence={"exit_codes": exit_codes},
+        evidence={"exit_codes": exit_code_results},
         readiness_checks=readiness_checks,
     )
 
@@ -2219,10 +2577,15 @@ def phase_sigterm(timeout: int) -> PhaseResult:
 def phase_restart(timeout: int) -> PhaseResult:
     """阶段 10:restart 验证可恢复。
 
+    R72 P0-14 整改:不再只检查 running。
+    restart 后必须重新执行:
+      - 所有服务 running
+      - Docker health 为 healthy(对有 healthcheck 的服务)
+
     readiness 检查点:
       - docker compose up -d 返回 0
       - 所有服务重新进入 running 状态
-      - redis healthcheck 重新通过
+      - 所有有 healthcheck 的服务 Docker health 为 healthy
     """
     description = PHASES[9][1]
     started = time.time()
@@ -2266,62 +2629,108 @@ def phase_restart(timeout: int) -> PhaseResult:
             ],
         )
 
-    # 等待服务就绪(start_period 60s,等待 30s 应足够)
-    time.sleep(15)
+    # R72 P0-14: restart 后必须重新验证所有服务 running + healthy
+    # 不再只检查 running。
+    # 所有服务(包括 redis + redis-acl-init + migration)都需要验证:
+    # - redis-acl-init / migration: exited 0(oneshot 已完成)
+    # - redis + db_writer + 所有 BOT_SERVICES: running + healthy
+    expected_services: dict[str, dict[str, str]] = {
+        "redis-acl-init": {"state": "exited", "health": ""},
+        "migration": {"state": "exited", "health": ""},
+        "redis": {"state": "running", "health": "healthy"},
+        "db_writer": {"state": "running", "health": "healthy"},
+    }
+    for svc in BOT_SERVICES:
+        expected_services[svc] = {"state": "running", "health": "healthy"}
 
-    # 验证服务重新运行
-    ps_cmd = _compose_cmd(["ps", "--format", "json"])
-    ps_result = _run(ps_cmd, timeout=30, cwd=REPO_ROOT)
-    running_services: list[str] = []
-    if ps_result.returncode == 0:
-        for line in ps_result.stdout.strip().splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                svc_info = json.loads(line)
-                svc_name = svc_info.get("Service") or svc_info.get("service", "")
-                svc_state = (
-                    svc_info.get("State")
-                    or svc_info.get("state", "")
-                    or svc_info.get("Status", "")
-                    or ""
-                )
-                if svc_name and "running" in str(svc_state).lower():
-                    running_services.append(svc_name)
-            except json.JSONDecodeError:
-                continue
+    # 轮询等待所有服务达到期望状态(healthcheck start_period 最高 90s)
+    all_ready, service_info = _wait_for_services(
+        expected=expected_services, timeout_seconds=180, poll_interval=5,
+    )
 
-    expected_running = set(CORE_SERVICES) | set(BOT_SERVICES)
-    found_running = set(running_services) & expected_running
-    restart_ok = len(found_running) >= len(expected_running)
-
-    readiness_checks = [
+    # 逐服务断言
+    service_failures: list[str] = []
+    readiness_checks: list[dict[str, Any]] = [
         {"check": "docker_daemon", "status": "pass"},
         {"check": "compose_up", "status": "pass"},
-        {
-            "check": "services_running_after_restart",
-            "status": "pass" if restart_ok else "fail",
-            "expected": sorted(expected_running),
-            "found": sorted(found_running),
-        },
     ]
+    for svc, req in expected_services.items():
+        si = service_info.get(svc)
+        if si is None:
+            service_failures.append(
+                f"{svc}: 服务不存在(docker compose ps 未发现)"
+            )
+            readiness_checks.append({
+                "check": f"service_{svc}",
+                "status": "fail",
+                "reason": "not_found",
+            })
+            continue
+        svc_ok = si["state"] == req["state"]
+        if req["health"]:
+            svc_ok = svc_ok and si["health"] == req["health"]
+        # 对 oneshot 服务检查 exit_code == 0
+        if req["state"] == "exited":
+            exit_code = si.get("exit_code")
+            svc_ok = svc_ok and (exit_code == 0)
+        readiness_checks.append({
+            "check": f"service_{svc}",
+            "status": "pass" if svc_ok else "fail",
+            "state": si["state"],
+            "health": si["health"],
+            "exit_code": si.get("exit_code"),
+        })
+        if not svc_ok:
+            service_failures.append(
+                f"{svc}: state={si['state']!r}, health={si['health']!r} "
+                f"(expected state={req['state']!r}, health={req['health']!r})"
+            )
 
-    if not restart_ok:
+    readiness_checks.append({
+        "check": "services_healthy_after_restart",
+        "status": "pass" if not service_failures else "fail",
+        "expected": sorted(expected_services.keys()),
+        "failures": service_failures,
+    })
+
+    if service_failures or not all_ready:
         return _fail_result(
             phase="restart",
             description=description,
             started=started,
             error=(
-                f"restart 后服务未恢复运行: "
-                f"expected={sorted(expected_running)}, "
-                f"found={sorted(found_running)}"
+                f"R72 P0-14: restart 后服务未恢复 healthy — "
+                f"{'; '.join(service_failures) if service_failures else '等待超时(180s)'}"
             ),
-            stdout=ps_result.stdout,
-            stderr=ps_result.stderr,
             evidence={
-                "running_services": running_services,
-                "expected": sorted(expected_running),
+                "service_info": service_info,
+                "failures": service_failures,
+                "wait_timeout_seconds": 180,
+                "all_ready": all_ready,
+            },
+            readiness_checks=readiness_checks,
+        )
+
+    # R72 P0-14: restart 后必须重新执行真实业务交易
+    # 不再只检查 running — 必须验证完整业务链(上传→索引→解码→派送→SQLite→幂等)
+    synth_passed, synth_evidence = _run_synthetic_transaction(timeout=timeout)
+    readiness_checks.append({
+        "check": "business_transaction_after_restart",
+        "status": "pass" if synth_passed else "fail",
+    })
+    if not synth_passed:
+        return _fail_result(
+            phase="restart",
+            description=description,
+            started=started,
+            error=(
+                f"R72 P0-14: restart 后业务交易验证失败 — "
+                f"readiness 恢复但业务链不可用: "
+                f"{synth_evidence.get('error', '未知错误')}"
+            ),
+            evidence={
+                "service_info": service_info,
+                "synthetic_transaction": synth_evidence,
             },
             readiness_checks=readiness_checks,
         )
@@ -2333,7 +2742,11 @@ def phase_restart(timeout: int) -> PhaseResult:
         stdout=result.stdout,
         stderr=result.stderr,
         returncode=result.returncode,
-        evidence={"running_services": running_services},
+        evidence={
+            "service_info": service_info,
+            "expected": sorted(expected_services.keys()),
+            "synthetic_transaction": synth_evidence,
+        },
         readiness_checks=readiness_checks,
     )
 
@@ -2448,9 +2861,12 @@ def _get_source_sha() -> str:
 
 
 def _get_image_repo_digest() -> str:
-    """R71 Wave 2: 获取 TGJIEMA_IMAGE 的 RepoDigests。
+    """R71 Wave 2 / R72 P1-02: 获取 TGJIEMA_IMAGE 的 RepoDigests。
 
-    fail-closed:docker 不可用时返回空字符串。
+    R72 P1-02: 禁止在 docker inspect 失败时返回输入的 TGJIEMA_IMAGE 环境变量值
+    (那会把"请求的 digest"冒充"实际拉取并运行的 RepoDigest")。
+    inspect 失败、返回非 0、或 RepoDigests 为空时一律返回空字符串(fail-closed),
+    调用方必须将空值视为校验失败。
     """
     tgjiema_image = os.environ.get("TGJIEMA_IMAGE", "")
     if not tgjiema_image:
@@ -2464,10 +2880,14 @@ def _get_image_repo_digest() -> str:
             timeout=10,
         )
         if result.returncode == 0:
-            return result.stdout.strip()
+            digest = result.stdout.strip()
+            # R72 P1-02: 空数组 "[]" 或空字符串也视为失败
+            if digest and digest != "[]":
+                return digest
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
-    return tgjiema_image  # 回退到环境变量值
+    # R72 P1-02: 不得回退到 TGJIEMA_IMAGE 环境变量值 — 返回空字符串让调用方失败
+    return ""
 
 
 def _get_compose_digest() -> str:

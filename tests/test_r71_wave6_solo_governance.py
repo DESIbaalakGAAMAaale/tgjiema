@@ -9,30 +9,29 @@ R71 P1-01/02/03 (Wave 6) 整改背景:
         无法批准自己的 PR)
     同时 R70 ruleset strict_merge=false,允许 stale parent commit 通过 status
     check(违反 current-SHA binding 原则);且 required_status_checks 缺少
-    R71 Wave 2/4/5/7 新增的 14 个 context(compose-runtime-e2e /
-    validate-oci-rootfs / verify-rc-identity / bind-runtime-config 等)。
+    R71 Wave 4/7 新增的 context(validate-oci-rootfs / bind-runtime-config 等)。
 
-R71 Wave 6 整改(P1-01/02/03, Commit 6):
+R71 Wave 6 整改(P1-01/02/03, Commit 6) + R72 P1-06 修订:
     1. .github/branch_ruleset.expected.json:
        - 用单一 "R71 Solo Founder Branch Ruleset" 替换两个旧 ruleset
        - required_reviewers=0(solo founder,无审批死锁)
        - require_code_owner_review=false(CODEOWNERS 保留但不阻断)
        - strict_merge=true(current-SHA,不允许 stale parent commit)
-       - required_status_checks 含 36 个 context(覆盖所有真实 release-gates.yml job;
-         Wave 7 新增 bind-runtime-config,从 35 扩展到 36)
+       - required_status_checks 含 29 个 context(仅 PR/master 事件可产生的 check;
+         R72 P1-06 移除 8 个 tag-only/environment-only check,从 36 缩减到 29)
        - bypass_actors=[](无 admin bypass;紧急情况通过 record_break_glass.py)
     2. .github/branch_protection.expected.json:
        - required_approving_review_count: 0(solo founder)
        - require_code_owner_reviews: false
        - required_status_checks.strict: true
-       - contexts 覆盖 36 个 release gates(含 R71 Wave 2/4/5/7 新增 14 个)
+       - contexts 覆盖 29 个 release gates(R72 P1-06 移除 tag-only/environment-only)
     3. scripts/configure_branch_ruleset.sh:
        - 完全重写为单一 R71 Solo Founder Ruleset 配置
        - 保留 --dry-run / --help / 幂等性(PUT/POST)
        - 自检断言更新为 solo-founder 语义
     4. scripts/verify_branch_ruleset.sh:
        - 完全重写为 solo-founder 语义断言
-       - 断言 required_reviewers == 0 / strict_merge == true / 36 contexts
+       - 断言 required_reviewers == 0 / strict_merge == true / 29 contexts
     5. scripts/record_break_glass.py(新文件):
        - Break-glass 紧急手动 override 审计日志(JSONL 格式)
        - 强制 typed_confirmation == "BREAK-GLASS-EMERGENCY"
@@ -46,15 +45,19 @@ R71 Wave 6 整改(P1-01/02/03, Commit 6):
     - scripts/verify_branch_ruleset.sh(验证脚本静态断言)
     - scripts/record_break_glass.py(break-glass 审计日志 CLI)
 
-测试覆盖矩阵(40+ 个测试):
+测试覆盖矩阵(60+ 个测试):
     A. branch_ruleset.expected.json schema 与内容(10 个)
     B. branch_protection.expected.json solo-founder 语义(8 个)
     C. configure_branch_ruleset.sh 静态检查 + --dry-run(8 个)
     D. verify_branch_ruleset.sh solo-founder 断言(6 个)
-    E. record_break_glass.py 模块结构与常量(4 个)
+    E. record_break_glass.py 模块结构与常量(10 个,含 R72 P1-07 常量与 issue_url 字段)
     F. record_break_glass.py 输入校验(8 个)
-    G. record_break_glass.py JSONL 持久化(6 个)
-    H. record_break_glass.py CLI 退出码(4 个)
+    G. record_break_glass.py JSONL 持久化(6 个,create_issue=False 模式)
+    H. record_break_glass.py CLI 退出码(4 个,--no-create-issue 模式)
+    I. record_break_glass.py 端到端验证(--no-create-issue 模式)
+    J. R72 P1-07: create_github_issue() 函数(mocked gh CLI)(7 个)
+    K. R72 P1-07: record_break_glass() create_issue=True(mocked)(3 个)
+    L. R72 P1-07: CLI --no-create-issue / --repo 标志(3 个)
 
 测试策略:
     - Windows 兼容(无 Docker / 无 gh CLI / 无 jq 时仍可运行)
@@ -80,30 +83,32 @@ CONFIGURE_RULESET_SH = REPO_ROOT / "scripts" / "configure_branch_ruleset.sh"
 VERIFY_RULESET_SH = REPO_ROOT / "scripts" / "verify_branch_ruleset.sh"
 RECORD_BREAK_GLASS_PY = REPO_ROOT / "scripts" / "record_break_glass.py"
 
-# R71 P1-02: 36 个必需 status checks(覆盖所有真实 release-gates.yml job 名)
+# R71 P1-02 / R72 P1-06: 29 个必需 status checks(仅 PR/master 事件可产生的 check)
 # 与 .github/branch_ruleset.expected.json / configure_branch_ruleset.sh 保持一致
+# R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
+# sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
+# migration-binding-gate / verify-rc-identity / production-promotion-gate)
 EXPECTED_REQUIRED_CHECKS: list[str] = [
     "lint", "static-gates", "test",
     "docker-build", "docker-digest-verify", "compose-config",
     "redis-acl-matrix", "schema-diff", "restore-legacy-seal-gate",
     "i18n-strict-export-boundary-gate", "migration-manifest-gate",
-    "migration-binding-gate", "button-flow-real-ux-gate",
+    "button-flow-real-ux-gate",
     "backup-restore-drill", "sbom", "pip-audit", "trivy",
-    "sign-image", "verify-branch-protection", "verify-branch-ruleset",
-    "verify-git-source-governance", "rc-continuity", "publish-attestation",
-    "attestation-semantics-verify", "verify-only-3x", "tag-ruleset-verify",
+    "sign-artifacts", "verify-branch-protection", "verify-branch-ruleset",
+    "verify-git-source-governance", "rc-continuity",
+    "tag-ruleset-verify",
     "crdb-ru-72h-attribution-gate", "production-evidence",
-    "production-promotion-gate", "oci-allowlist-verify",
+    "oci-allowlist-verify",
     "validate-oci-rootfs", "runtime-smoke-compose",
-    "compose-runtime-e2e", "verify-rc-identity",
     "bind-runtime-config", "release-summary",
 ]
 
-# R71 Wave 2/4/5/7 新增的 context(必须出现在 ruleset 与 BP 中)
+# R71 Wave 4/7 新增的 context(必须出现在 ruleset 与 BP 中)
+# R72 P1-06: 移除 Wave 2(compose-runtime-e2e)与 Wave 5(verify-rc-identity)—
+#   它们是 tag-only / environment-only 的 check,不在 PR/master 事件产出
 R71_NEW_CONTEXTS: list[str] = [
-    "compose-runtime-e2e",  # Wave 2
     "validate-oci-rootfs",  # Wave 4
-    "verify-rc-identity",   # Wave 5
     "bind-runtime-config",  # Wave 7
 ]
 
@@ -310,12 +315,14 @@ class TestBranchRulesetExpectedJson:
             "(current-SHA,不允许 stale parent commit)"
         )
 
-    def test_required_status_checks_has_36_contexts(self, expected: dict):
-        """R71 P1-02: required_status_checks 覆盖 36 个真实 release-gates.yml job 名。
+    def test_required_status_checks_has_29_contexts(self, expected: dict):
+        """R71 P1-02 / R72 P1-06: required_status_checks 覆盖 29 个 PR/master-event check。
 
-        旧版 R70 只有 5 个 required checks,缺少 R71 Wave 2/4/5/7 新增的 14 个
-        context(compose-runtime-e2e / validate-oci-rootfs / verify-rc-identity /
-        bind-runtime-config 等)。
+        旧版 R70 只有 5 个 required checks,R71 扩展到 36 个。R72 P1-06 移除 8 个
+        tag-only/environment-only 的 check(compose-runtime-e2e / sign-image /
+        publish-attestation / attestation-semantics-verify / verify-only-3x /
+        migration-binding-gate / verify-rc-identity / production-promotion-gate),
+        因为它们不在 PR/master 事件产出 check,会造成合并死锁。
 
         R71 fix: Ruleset API 参数名为 required_status_checks(非 required_checks)。
         """
@@ -323,13 +330,13 @@ class TestBranchRulesetExpectedJson:
         assert len(rsc_rules) == 1
         params = rsc_rules[0]["parameters"]
         contexts = [c["context"] for c in params["required_status_checks"]]
-        assert len(contexts) >= 36, (
-            f"R71 P1-02: 至少需要 36 个 required_status_checks.contexts, "
+        assert len(contexts) >= 29, (
+            f"R71 P1-02 / R72 P1-06: 至少需要 29 个 required_status_checks.contexts, "
             f"实际: {len(contexts)}"
         )
 
     def test_required_status_checks_includes_all_expected_contexts(self, expected: dict):
-        """R71 P1-02: 所有期望的 36 个 context 都必须出现。"""
+        """R71 P1-02: 所有期望的 29 个 context 都必须出现。"""
         rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
         assert len(rsc_rules) == 1
         params = rsc_rules[0]["parameters"]
@@ -340,7 +347,7 @@ class TestBranchRulesetExpectedJson:
             )
 
     def test_required_status_checks_includes_r71_new_contexts(self, expected: dict):
-        """R71 P1-02: 特别验证 R71 Wave 2/4/5/7 新增的 context。"""
+        """R71 P1-02: 特别验证 R71 Wave 4/7 新增的 context(R72 P1-06 移除 Wave 2/5)。"""
         rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
         assert len(rsc_rules) == 1
         params = rsc_rules[0]["parameters"]
@@ -442,14 +449,12 @@ class TestBranchProtectionExpectedJson:
     def test_required_status_checks_includes_r71_new_contexts(
         self, bp_expected: dict
     ):
-        """R71 P1-02: BP 包含 R71 Wave 2/4/5/7 新增的 14 个 context。
+        """R71 P1-02: BP 包含 R71 Wave 4/7 新增的 context(R72 P1-06 移除 Wave 2/5)。
 
-        旧版缺少:migration-binding-gate / attestation-semantics-verify /
-        verify-only-3x / tag-ruleset-verify / production-evidence /
-        production-promotion-gate / publish-attestation / sign-image /
-        verify-branch-protection / verify-git-source-governance /
-        validate-oci-rootfs / compose-runtime-e2e / verify-rc-identity /
-        bind-runtime-config
+        R72 P1-06 移除的 tag-only/environment-only check(不在 BP 必需列表中):
+        compose-runtime-e2e / sign-image / publish-attestation /
+        attestation-semantics-verify / verify-only-3x / migration-binding-gate /
+        verify-rc-identity / production-promotion-gate
         """
         contexts = bp_expected["required_status_checks"]["contexts"]
         for ctx in R71_NEW_CONTEXTS:
@@ -569,26 +574,26 @@ class TestConfigureBranchRulesetScript:
             "configure_branch_ruleset.sh 应保留 PUT/POST 幂等性逻辑"
         )
 
-    def test_script_includes_36_required_checks(self, script_content: str):
-        """R71 P1-02: 脚本默认 REQUIRED_STATUS_CHECKS 包含全部 36 个 context。"""
+    def test_script_includes_29_required_checks(self, script_content: str):
+        """R71 P1-02 / R72 P1-06: 脚本默认 REQUIRED_STATUS_CHECKS 包含全部 29 个 context。"""
         for ctx in EXPECTED_REQUIRED_CHECKS:
             assert ctx in script_content, (
                 f"configure_branch_ruleset.sh 缺少 REQUIRED_STATUS_CHECKS context: {ctx}"
             )
 
     def test_script_includes_r71_new_contexts(self, script_content: str):
-        """R71 P1-02: 脚本默认 REQUIRED_STATUS_CHECKS 包含 R71 Wave 2/4/5/7 新增 context。"""
+        """R71 P1-02: 脚本默认 REQUIRED_STATUS_CHECKS 包含 R71 Wave 4/7 新增 context。"""
         for ctx in R71_NEW_CONTEXTS:
             assert ctx in script_content, (
                 f"configure_branch_ruleset.sh 缺少 R71 新增 context: {ctx}"
             )
 
-    def test_script_validates_at_least_36_checks(self, script_content: str):
-        """R71 P1-02: 脚本校验 REQUIRED_STATUS_CHECKS 至少含 36 个 context
-        (Wave 7 新增 bind-runtime-config,从 35 扩展到 36)。"""
-        # 脚本中应有 "-lt 36" 校验(Wave 7 扩展)
-        assert "-lt 36" in script_content, (
-            "configure_branch_ruleset.sh 应校验 REQUIRED_STATUS_CHECKS 至少含 36 个 context"
+    def test_script_validates_at_least_29_checks(self, script_content: str):
+        """R71 P1-02 / R72 P1-06: 脚本校验 REQUIRED_STATUS_CHECKS 至少含 29 个 context
+        (R72 P1-06 移除 8 个 tag-only/environment-only check,从 36 缩减到 29)。"""
+        # 脚本中应有 "-lt 29" 校验(R72 P1-06 缩减)
+        assert "-lt 29" in script_content, (
+            "configure_branch_ruleset.sh 应校验 REQUIRED_STATUS_CHECKS 至少含 29 个 context"
         )
 
     def test_script_self_asserts_required_approving_review_count_zero(
@@ -766,15 +771,15 @@ class TestVerifyBranchRulesetScript:
             "R71 P1-01: verify_branch_ruleset.sh 应断言 bypass_actors 长度为 0"
         )
 
-    def test_script_includes_36_expected_checks(self, script_content: str):
-        """R71 P1-02: 验证脚本 EXPECTED_REQUIRED_CHECKS 含全部 36 个 context。"""
+    def test_script_includes_29_expected_checks(self, script_content: str):
+        """R71 P1-02 / R72 P1-06: 验证脚本 EXPECTED_REQUIRED_CHECKS 含全部 29 个 context。"""
         for ctx in EXPECTED_REQUIRED_CHECKS:
             assert ctx in script_content, (
                 f"verify_branch_ruleset.sh 缺少 EXPECTED_REQUIRED_CHECKS context: {ctx}"
             )
 
     def test_script_includes_r71_new_contexts(self, script_content: str):
-        """R71 P1-02: 验证脚本特别断言 R71 Wave 2/4/5/7 新增 context。"""
+        """R71 P1-02: 验证脚本特别断言 R71 Wave 4/7 新增 context(R72 P1-06 移除 Wave 2/5)。"""
         for ctx in R71_NEW_CONTEXTS:
             assert ctx in script_content, (
                 f"verify_branch_ruleset.sh 缺少 R71 新增 context: {ctx}"
@@ -849,6 +854,65 @@ class TestRecordBreakGlassModuleStructure:
         assert "risk" in module.REQUIRED_FIELDS
         assert "rollback_plan" in module.REQUIRED_FIELDS
         assert "typed_confirmation" in module.REQUIRED_FIELDS
+
+    def test_issue_labels_constant(self, module):
+        """R72 P1-07: ISSUE_LABELS 含 break-glass 与 audit 标签。"""
+        assert "break-glass" in module.ISSUE_LABELS, (
+            "ISSUE_LABELS 必须含 'break-glass' 标签(R72 P1-07: GitHub issue 主要审计源)"
+        )
+        assert "audit" in module.ISSUE_LABELS, (
+            "ISSUE_LABELS 必须含 'audit' 标签(R72 P1-07: GitHub issue 主要审计源)"
+        )
+
+    def test_gh_cli_binary_constant(self, module):
+        """R72 P1-07: GH_CLI_BINARY == 'gh'(用于 shutil.which 检查可用性)。"""
+        assert module.GH_CLI_BINARY == "gh", (
+            "GH_CLI_BINARY 必须为 'gh'(GitHub CLI 命令名)"
+        )
+
+    def test_gh_cli_timeout_constant(self, module):
+        """R72 P1-07: GH_CLI_TIMEOUT_SEC 为正整数(防止子进程挂起)。"""
+        assert isinstance(module.GH_CLI_TIMEOUT_SEC, int), (
+            "GH_CLI_TIMEOUT_SEC 必须为整数"
+        )
+        assert module.GH_CLI_TIMEOUT_SEC > 0, (
+            "GH_CLI_TIMEOUT_SEC 必须为正数(防止 gh issue create 子进程挂起)"
+        )
+
+    def test_break_glass_event_has_issue_url_field(self, module):
+        """R72 P1-07: BreakGlassEvent dataclass 含 issue_url 字段(默认空字符串)。"""
+        event = module.BreakGlassEvent(
+            operator="maxiuquan",
+            sha="a" * 40,
+            reason="emergency production hotfix for CVE-XXXX",
+            risk="high — security fix",
+            rollback_plan="revert commit and rerun all gates",
+            typed_confirmation="BREAK-GLASS-EMERGENCY",
+        )
+        assert hasattr(event, "issue_url"), (
+            "BreakGlassEvent 必须含 issue_url 字段(R72 P1-07: GitHub issue URL)"
+        )
+        assert event.issue_url == "", (
+            "issue_url 默认值必须为空字符串(尚未创建 issue 时)"
+        )
+
+    def test_break_glass_event_to_dict_includes_issue_url(self, module):
+        """R72 P1-07: BreakGlassEvent.to_dict() 包含 issue_url 键。"""
+        event = module.BreakGlassEvent(
+            operator="maxiuquan",
+            sha="a" * 40,
+            reason="emergency production hotfix for CVE-XXXX",
+            risk="high — security fix",
+            rollback_plan="revert commit and rerun all gates",
+            typed_confirmation="BREAK-GLASS-EMERGENCY",
+        )
+        event.issue_url = "https://github.com/maxiuquan/tgjiema/issues/42"
+        data = event.to_dict()
+        assert "issue_url" in data, (
+            "to_dict() 必须包含 issue_url 键(R72 P1-07)"
+        )
+        assert data["issue_url"] == \
+            "https://github.com/maxiuquan/tgjiema/issues/42"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1038,6 +1102,7 @@ class TestRecordBreakGlassJsonlPersistence:
             rollback_plan="revert commit abc123, rebuild RC, rerun all gates",
             typed_confirmation="BREAK-GLASS-EMERGENCY",
             output_path=output_path,
+            create_issue=False,
         )
         assert result.valid is True
         assert output_path.exists(), "JSONL 文件应被创建"
@@ -1080,6 +1145,7 @@ class TestRecordBreakGlassJsonlPersistence:
             rollback_plan="revert commit and rerun all gates",
             typed_confirmation="BREAK-GLASS-EMERGENCY",
             output_path=output_path,
+            create_issue=False,
         )
         assert result.valid is True
         assert event.followup_required is True, (
@@ -1112,6 +1178,7 @@ class TestRecordBreakGlassJsonlPersistence:
             rollback_plan="rollback plan 1",
             typed_confirmation="BREAK-GLASS-EMERGENCY",
             output_path=output_path,
+            create_issue=False,
         )
         assert result1.valid is True
 
@@ -1132,6 +1199,7 @@ class TestRecordBreakGlassJsonlPersistence:
             rollback_plan="rollback plan 2",
             typed_confirmation="BREAK-GLASS-EMERGENCY",
             output_path=output_path,
+            create_issue=False,
         )
         assert result2.valid is True
 
@@ -1170,6 +1238,7 @@ class TestRecordBreakGlassJsonlPersistence:
             rollback_plan="rollback",
             typed_confirmation="WRONG-CONFIRMATION",  # 错误
             output_path=output_path,
+            create_issue=False,
         )
         assert result.valid is False, "校验应失败(typed_confirmation 错误)"
         # 文件不应被创建 / 不应被写入
@@ -1199,6 +1268,7 @@ class TestRecordBreakGlassJsonlPersistence:
             rollback_plan="revert commit and rerun all gates",
             typed_confirmation="BREAK-GLASS-EMERGENCY",
             output_path=output_path,
+            create_issue=False,
         )
         assert result.valid is True
 
@@ -1252,6 +1322,7 @@ class TestRecordBreakGlassCliExitCodes:
                 "--risk", "high — bypassing RC identity verification",
                 "--rollback-plan", "revert commit abc123, rebuild RC, rerun all gates",
                 "--typed-confirmation", "BREAK-GLASS-EMERGENCY",
+                "--no-create-issue",
                 "--output", str(output_path),
             ],
             capture_output=True, text=True, timeout=30,
@@ -1276,6 +1347,7 @@ class TestRecordBreakGlassCliExitCodes:
                 "--risk", "high",
                 "--rollback-plan", "rollback",
                 "--typed-confirmation", "BREAK-GLASS-EMERGENCY",
+                "--no-create-issue",
                 "--output", str(output_path),
             ],
             capture_output=True, text=True, timeout=30,
@@ -1303,6 +1375,7 @@ class TestRecordBreakGlassCliExitCodes:
                 "--risk", "high",
                 "--rollback-plan", "rollback plan",
                 "--typed-confirmation", "wrong-confirmation",  # 错误
+                "--no-create-issue",
                 "--output", str(output_path),
             ],
             capture_output=True, text=True, timeout=30,
@@ -1354,6 +1427,7 @@ class TestRecordBreakGlassEndToEnd:
                 "--risk", "high — bypassing RC identity verification for critical security fix",
                 "--rollback-plan", "revert commit abc123, rebuild RC, rerun all gates",
                 "--typed-confirmation", "BREAK-GLASS-EMERGENCY",
+                "--no-create-issue",
                 "--output", str(output_path),
             ],
             capture_output=True, text=True, timeout=30,
@@ -1393,6 +1467,377 @@ class TestRecordBreakGlassEndToEnd:
         stdout_data = json.loads(result.stdout)
         assert stdout_data["event_id"] == data["event_id"]
         assert stdout_data["operator"] == "maxiuquan"
+
+
+# ════════════════════════════════════════════════════════════════
+# J. R72 P1-07: create_github_issue() 函数(mocked gh CLI)
+# ════════════════════════════════════════════════════════════════
+
+
+class TestCreateGithubIssue:
+    """R72 P1-07: create_github_issue() 通过 gh CLI 创建主要审计源 issue。"""
+
+    @pytest.fixture
+    def module(self):
+        return _load_record_break_glass_module()
+
+    @pytest.fixture
+    def valid_event(self, module):
+        """返回一个已校验通过的 BreakGlassEvent(用于 issue 创建测试)。"""
+        return module.BreakGlassEvent(
+            event_id="test-uuid-issue-1234",
+            timestamp="2026-07-24T10:00:00+00:00",
+            operator="maxiuquan",
+            sha="abc123def4567890abcdef1234567890abcdef12",
+            reason="emergency production hotfix for CVE-XXXX",
+            failed_checks=["verify-rc-identity", "validate-oci-rootfs"],
+            run_url="https://github.com/maxiuquan/tgjiema/actions/runs/123",
+            risk="high — bypassing RC identity verification",
+            rollback_plan="revert commit abc123, rebuild RC, rerun all gates",
+            typed_confirmation="BREAK-GLASS-EMERGENCY",
+        )
+
+    def test_issue_title_format(self, module, valid_event):
+        """R72 P1-07: _format_issue_title 格式为 '[BREAK-GLASS] <operator> ... for <sha[:12]>'。"""
+        title = module._format_issue_title(valid_event)
+        assert title.startswith("[BREAK-GLASS]"), (
+            "issue 标题必须以 '[BREAK-GLASS]' 开头"
+        )
+        assert "maxiuquan" in title, "issue 标题必须含 operator 名"
+        assert "abc123def456" in title, (
+            "issue 标题必须含 sha[:12](12 字符短 SHA)"
+        )
+
+    def test_issue_body_contains_all_audit_fields(self, module, valid_event):
+        """R72 P1-07: _format_issue_body 包含所有审计字段。"""
+        body = module._format_issue_body(valid_event)
+        assert "maxiuquan" in body, "issue 正文必须含 operator"
+        assert valid_event.sha in body, "issue 正文必须含完整 sha"
+        assert "CVE-XXXX" in body, "issue 正文必须含 reason"
+        assert "verify-rc-identity" in body, "issue 正文必须含 failed_checks"
+        assert "validate-oci-rootfs" in body, "issue 正文必须含 failed_checks"
+        assert valid_event.run_url in body, "issue 正文必须含 run_url"
+        assert valid_event.risk in body, "issue 正文必须含 risk"
+        assert valid_event.rollback_plan in body, "issue 正文必须含 rollback_plan"
+        assert valid_event.event_id in body, "issue 正文必须含 event_id"
+        assert "primary audit source" in body, (
+            "issue 正文必须声明 GitHub issue 是主要审计源(R72 P1-07)"
+        )
+
+    def test_create_issue_fails_when_gh_not_found(self, module, valid_event, monkeypatch):
+        """R72 P1-07: gh CLI 不可用时 create_github_issue 返回 (False, error)。"""
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+        success, msg = module.create_github_issue(valid_event)
+        assert success is False, (
+            "gh CLI 不可用时 create_github_issue 应返回 False(fail-closed)"
+        )
+        assert "gh CLI" in msg or "未找到" in msg, (
+            f"错误消息应说明 gh CLI 未找到,实际: {msg}"
+        )
+
+    def test_create_issue_succeeds_when_gh_returns_url(self, module, valid_event, monkeypatch):
+        """R72 P1-07: gh CLI 返回 issue URL 时 create_github_issue 返回 (True, url)。"""
+        monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/gh")
+
+        expected_url = "https://github.com/maxiuquan/tgjiema/issues/42"
+
+        class _FakeResult:
+            returncode = 0
+            stdout = expected_url + "\n"
+            stderr = ""
+
+        def _fake_run(cmd, **kwargs):
+            return _FakeResult()
+
+        monkeypatch.setattr(module.subprocess, "run", _fake_run)
+        success, url = module.create_github_issue(valid_event)
+        assert success is True, (
+            f"gh CLI 成功时 create_github_issue 应返回 True,错误: {url}"
+        )
+        assert url == expected_url, (
+            f"返回的 issue URL 应为 gh CLI stdout,期望 {expected_url},实际 {url}"
+        )
+
+    def test_create_issue_fails_when_gh_returns_nonzero(self, module, valid_event, monkeypatch):
+        """R72 P1-07: gh CLI 返回非零退出码时 create_github_issue 返回 (False, error)。"""
+        monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/gh")
+
+        class _FakeResult:
+            returncode = 1
+            stdout = ""
+            stderr = "auth error: not logged in"
+
+        def _fake_run(cmd, **kwargs):
+            return _FakeResult()
+
+        monkeypatch.setattr(module.subprocess, "run", _fake_run)
+        success, msg = module.create_github_issue(valid_event)
+        assert success is False, (
+            "gh CLI 非零退出码时 create_github_issue 应返回 False(fail-closed)"
+        )
+        assert "失败" in msg or "exit=1" in msg, (
+            f"错误消息应含失败信息,实际: {msg}"
+        )
+
+    def test_create_issue_fails_on_timeout(self, module, valid_event, monkeypatch):
+        """R72 P1-07: gh CLI 超时时 create_github_issue 返回 (False, error)。"""
+        monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/gh")
+
+        def _fake_run(cmd, **kwargs):
+            raise module.subprocess.TimeoutExpired(cmd=cmd, timeout=60)
+
+        monkeypatch.setattr(module.subprocess, "run", _fake_run)
+        success, msg = module.create_github_issue(valid_event)
+        assert success is False, (
+            "gh CLI 超时时 create_github_issue 应返回 False(fail-closed)"
+        )
+        assert "超时" in msg, f"错误消息应含超时信息,实际: {msg}"
+
+    def test_create_issue_fails_when_stdout_not_url(self, module, valid_event, monkeypatch):
+        """R72 P1-07: gh CLI 返回非 URL stdout 时 create_github_issue 返回 (False, error)。"""
+        monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/gh")
+
+        class _FakeResult:
+            returncode = 0
+            stdout = "some random text\n"
+            stderr = ""
+
+        def _fake_run(cmd, **kwargs):
+            return _FakeResult()
+
+        monkeypatch.setattr(module.subprocess, "run", _fake_run)
+        success, msg = module.create_github_issue(valid_event)
+        assert success is False, (
+            "gh CLI 返回非 URL stdout 时应返回 False(fail-closed)"
+        )
+        assert "非 URL" in msg or "URL" in msg, (
+            f"错误消息应说明输出非 URL,实际: {msg}"
+        )
+
+
+# ════════════════════════════════════════════════════════════════
+# K. R72 P1-07: record_break_glass() with create_issue=True(mocked)
+# ════════════════════════════════════════════════════════════════
+
+
+class TestRecordBreakGlassWithIssueCreation:
+    """R72 P1-07: record_break_glass() 在 create_issue=True 时的行为(mocked)。"""
+
+    @pytest.fixture
+    def module(self):
+        return _load_record_break_glass_module()
+
+    def test_issue_url_written_to_jsonl_when_issue_created(
+        self, module, tmp_path: Path, monkeypatch
+    ):
+        """R72 P1-07: issue 创建成功后,issue_url 应写入 JSONL 副本。"""
+        monkeypatch.setattr(module.uuid, "uuid4", lambda: type(
+            "UUID", (), {"__str__": lambda self: "uuid-with-issue"}
+        )())
+        monkeypatch.setattr(
+            module, "_now_iso", lambda: "2026-07-24T10:00:00+00:00"
+        )
+        monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/gh")
+
+        expected_issue_url = "https://github.com/maxiuquan/tgjiema/issues/99"
+
+        class _FakeResult:
+            returncode = 0
+            stdout = expected_issue_url + "\n"
+            stderr = ""
+
+        monkeypatch.setattr(
+            module.subprocess, "run", lambda cmd, **kw: _FakeResult()
+        )
+
+        output_path = tmp_path / "break-glass-audit.jsonl"
+        event, result = module.record_break_glass(
+            operator="maxiuquan",
+            sha="abc123def4567890abcdef1234567890abcdef12",
+            reason="emergency production hotfix for CVE-XXXX",
+            failed_checks=["verify-rc-identity"],
+            run_url="https://github.com/maxiuquan/tgjiema/actions/runs/123",
+            risk="high — security fix",
+            rollback_plan="revert commit and rerun all gates",
+            typed_confirmation="BREAK-GLASS-EMERGENCY",
+            output_path=output_path,
+            create_issue=True,
+        )
+        assert result.valid is True, (
+            f"issue 创建成功时应通过校验,错误: {result.errors}"
+        )
+        assert event.issue_url == expected_issue_url, (
+            f"event.issue_url 应为创建的 issue URL,期望 {expected_issue_url},"
+            f"实际 {event.issue_url}"
+        )
+
+        # JSONL 副本中应含 issue_url
+        data = json.loads(output_path.read_text(encoding="utf-8").strip())
+        assert data["issue_url"] == expected_issue_url, (
+            "JSONL 副本必须含 issue_url 字段(R72 P1-07)"
+        )
+
+    def test_jsonl_not_written_when_issue_creation_fails(
+        self, module, tmp_path: Path, monkeypatch
+    ):
+        """R72 P1-07: issue 创建失败时,JSONL 副本不应被写入(fail-closed)。
+
+        确保重试不会产生重复 JSONL 条目 — 只有 issue 创建成功后才写 JSONL。
+        """
+        monkeypatch.setattr(module.uuid, "uuid4", lambda: type(
+            "UUID", (), {"__str__": lambda self: "uuid-fail-issue"}
+        )())
+        monkeypatch.setattr(
+            module, "_now_iso", lambda: "2026-07-24T10:00:00+00:00"
+        )
+        # gh CLI 不可用 → issue 创建失败
+        monkeypatch.setattr(module.shutil, "which", lambda name: None)
+
+        output_path = tmp_path / "break-glass-audit.jsonl"
+        event, result = module.record_break_glass(
+            operator="maxiuquan",
+            sha="abc123def4567890abcdef1234567890abcdef12",
+            reason="emergency production hotfix for CVE-XXXX",
+            failed_checks=["verify-rc-identity"],
+            run_url="https://github.com/maxiuquan/tgjiema/actions/runs/123",
+            risk="high — security fix",
+            rollback_plan="revert commit and rerun all gates",
+            typed_confirmation="BREAK-GLASS-EMERGENCY",
+            output_path=output_path,
+            create_issue=True,
+        )
+        assert result.valid is False, (
+            "issue 创建失败时校验应失败(fail-closed)"
+        )
+        assert not output_path.exists(), (
+            "issue 创建失败时 JSONL 副本不应被写入(fail-closed — "
+            "确保重试不会产生重复 JSONL 条目)"
+        )
+        assert event.issue_url == "", (
+            "issue 创建失败时 issue_url 应保持空字符串"
+        )
+        assert any("issue" in err.lower() for err in result.errors), (
+            f"错误消息应说明 issue 创建失败,实际: {result.errors}"
+        )
+
+    def test_validation_failure_skips_issue_creation(
+        self, module, tmp_path: Path, monkeypatch
+    ):
+        """R72 P1-07: 校验失败时不应尝试创建 issue(先校验再创建)。"""
+        monkeypatch.setattr(module.uuid, "uuid4", lambda: type(
+            "UUID", (), {"__str__": lambda self: "uuid-validation-fail"}
+        )())
+        monkeypatch.setattr(
+            module, "_now_iso", lambda: "2026-07-24T10:00:00+00:00"
+        )
+
+        # 跟踪 create_github_issue 是否被调用
+        issue_called = False
+
+        def _spy_create_issue(event, repo=None):
+            nonlocal issue_called
+            issue_called = True
+            return False, "should not be called"
+
+        monkeypatch.setattr(module, "create_github_issue", _spy_create_issue)
+
+        output_path = tmp_path / "break-glass-audit.jsonl"
+        event, result = module.record_break_glass(
+            operator="maxiuquan",
+            sha="invalid-sha",  # 校验失败
+            reason="emergency",
+            failed_checks=[],
+            run_url="",
+            risk="high",
+            rollback_plan="rollback",
+            typed_confirmation="BREAK-GLASS-EMERGENCY",
+            output_path=output_path,
+            create_issue=True,
+        )
+        assert result.valid is False, "校验应失败(sha 格式错误)"
+        assert not issue_called, (
+            "校验失败时不应调用 create_github_issue(先校验再创建 issue)"
+        )
+        assert not output_path.exists(), "校验失败时不应创建 JSONL 文件"
+
+
+# ════════════════════════════════════════════════════════════════
+# L. R72 P1-07: CLI --no-create-issue / --repo 标志
+# ════════════════════════════════════════════════════════════════
+
+
+class TestRecordBreakGlassCliIssueFlags:
+    """R72 P1-07: record_break_glass.py CLI --no-create-issue / --repo 标志。"""
+
+    def test_cli_no_create_issue_flag_accepted(self, tmp_path: Path):
+        """R72 P1-07: --no-create-issue 标志被接受且跳过 issue 创建(exit 0)。"""
+        output_path = tmp_path / "break-glass-audit.jsonl"
+        result = subprocess.run(
+            [
+                sys.executable, str(RECORD_BREAK_GLASS_PY),
+                "--operator", "maxiuquan",
+                "--sha", "abc123def4567890abcdef1234567890abcdef12",
+                "--reason", "emergency production hotfix for CVE-XXXX",
+                "--failed-checks", "verify-rc-identity",
+                "--run-url", "https://github.com/maxiuquan/tgjiema/actions/runs/123",
+                "--risk", "high — security fix",
+                "--rollback-plan", "revert commit and rerun all gates",
+                "--typed-confirmation", "BREAK-GLASS-EMERGENCY",
+                "--no-create-issue",
+                "--output", str(output_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, (
+            f"--no-create-issue 模式应 exit 0,实际 {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert output_path.exists(), "JSONL 文件应被创建"
+        # issue_url 应为空(未创建 issue)
+        data = json.loads(output_path.read_text(encoding="utf-8").strip())
+        assert data["issue_url"] == "", (
+            "--no-create-issue 模式下 issue_url 应为空字符串"
+        )
+
+    def test_cli_repo_flag_accepted(self, tmp_path: Path):
+        """R72 P1-07: --repo 标志被接受(配合 --no-create-issue 使用,exit 0)。"""
+        output_path = tmp_path / "break-glass-audit.jsonl"
+        result = subprocess.run(
+            [
+                sys.executable, str(RECORD_BREAK_GLASS_PY),
+                "--operator", "maxiuquan",
+                "--sha", "abc123def4567890abcdef1234567890abcdef12",
+                "--reason", "emergency production hotfix for CVE-XXXX",
+                "--failed-checks", "verify-rc-identity",
+                "--run-url", "https://github.com/maxiuquan/tgjiema/actions/runs/123",
+                "--risk", "high — security fix",
+                "--rollback-plan", "revert commit and rerun all gates",
+                "--typed-confirmation", "BREAK-GLASS-EMERGENCY",
+                "--no-create-issue",
+                "--repo", "maxiuquan/tgjiema",
+                "--output", str(output_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0, (
+            f"--repo 标志应被接受,实际 {result.returncode}\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+        assert output_path.exists(), "JSONL 文件应被创建"
+
+    def test_cli_help_lists_no_create_issue_flag(self):
+        """R72 P1-07: --help 输出中应列出 --no-create-issue 标志。"""
+        result = subprocess.run(
+            [sys.executable, str(RECORD_BREAK_GLASS_PY), "--help"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert result.returncode == 0
+        assert "--no-create-issue" in result.stdout, (
+            "--help 输出应包含 --no-create-issue 标志说明(R72 P1-07)"
+        )
+        assert "--repo" in result.stdout, (
+            "--help 输出应包含 --repo 标志说明(R72 P1-07)"
+        )
 
 
 if __name__ == "__main__":

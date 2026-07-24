@@ -132,17 +132,18 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
     {
         "file": "services/db_restore.py",
         "function": "run_restore",
-        "ast_signature": "fd687f7355c207417f14bf93c703b72221449aa89750e72ea5800c6dc2e9e07e",
-        "source_digest": "c368a10a0389bbef1248ac535eff7a251243ff41f92c648701a8fba3e3b9dc66",
+        "ast_signature": "cc5940e83a299ee5df0bd20e7f2d736f9634043a146925bcae1f45a53d3e4139",
+        "source_digest": "907f5519186ed8af3a24a00bed74034d25d42b3603098e7fb03169aa6768ffda",
         "allowed_callees": frozenset({"validate_and_restore_backup_strict"}),
         "reason": "CLI 入口委托:run_restore → validate_and_restore_backup_strict(strict service)",
     },
     # db_restore.py: main() CLI argparse 入口委托给 run_restore
+    # R72: --target / --backup-id / --output-json 参数新增,source_digest 重新生成
     {
         "file": "services/db_restore.py",
         "function": "main",
-        "ast_signature": "09644db2dd9793b8acaedf000db0135aa8be9faff9d605b7b26bb2a6916ed36b",
-        "source_digest": "76aa6e8534388d937446b279bd64395fe9f7c4743c5aa15bda7a32dce319b05f",
+        "ast_signature": "c19a5fc788f825213e1a57d4f86c4c30c7f0da23605c8e5d4e4f188a63ff33cd",
+        "source_digest": "fd543ce76c47248bc40ec11d44e9a791d944ac5b8d370921265b0b9e338845ce",
         "allowed_callees": frozenset({"run_restore"}),
         "reason": "CLI argparse 入口委托:main → run_restore(运行时由 run_restore 的 seal 防护)",
     },

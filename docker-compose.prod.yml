@@ -618,6 +618,56 @@ services:
       retries: 3
       start_period: 90s
 
+  # ── r40_scheduler (定时任务调度器: 清理过期数据 + 配额预留 + 指标采集) ──
+  # R72 P0-04: r40_scheduler 是生产必需角色(R42 retention / R45 decode_logs cleanup /
+  # R47 MFA cleanup / R41 approval drain)。此前仅存在于 entrypoint 和 health 矩阵,
+  # 但不在 docker-compose.prod.yml 中,导致生产部署中该角色永久缺席。
+  r40_scheduler:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}
+    container_name: tgjiema-r40_scheduler
+    restart: always
+    env_file:
+      - .env.shared
+    environment:
+      - SERVICE_ROLE=r40_scheduler
+      - APP_ENV=production
+      - PYTHONUNBUFFERED=1
+      - REDIS_URL=redis://tgjiema_writer:${REDIS_WRITER_PASSWORD}@redis:6379/0
+      - I18N_ALLOW_FALLBACK=
+      - ALLOW_LEGACY_RESTORE=
+      - TEST_ONLY=
+      - DEV_ONLY=
+      - BYPASS=
+      - SKIP_VERIFY=
+      - SKIP_VALIDATION=
+      - ALLOW_INSECURE=
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
+
   # ── prometheus_exporter (指标导出) ──
   prometheus_exporter:
     image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be set to ghcr.io/maxiuquan/tgjiema@sha256:<digest>}

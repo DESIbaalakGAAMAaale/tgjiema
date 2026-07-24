@@ -152,6 +152,21 @@ _SCHEDULER_HEARTBEAT_STALE_THRESHOLD = 600.0  # 10 分钟
 # R71 Wave 1: metrics endpoint HTTP 探测超时(秒)
 _METRICS_HTTP_TIMEOUT = 2.0
 
+# R72 P1-03: Bot polling 心跳过期阈值(秒)— up_bot polling loop 心跳新鲜度
+_POLLING_HEARTBEAT_STALE_THRESHOLD = 300.0  # 5 分钟
+
+# R72 P1-04: Redis Stream consumer idle 阈值(秒)— consumer 超过此值未消费视为停滞
+_CONSUMER_IDLE_THRESHOLD = 300.0  # 5 分钟
+
+# R72 P1-04: Redis Stream pending 消息数失控阈值
+_CONSUMER_PENDING_THRESHOLD = 10000
+
+# R72 P1-05: migration 完成后必须存在的表集合
+_REQUIRED_TABLES = frozenset({
+    "upload_sessions", "writer_inbox", "upload_outbox",
+    "bot_heartbeat", "kv_store",
+})
+
 # R71 Wave 1: 需要 CRDB 的角色集合(database_crdb 检查)
 # db_writer 在生产部署中也使用 CRDB 作为权威后端(R70 §2:写穿 CRDB)
 # admin 角色同时检查 SQLite + CRDB
@@ -170,19 +185,30 @@ _CRDB_SYNC_LAST_SUCCESS_KEY = "crdb_sync_last_success"
 
 
 def _is_ci_mode() -> bool:
-    """R71 RC27: 检测当前是否在 CI 环境中运行。
+    """R72 P0-02: 已废弃 — CI 变量不得改变生产 health 语义。
 
-    CI 环境无法提供真实 Telegram Bot Token / 真实 Telegram API 连接,
-    也没有 r40_scheduler 运行。因此 timing-dependent 健康检查
-    (self-port probe / crdb_sync_lag / scheduler_heartbeat / metrics_endpoint)
-    在 CI 模式下跳过 — 与 READINESS_GATE_PRE_LAUNCH 语义一致。
+    此函数保留为空实现(始终返回 False)仅为向后兼容,防止外部调用者
+    在未更新的测试中 import 失败。所有内部调用已改为仅使用
+    READINESS_GATE_PRE_LAUNCH 区分启动前 vs 运行时语义。
 
-    检测: CI=true 或 GITHUB_ACTIONS=true (GitHub Actions 默认设置)。
+    R72 P0-01/P0-02: 删除通用 CI 变量 bypass。CI 环境缺少真实依赖时
+    门禁必须失败(fail-closed),不得通过环境变量跳过。
     """
-    return (
-        os.getenv("CI", "").lower() in ("true", "1")
-        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-    )
+    return False
+
+
+def _is_pre_launch() -> bool:
+    """R72 P1-03/04/05: 检查是否处于启动前 readiness gate 模式。
+
+    READINESS_GATE_PRE_LAUNCH=1 表示 entrypoint 在 exec 业务进程前
+    调用 check_readiness,此时依赖(DB 表 / Redis Stream / polling loop)
+    尚未初始化,允许宽松通过。运行时 healthcheck 不设置此变量,
+    必须执行严格检查。
+
+    Returns:
+        True if READINESS_GATE_PRE_LAUNCH=1, False otherwise
+    """
+    return os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -289,43 +315,48 @@ ROLE_REQUIREMENTS: dict[str, dict[str, bool]] = {
     "up_bot": {
         "database": True, "redis": True, "bot_token_valid": True,
         "upload_session_status": False, "bot_polling_status": True,
+        "required_tables": True,
     },
     "idx_bot": {
         "database": True, "redis": True, "bot_token_valid": True,
-        "index_queue_depth": False,
+        "index_queue_depth": False, "required_tables": True,
     },
     "dsp_bot": {
         "database": True, "redis": True, "bot_token_valid": True,
         "redis_stream_consumer": True, "send_queue_depth": False,
+        "required_tables": True,
     },
     "mon_bot": {
         "database": True, "redis": True, "bot_token_valid": True,
-        "sub_services_alive": False,
+        "sub_services_alive": False, "required_tables": True,
     },
     "admin_bot": {
         "database": True, "redis": True, "bot_token_valid": True,
-        "admin_web_port": True,
+        "admin_web_port": True, "required_tables": True,
     },
     "db_writer": {
         "database": True, "redis": True,
         "redis_stream_consumer_group": True, "writer_inbox_lag": True,
+        "required_tables": True,
     },
     "crdb_sync": {
         "database_crdb": True, "redis": False,
-        "crdb_sync_lag": True,
+        "crdb_sync_lag": True, "required_tables": True,
     },
     "db_backup": {
         "database": True, "backup_dir_writable": True,
+        "required_tables": True,
     },
     "migration": {
-        "database_crdb": True,
+        "database_crdb": True, "required_tables": True,
     },
     "prometheus_exporter": {
         "database": True, "metrics_endpoint": True,
+        "required_tables": True,
     },
     "r40_scheduler": {
         "database": True, "redis": True,
-        "scheduler_heartbeat": True,
+        "scheduler_heartbeat": True, "required_tables": True,
     },
     "admin": {  # 全部检查
         "database": True, "database_crdb": True, "redis": True,
@@ -336,6 +367,7 @@ ROLE_REQUIREMENTS: dict[str, dict[str, bool]] = {
         "redis_stream_consumer_group": True, "writer_inbox_lag": True,
         "crdb_sync_lag": True, "backup_dir_writable": True,
         "metrics_endpoint": True, "scheduler_heartbeat": True,
+        "required_tables": True,
     },
 }
 
@@ -679,11 +711,14 @@ async def _check_upload_session_status() -> tuple[bool, Optional[str]]:
 
     读取 cache_store.upload_sessions 表,检查是否有 stuck session
     (status='INDEX_PENDING' 但 updated_at 超过阈值)。
-    表不存在时视为健康(可能未启用 upload session 模块)。
+
+    R72 P1-05: 运行态(非 PRE_LAUNCH)中表缺失必须失败(migration 已完成,
+    必需表必须存在)。PRE_LAUNCH 模式表不存在视为健康(migration 尚未运行)。
 
     Returns:
         (healthy, error)
     """
+    pre_launch = _is_pre_launch()
     try:
         import sqlite3
 
@@ -701,8 +736,11 @@ async def _check_upload_session_status() -> tuple[bool, Optional[str]]:
                 "WHERE type='table' AND name='upload_sessions'"
             )
             if cursor.fetchone() is None:
-                # upload_sessions 表不存在 → 视为健康(未启用)
-                return True, None
+                if pre_launch:
+                    return True, None  # PRE_LAUNCH: migration 尚未运行
+                return False, (
+                    "upload_sessions table not found (migration incomplete)"
+                )
             # 检查 stuck session(INDEX_PENDING 超过阈值)
             threshold = time.time() - _WRITER_INBOX_LAG_THRESHOLD
             cursor = conn.execute(
@@ -722,7 +760,11 @@ async def _check_upload_session_status() -> tuple[bool, Optional[str]]:
             conn.close()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
-            return True, None
+            if pre_launch:
+                return True, None  # PRE_LAUNCH: migration 尚未运行
+            return False, (
+                "upload_sessions table not found (migration incomplete)"
+            )
         return False, f"Upload session check failed: {e}"
     except Exception as e:
         return False, f"Upload session check failed: {e}"
@@ -731,12 +773,105 @@ async def _check_upload_session_status() -> tuple[bool, Optional[str]]:
 async def _check_bot_polling_status(bot_token: str) -> tuple[bool, Optional[str]]:
     """up_bot 专属: Bot polling 状态检查。
 
-    通过 getMe 验证 Bot token 有效(不调用 getUpdates,避免消费消息副作用)。
-    与 _check_bot_token_valid 共享实现,但语义不同:
-    - bot_token_valid: 通用检查(token 是否有效)
-    - bot_polling_status: up_bot 专属检查(Bot 是否能正常 polling)
+    R72 P1-03: getMe 成功不能证明 polling loop 活着。
+    必须验证 bot_heartbeat 表中 polling 心跳记录:
+    1. 验证 token 有效(getMe)
+    2. 运行态(非 PRE_LAUNCH)中检查 bot_heartbeat 表:
+       - 心跳记录必须包含 bot role(name)、last_ping、is_running
+       - last_ping 超过 _POLLING_HEARTBEAT_STALE_THRESHOLD(300s)→ 不健康
+       - is_running=0 → 不健康(polling loop 已停止)
+       - 无心跳记录 → 不健康(polling 从未运行)
+    3. PRE_LAUNCH 模式:只验证 token 有效(polling loop 尚未启动)
+
+    Args:
+        bot_token: Telegram Bot token
+
+    Returns:
+        (healthy, error)
     """
-    return await _check_bot_token_valid(bot_token)
+    # Step 1: 验证 token 有效
+    token_healthy, token_err = await _check_bot_token_valid(bot_token)
+    if not token_healthy:
+        return False, f"Bot token invalid: {token_err}"
+
+    # Step 2: PRE_LAUNCH 模式跳过 polling 心跳检查(polling loop 尚未启动)
+    if _is_pre_launch():
+        return True, None
+
+    # Step 3: 运行态检查 polling 心跳(从 bot_heartbeat 表读取)
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "cache_store.db not found (polling never ran)"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            # 检查 bot_heartbeat 表是否存在
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='bot_heartbeat'"
+            )
+            if cursor.fetchone() is None:
+                return False, (
+                    "bot_heartbeat table not found (polling never ran)"
+                )
+            # 查询 up_bot 的 polling 心跳记录
+            # bot_heartbeat 表列: name, last_ping, is_running,
+            #                     total_processed, total_errors
+            cursor = conn.execute(
+                "SELECT name, last_ping, is_running "
+                "FROM bot_heartbeat WHERE name = ?",
+                ("up_bot",),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return False, (
+                    "No polling heartbeat for up_bot in bot_heartbeat "
+                    "(polling loop never started)"
+                )
+            _name, last_ping, is_running = row
+            # is_running=0 → polling loop 已停止
+            if not is_running:
+                return False, (
+                    "up_bot polling loop stopped (is_running=0 in "
+                    "bot_heartbeat)"
+                )
+            # last_ping 过期 → polling loop 停滞
+            try:
+                last_ts = float(last_ping) if last_ping else 0.0
+            except (TypeError, ValueError):
+                return False, (
+                    f"up_bot polling heartbeat last_ping unparseable: "
+                    f"{last_ping!r}"
+                )
+            if last_ts <= 0:
+                return False, (
+                    "up_bot polling heartbeat last_ping is zero/negative"
+                )
+            age_seconds = time.time() - last_ts
+            if age_seconds < 0:
+                age_seconds = 0.0
+            if age_seconds > _POLLING_HEARTBEAT_STALE_THRESHOLD:
+                return False, (
+                    f"up_bot polling heartbeat stale: {age_seconds:.1f}s > "
+                    f"threshold {_POLLING_HEARTBEAT_STALE_THRESHOLD}s "
+                    f"(last_poll_succeeded_at={last_ping})"
+                )
+            return True, None
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return False, (
+                "bot_heartbeat table not found (polling never ran)"
+            )
+        return False, f"Bot polling status check failed: {e}"
+    except Exception as e:
+        return False, f"Bot polling status check failed: {e}"
 
 
 async def _check_index_queue_depth() -> tuple[bool, Optional[str]]:
@@ -744,11 +879,14 @@ async def _check_index_queue_depth() -> tuple[bool, Optional[str]]:
 
     读取 cache_store.writer_inbox 表,统计总行数(待处理消息数)。
     深度超过阈值视为不健康(可能消费跟不上)。
-    表不存在时视为健康(无积压)。
+
+    R72 P1-05: 运行态(非 PRE_LAUNCH)中表缺失必须失败。
+    PRE_LAUNCH 模式表不存在视为健康(migration 尚未运行)。
 
     Returns:
         (healthy, error)
     """
+    pre_launch = _is_pre_launch()
     try:
         import sqlite3
 
@@ -773,7 +911,11 @@ async def _check_index_queue_depth() -> tuple[bool, Optional[str]]:
             conn.close()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
-            return True, None
+            if pre_launch:
+                return True, None  # PRE_LAUNCH: migration 尚未运行
+            return False, (
+                "writer_inbox table not found (migration incomplete)"
+            )
         return False, f"Index queue depth check failed: {e}"
     except Exception as e:
         return False, f"Index queue depth check failed: {e}"
@@ -782,18 +924,22 @@ async def _check_index_queue_depth() -> tuple[bool, Optional[str]]:
 async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
     """dsp_bot 专属: Redis Stream 消费者状态检查。
 
-    检查 Redis Stream Consumer Group 是否有 consumer 在消费。
-    未配置 REDIS_URL 时视为健康(not_configured,不 fail-closed)。
+    R72 P1-04: 运行态(非 PRE_LAUNCH)中必须验证消费者活跃性:
+    - stream 不存在 → 失败
+    - group 不存在(NOGROUP)→ 失败
+    - active consumer 不存在 → 失败
+    - consumer idle 超过 _CONSUMER_IDLE_THRESHOLD → 失败
+    - pending 数量超过 _CONSUMER_PENDING_THRESHOLD → 失败
+    - last-delivered-id 未推进(为 "0-0" 或空)→ 失败
 
-    R71 RC24 fix: NOGROUP(Stream/Consumer Group 不存在)视为健康。
-    全新部署中 Stream 尚未被 XADD 创建,Consumer Group 尚未被
-    DBWriter.init() 的 ensure_consumer_group() 创建。这是正常的初始
-    状态,不应阻断 readiness gate(否则 db_writer 永远无法启动来创建
-    Consumer Group — 先有鸡还是先有蛋问题)。
+    PRE_LAUNCH 模式:NOGROUP/no key 视为健康(Stream/Group 尚未创建,
+    先有鸡还是先有蛋问题)。只有 PRE_LAUNCH 阶段可以允许 group 尚未创建。
 
     Returns:
         (healthy, error)
     """
+    pre_launch = _is_pre_launch()
+
     try:
         from config import settings
 
@@ -827,15 +973,135 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
                 stream_key = "tgjiema:writer:stream"
                 group = "tgjiema-writer-group"
 
+            # ── 运行态严格检查:XINFO STREAM / GROUPS / CONSUMERS ──
+            if not pre_launch:
+                # 1. Stream 是否存在(XINFO STREAM 不存在时抛 ResponseError)
+                try:
+                    stream_info = await asyncio.wait_for(
+                        client.xinfo_stream(stream_key),
+                        timeout=_REDIS_PING_TIMEOUT,
+                    )
+                except Exception as e:
+                    err_str = str(e)
+                    if (
+                        "no such key" in err_str.lower()
+                        or "NOGROUP" in err_str
+                    ):
+                        return False, (
+                            f"Redis Stream {stream_key!r} not exists "
+                            f"(runtime mode requires stream to be created)"
+                        )
+                    return False, (
+                        f"Redis XINFO STREAM failed: {e}"
+                    )
+
+                # 2. Consumer Group 是否存在(XINFO GROUPS)
+                try:
+                    groups_info = await asyncio.wait_for(
+                        client.xinfo_groups(stream_key),
+                        timeout=_REDIS_PING_TIMEOUT,
+                    )
+                except Exception as e:
+                    err_str = str(e)
+                    if "NOGROUP" in err_str or "no such key" in err_str.lower():
+                        return False, (
+                            f"Consumer Group {group!r} not exists on "
+                            f"Stream {stream_key!r} (runtime mode requires "
+                            f"group to be created)"
+                        )
+                    return False, f"Redis XINFO GROUPS failed: {e}"
+
+                # 查找目标 group
+                target_group_info = None
+                for g in groups_info:
+                    g_name = g.get("name", b"") if isinstance(g, dict) else b""
+                    if isinstance(g_name, bytes):
+                        g_name = g_name.decode("utf-8", errors="replace")
+                    if g_name == group:
+                        target_group_info = g
+                        break
+                if target_group_info is None:
+                    return False, (
+                        f"Consumer Group {group!r} not found on Stream "
+                        f"{stream_key!r} (runtime mode requires group)"
+                    )
+
+                # 3. last-delivered-id 未推进 → 失败
+                last_delivered_id = target_group_info.get(
+                    "last-delivered-id", ""
+                )
+                if isinstance(last_delivered_id, bytes):
+                    last_delivered_id = last_delivered_id.decode(
+                        "utf-8", errors="replace"
+                    )
+                if not last_delivered_id or last_delivered_id == "0-0":
+                    return False, (
+                        f"Consumer Group {group!r} last-delivered-id is "
+                        f"{last_delivered_id!r} (never advanced — consumer "
+                        f"never processed any message)"
+                    )
+
+                # 4. pending 数量失控 → 失败
+                pending_count = target_group_info.get("pending", 0)
+                if isinstance(pending_count, bytes):
+                    pending_count = int(pending_count)
+                if pending_count > _CONSUMER_PENDING_THRESHOLD:
+                    return False, (
+                        f"Consumer Group {group!r} pending {pending_count} > "
+                        f"threshold {_CONSUMER_PENDING_THRESHOLD}"
+                    )
+
+                # 5. active consumer 不存在 / idle 超过阈值 → 失败
+                try:
+                    consumers_info = await asyncio.wait_for(
+                        client.xinfo_consumers(stream_key, group),
+                        timeout=_REDIS_PING_TIMEOUT,
+                    )
+                except Exception as e:
+                    err_str = str(e)
+                    if "NOGROUP" in err_str or "no such key" in err_str.lower():
+                        return False, (
+                            f"Consumer Group {group!r} not exists "
+                            f"(XINFO CONSUMERS failed)"
+                        )
+                    return False, f"Redis XINFO CONSUMERS failed: {e}"
+
+                if not consumers_info:
+                    return False, (
+                        f"No active consumers in Consumer Group {group!r} "
+                        f"(runtime mode requires at least one consumer)"
+                    )
+
+                # 检查所有 consumer 的 idle 时间
+                stale_consumers: list[str] = []
+                any_active = False
+                for c in consumers_info:
+                    c_name = c.get("name", b"") if isinstance(c, dict) else b""
+                    if isinstance(c_name, bytes):
+                        c_name = c_name.decode("utf-8", errors="replace")
+                    c_idle = c.get("idle", 0)
+                    if isinstance(c_idle, bytes):
+                        c_idle = int(c_idle)
+                    # idle 是毫秒
+                    idle_seconds = c_idle / 1000.0
+                    if idle_seconds > _CONSUMER_IDLE_THRESHOLD:
+                        stale_consumers.append(
+                            f"{c_name}(idle={idle_seconds:.1f}s)"
+                        )
+                    else:
+                        any_active = True
+                if not any_active:
+                    return False, (
+                        f"All consumers idle > {_CONSUMER_IDLE_THRESHOLD}s: "
+                        f"{stale_consumers}"
+                    )
+                return True, None
+
+            # ── PRE_LAUNCH 模式:宽松检查(仅验证 XPENDING 不抛异常) ──
             # XPENDING 返回格式因 redis-py 版本而异:
             # - redis-py 4.x: list [count, min_id, max_id, [[consumer, count], ...]]
             # - redis-py 5.x: dict {'pending': count, 'min': id, 'max': id,
             #                       'consumers': [[name, count], ...]}
-            # R71 RC25 fix: redis-py 5.x 返回 dict,用 pending_info[3] 索引
-            # 会导致 KeyError(3),str(KeyError(3))="3" → readiness gate 误判失败。
-            # RC25 进一步简化:只要 XPENDING 不抛异常(Consumer Group 存在),
-            # 即视为健康。全新部署中可能没有 pending 消息或 active consumer,
-            # 但 Consumer Group 已创建 = 系统就绪。
             await asyncio.wait_for(
                 client.xpending(stream_key, group),
                 timeout=_REDIS_PING_TIMEOUT,
@@ -848,10 +1114,12 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
                 logger.debug(f"Redis aclose cleanup: {_close_err}")
     except Exception as e:
         err_str = str(e)
-        # R71 RC24: NOGROUP/No such key 在全新部署中是正常状态
+        # R71 RC24: NOGROUP/No such key 在 PRE_LAUNCH 模式中是正常状态
         # (Stream 尚未被 XADD 创建,Consumer Group 尚未被
         # DBWriter.init() 创建)。不阻断 readiness gate。
-        if "NOGROUP" in err_str or "no such key" in err_str.lower():
+        if pre_launch and (
+            "NOGROUP" in err_str or "no such key" in err_str.lower()
+        ):
             return True, None
         return False, f"Redis stream consumer check failed: {e}"
 
@@ -862,11 +1130,14 @@ async def _check_send_queue_depth() -> tuple[bool, Optional[str]]:
     读取 cache_store.upload_outbox 表,统计未完成行数
     (status NOT IN ('DONE', 'FAILED'))。
     深度超过阈值视为不健康。
-    表不存在时视为健康。
+
+    R72 P1-05: 运行态(非 PRE_LAUNCH)中表缺失必须失败。
+    PRE_LAUNCH 模式表不存在视为健康(migration 尚未运行)。
 
     Returns:
         (healthy, error)
     """
+    pre_launch = _is_pre_launch()
     try:
         import sqlite3
 
@@ -894,7 +1165,11 @@ async def _check_send_queue_depth() -> tuple[bool, Optional[str]]:
             conn.close()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
-            return True, None
+            if pre_launch:
+                return True, None  # PRE_LAUNCH: migration 尚未运行
+            return False, (
+                "upload_outbox table not found (migration incomplete)"
+            )
         return False, f"Send queue depth check failed: {e}"
     except Exception as e:
         return False, f"Send queue depth check failed: {e}"
@@ -905,11 +1180,15 @@ async def _check_sub_services_alive() -> tuple[bool, Optional[str]]:
 
     读取 cache_store.bot_heartbeat 表,检查所有 Bot 的最近心跳时间。
     任一 Bot 心跳过期 → 不健康。
-    表不存在时视为健康(未启用 heartbeat 模块)。
+
+    R72 P1-05: 运行态(非 PRE_LAUNCH)中表缺失必须失败。
+    PRE_LAUNCH 模式表不存在视为健康(migration 尚未运行)。
+    R72 P1-05 fix: 修正列名 last_seen_at → last_ping(与实际 DDL 一致)。
 
     Returns:
         (healthy, error)
     """
+    pre_launch = _is_pre_launch()
     try:
         import sqlite3
 
@@ -927,19 +1206,28 @@ async def _check_sub_services_alive() -> tuple[bool, Optional[str]]:
                 "WHERE type='table' AND name='bot_heartbeat'"
             )
             if cursor.fetchone() is None:
-                return True, None  # 表不存在 → 视为健康
+                if pre_launch:
+                    return True, None  # PRE_LAUNCH: migration 尚未运行
+                return False, (
+                    "bot_heartbeat table not found (migration incomplete)"
+                )
             # 读取所有 bot 的最近心跳
+            # bot_heartbeat 表实际列名是 last_ping(非 last_seen_at)
             cursor = conn.execute(
-                "SELECT name, last_seen_at FROM bot_heartbeat"
+                "SELECT name, last_ping FROM bot_heartbeat"
             )
             rows = cursor.fetchall()
             if not rows:
-                return True, None  # 无 bot 记录 → 视为健康
+                if pre_launch:
+                    return True, None  # PRE_LAUNCH: bots 尚未启动
+                return False, (
+                    "bot_heartbeat table is empty (no bots ever heartbeat)"
+                )
             now = time.time()
             stale_bots: list[str] = []
-            for name, last_seen in rows:
+            for name, last_ping in rows:
                 try:
-                    last_ts = float(last_seen) if last_seen else 0.0
+                    last_ts = float(last_ping) if last_ping else 0.0
                 except (TypeError, ValueError):
                     stale_bots.append(str(name))
                     continue
@@ -952,7 +1240,11 @@ async def _check_sub_services_alive() -> tuple[bool, Optional[str]]:
             conn.close()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
-            return True, None
+            if pre_launch:
+                return True, None  # PRE_LAUNCH: migration 尚未运行
+            return False, (
+                "bot_heartbeat table not found (migration incomplete)"
+            )
         return False, f"Sub-services alive check failed: {e}"
     except Exception as e:
         return False, f"Sub-services alive check failed: {e}"
@@ -972,9 +1264,9 @@ async def _check_admin_web_port() -> tuple[bool, Optional[str]]:
     """
     # R71 RC25: 启动前 readiness gate 跳过自身端口检查
     # (entrypoint 在 exec 业务进程前调用 check_readiness,此时端口还没监听)
-    # R71 RC27: CI 模式下也跳过 — CI 中 admin web server 可能尚未启动
-    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1" or _is_ci_mode():
-        return True, None  # 启动前/CI 不检查自身端口
+    # R72 P0-02: 删除 CI bypass — 运行时 healthcheck 必须执行真实端口检查
+    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1":
+        return True, None  # 启动前不检查自身端口
 
     try:
         from config import settings
@@ -1020,8 +1312,14 @@ def _tcp_probe(host: str, port: int) -> None:
 async def _check_redis_stream_consumer_group() -> tuple[bool, Optional[str]]:
     """db_writer 专属: Redis Stream Consumer Group 状态检查。
 
-    检查 Consumer Group 是否存在且有 consumer(复用 _check_redis_stream_consumer)。
-    未配置 REDIS_URL 时视为健康。
+    R72 P1-04: 复用 _check_redis_stream_consumer() 的运行态严格检查逻辑。
+    运行态(非 PRE_LAUNCH)中:
+    - stream 不存在 → 失败
+    - group 不存在(NOGROUP)→ 失败
+    - active consumer 不存在 → 失败
+    - consumer idle 超过阈值 → 失败
+    - pending 数量失控 → 失败
+    - last-delivered-id 未推进 → 失败
 
     Returns:
         (healthy, error)
@@ -1035,11 +1333,14 @@ async def _check_writer_inbox_lag() -> tuple[bool, Optional[str]]:
     检查 writer_inbox 表中是否有消息处理延迟超过阈值
     (created_at 早于阈值,但 processed_at 也早于阈值,说明
     消息未被处理且很久未清理)。
-    表不存在时视为健康。
+
+    R72 P1-05: 运行态(非 PRE_LAUNCH)中表缺失必须失败。
+    PRE_LAUNCH 模式表不存在视为健康(migration 尚未运行)。
 
     Returns:
         (healthy, error)
     """
+    pre_launch = _is_pre_launch()
     try:
         import sqlite3
 
@@ -1071,10 +1372,72 @@ async def _check_writer_inbox_lag() -> tuple[bool, Optional[str]]:
             conn.close()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
-            return True, None
+            if pre_launch:
+                return True, None  # PRE_LAUNCH: migration 尚未运行
+            return False, (
+                "writer_inbox table not found (migration incomplete)"
+            )
         return False, f"Writer inbox lag check failed: {e}"
     except Exception as e:
         return False, f"Writer inbox lag check failed: {e}"
+
+
+async def _check_required_tables() -> tuple[bool, Optional[str]]:
+    """R72 P1-05: 必需表存在性检查。
+
+    migration 完成后,以下必需表缺失必须失败:
+    - upload_sessions
+    - writer_inbox
+    - upload_outbox
+    - bot_heartbeat
+    - kv_store
+
+    PRE_LAUNCH 模式:跳过(migration 尚未运行,表可能尚未创建)。
+    运行态:所有必需表必须存在(空表视为健康,仅检查存在性)。
+
+    Returns:
+        (healthy, error)
+    """
+    if _is_pre_launch():
+        return True, None  # PRE_LAUNCH: migration 尚未运行
+
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "cache_store.db not found (migration never ran)"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            missing: list[str] = []
+            for table_name in _REQUIRED_TABLES:
+                cursor = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name=?",
+                    (table_name,),
+                )
+                if cursor.fetchone() is None:
+                    missing.append(table_name)
+            if missing:
+                return False, (
+                    f"Required tables missing: {missing} "
+                    f"(migration incomplete)"
+                )
+            return True, None
+        finally:
+            conn.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return False, (
+                "Required tables check failed — table not found "
+                "(migration incomplete)"
+            )
+        return False, f"Required tables check failed: {e}"
+    except Exception as e:
+        return False, f"Required tables check failed: {e}"
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1098,11 +1461,8 @@ async def _check_crdb_sync_lag() -> tuple[bool, Optional[str]]:
         (healthy, error)
     """
     # R71 RC25: 启动前 readiness gate 中,crdb_sync 还没运行过是正常的
-    # R71 RC27: CI 模式下也跳过 — crdb_sync 进程可能尚未写入 kv_store
-    pre_launch = (
-        os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1"
-        or _is_ci_mode()
-    )
+    # R72 P0-02: 删除 CI bypass — 运行时必须执行真实 crdb_sync_lag 检查
+    pre_launch = os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1"
 
     try:
         import sqlite3
@@ -1238,9 +1598,9 @@ async def _check_metrics_endpoint() -> tuple[bool, Optional[str]]:
     """
     # R71 RC25: 启动前 readiness gate 跳过自身端口检查
     # (entrypoint 在 exec 业务进程前调用 check_readiness,此时 HTTP server 还没启动)
-    # R71 RC27: CI 模式下也跳过 — CI 中 metrics endpoint 可能尚未启动
-    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1" or _is_ci_mode():
-        return True, None  # 启动前/CI 不检查自身端口
+    # R72 P0-02: 删除 CI bypass — 运行时 healthcheck 必须执行真实端口检查
+    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1":
+        return True, None  # 启动前不检查自身端口
 
     try:
         from config import settings
@@ -1287,8 +1647,9 @@ async def _check_scheduler_heartbeat() -> tuple[bool, Optional[str]]:
     Returns:
         (healthy, error)
     """
-    # R71 RC27: CI 模式 / 启动前跳过 — scheduler 尚未运行
-    if _is_ci_mode() or os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1":
+    # R72 P0-02: 删除 CI bypass — 运行时必须执行真实 scheduler_heartbeat 检查
+    # 启动前 readiness gate (READINESS_GATE_PRE_LAUNCH=1) 跳过(scheduler 尚未运行)
+    if os.getenv("READINESS_GATE_PRE_LAUNCH", "") == "1":
         return True, None
     try:
         import sqlite3
@@ -1485,6 +1846,8 @@ def _build_check_coro(
         return _check_metrics_endpoint()
     if check_name == "scheduler_heartbeat":
         return _check_scheduler_heartbeat()
+    if check_name == "required_tables":
+        return _check_required_tables()
     # 未知检查项 → 编程错误,立即抛出(不被 _run_check 吞掉)
     raise KeyError(
         f"Unknown check name {check_name!r} (not in dispatcher; "
@@ -1499,7 +1862,7 @@ _KNOWN_CHECK_NAMES = frozenset({
     "redis_stream_consumer", "send_queue_depth", "sub_services_alive",
     "admin_web_port", "redis_stream_consumer_group", "writer_inbox_lag",
     "crdb_sync_lag", "backup_dir_writable", "metrics_endpoint",
-    "scheduler_heartbeat",
+    "scheduler_heartbeat", "required_tables",
 })
 
 

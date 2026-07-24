@@ -575,13 +575,21 @@ class TestSwitchRollbackEvidence:
         result = vri.generate_switch_rollback_evidence()
         required_fields = {
             "orchestrator_available",
+            "orchestrator_executed",
+            "passed",
+            "switch_version",
+            "rollback_version",
+            "old_db_identity",
+            "new_db_identity",
+            "business_probe_after_switch",
+            "business_probe_after_rollback",
+            "switch_time_seconds",
+            "rto_seconds",
+            "rpo_seconds",
+            "target_db",
+            "actual_db_path",
             "restore_phases",
-            "switch_procedure",
-            "rollback_procedure",
             "error",
-            "has_switch_phase",
-            "has_rollback_phase",
-            "performed_in_e2e",
         }
         missing = required_fields - set(result.keys())
         assert not missing, (
@@ -590,10 +598,10 @@ class TestSwitchRollbackEvidence:
         )
 
     def test_switch_rollback_evidence_performed_in_e2e_is_false(self, vri):
-        """performed_in_e2e 必须为 False(E2E 中不实际执行破坏性切换)。"""
+        """orchestrator_executed 必须为 False(E2E 中无凭证不实际执行破坏性切换)。"""
         result = vri.generate_switch_rollback_evidence()
-        assert result["performed_in_e2e"] is False, (
-            "performed_in_e2e 必须为 False(E2E 不执行破坏性切换,只做 import check)"
+        assert result["orchestrator_executed"] is False, (
+            "orchestrator_executed 必须为 False(E2E 无凭证不执行破坏性切换)"
         )
 
 
@@ -626,7 +634,7 @@ class TestVerifyFull:
         monkeypatch.setattr(vri, "_exec_health", mock_exec_health)
 
         # mock synthetic transaction
-        def mock_synthetic(timeout=60):
+        def mock_synthetic(timeout=60, **kwargs):
             return {"overall_passed": True, "trace_id": "mock"}
         monkeypatch.setattr(
             vri, "run_synthetic_transaction_in_restored_env", mock_synthetic,
@@ -664,7 +672,7 @@ class TestVerifyFull:
             return 0, json.dumps({"healthy": True, "checks": []}), ""
         monkeypatch.setattr(vri, "_exec_health", mock_exec_health)
 
-        def mock_synthetic(timeout=60):
+        def mock_synthetic(timeout=60, **kwargs):
             return {"overall_passed": True}
         monkeypatch.setattr(
             vri, "run_synthetic_transaction_in_restored_env", mock_synthetic,
@@ -700,7 +708,7 @@ class TestVerifyFull:
             return 1, "", "health check failed"
         monkeypatch.setattr(vri, "_exec_health", mock_exec_health)
 
-        def mock_synthetic(timeout=60):
+        def mock_synthetic(timeout=60, **kwargs):
             return {"overall_passed": True}
         monkeypatch.setattr(
             vri, "run_synthetic_transaction_in_restored_env", mock_synthetic,
@@ -736,7 +744,7 @@ class TestVerifyFull:
             return 0, json.dumps({"healthy": True, "checks": []}), ""
         monkeypatch.setattr(vri, "_exec_health", mock_exec_health)
 
-        def mock_synthetic(timeout=60):
+        def mock_synthetic(timeout=60, **kwargs):
             return {"overall_passed": True, "trace_id": "json_test"}
         monkeypatch.setattr(
             vri, "run_synthetic_transaction_in_restored_env", mock_synthetic,
@@ -800,7 +808,7 @@ class TestCLIEntry:
             return 0, json.dumps({"healthy": True, "checks": []}), ""
         monkeypatch.setattr(vri, "_exec_health", mock_exec_health)
 
-        def mock_synthetic(timeout=60):
+        def mock_synthetic(timeout=60, **kwargs):
             return {"overall_passed": True}
         monkeypatch.setattr(
             vri, "run_synthetic_transaction_in_restored_env", mock_synthetic,
@@ -931,7 +939,7 @@ class TestFailClosedAndConsistency:
         monkeypatch.setattr(vri, "_exec_health", mock_exec_health)
 
         # 这个 mock 不应该被调用
-        def mock_synthetic_should_not_be_called(timeout=60):
+        def mock_synthetic_should_not_be_called(timeout=60, **kwargs):
             raise AssertionError(
                 "skip_synthetic=True 时不应调用 run_synthetic_transaction_in_restored_env"
             )
@@ -971,7 +979,7 @@ class TestFailClosedAndConsistency:
             )
         monkeypatch.setattr(vri, "_exec_health", mock_health_should_not_be_called)
 
-        def mock_synthetic(timeout=60):
+        def mock_synthetic(timeout=60, **kwargs):
             return {"overall_passed": True}
         monkeypatch.setattr(
             vri, "run_synthetic_transaction_in_restored_env", mock_synthetic,

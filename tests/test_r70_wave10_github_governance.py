@@ -253,20 +253,26 @@ class TestConfigureBranchRulesetR71SoloFounder:
                 f"configure_branch_ruleset.sh 缺少 R71 required status check: {check}"
             )
 
-    def test_r71_required_status_checks_36_count(self, script_content: str):
-        """R71 P1-02: 必须包含至少 36 个 required status check(覆盖所有
-        真实 release-gates.yml job 名,含 Wave 7 新增 bind-runtime-config)。"""
+    def test_r71_required_status_checks_29_count(self, script_content: str):
+        """R71 P1-02 / R72 P1-06: 必须包含至少 29 个 required status check。
+
+        R72 P1-06: 已移除 8 个 tag-only/environment-only check
+        (compose-runtime-e2e / sign-image / publish-attestation /
+        attestation-semantics-verify / verify-only-3x /
+        migration-binding-gate / verify-rc-identity / production-promotion-gate),
+        从 36 降到 29(仅保留 PR/master 事件可产生的 check)。
+        """
         assert "REQUIRED_STATUS_CHECKS" in script_content, (
             "configure_branch_ruleset.sh 应有 REQUIRED_STATUS_CHECKS 变量"
         )
-        # 必须有 -lt 36 校验(Wave 7 扩展,从 35 到 36)
-        assert "-lt 36" in script_content, (
-            "R71 P1-02: configure_branch_ruleset.sh 必须校验 REQUIRED_STATUS_CHECKS "
-            "至少 36 项(-lt 36, Wave 7 新增 bind-runtime-config)"
+        # R72 P1-06: 必须有 -lt 29 校验(从 36 降到 29,移除 8 个 tag-only check)
+        assert "-lt 29" in script_content, (
+            "R72 P1-06: configure_branch_ruleset.sh 必须校验 REQUIRED_STATUS_CHECKS "
+            "至少 29 项(-lt 29, R72 P1-06 移除 8 个 tag-only check)"
         )
-        # R71 Wave 2/4/5/7 新增的 context 必须在默认值中
-        for ctx in ("compose-runtime-e2e", "validate-oci-rootfs",
-                    "verify-rc-identity", "bind-runtime-config"):
+        # R71 Wave 4/7 新增的 PR-gate context 必须在默认值中
+        # R72 P1-06: compose-runtime-e2e / verify-rc-identity 已移除(tag-only)
+        for ctx in ("validate-oci-rootfs", "bind-runtime-config"):
             assert ctx in script_content, (
                 f"R71 P1-02: configure_branch_ruleset.sh 缺少 R71 新增 context: {ctx}"
             )

@@ -164,18 +164,19 @@ class TestGetEntrypointRoles:
 
 
 class TestStartBotsPhaseExpansion:
-    """R71 Wave 2 B: start_bots 阶段扩展到全部 9 个业务服务。"""
+    """R71 Wave 2 B / R72 P0-04: start_bots 阶段扩展到全部 10 个业务服务。"""
 
-    def test_bot_services_has_9_entries(self, orch):
-        """BOT_SERVICES 必须包含 9 个服务(5 bot + 4 业务服务)。"""
-        assert len(orch.BOT_SERVICES) == 9, (
-            f"R71 P0-07: BOT_SERVICES 必须有 9 个服务, 实际: {len(orch.BOT_SERVICES)}"
+    def test_bot_services_has_10_entries(self, orch):
+        """R72 P0-04: BOT_SERVICES 必须包含 10 个服务(5 bot + 5 业务服务,
+        含 r40_scheduler 已加入 production Compose)。"""
+        assert len(orch.BOT_SERVICES) == 10, (
+            f"R72 P0-04: BOT_SERVICES 必须有 10 个服务, 实际: {len(orch.BOT_SERVICES)}"
         )
 
     def test_bot_services_includes_new_roles(self, orch):
-        """BOT_SERVICES 必须包含 admin/crdb_sync/db_backup/prometheus_exporter。"""
+        """BOT_SERVICES 必须包含 admin/crdb_sync/db_backup/r40_scheduler/prometheus_exporter。"""
         required_new_services = {
-            "admin", "crdb_sync", "db_backup", "prometheus_exporter",
+            "admin", "crdb_sync", "db_backup", "r40_scheduler", "prometheus_exporter",
         }
         actual = set(orch.BOT_SERVICES)
         missing = required_new_services - actual

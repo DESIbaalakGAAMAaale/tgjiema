@@ -895,3 +895,207 @@ def _build_db_backup_decryptor():
         return BackupDecryptor()
     except Exception:
         return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# R72 P0-10: 一次性 backup CLI (--once --output-json)
+# ═══════════════════════════════════════════════════════════════
+
+
+async def backup_once(output_json_path: str | None = None) -> dict:
+    """R72 P0-10: 执行一次性备份(不进入 daemon 循环)。
+
+    用于 RC 门禁中的真实 backup→restore 演练:
+      1. 初始化 DB + R2
+      2. 执行单次备份(watermark → backup_all_tables → encrypt → upload → manifest)
+      3. 保存 watermark
+      4. 输出结构化 JSON evidence
+
+    Args:
+        output_json_path: 可选,将 evidence JSON 写入文件
+
+    Returns:
+        包含 backup_id / manifest / evidence 的字典
+
+    Raises:
+        RuntimeError: R2 凭证缺失 / 加密不可用 / 上传失败
+    """
+    # 确保数据库连接池已初始化
+    if not db_client.is_connected:
+        from database.session import init_db
+        await init_db()
+
+    try:
+        # R2 凭证动态配置
+        await configure_r2_dynamic()
+        if not r2_storage._access_key:
+            raise AppError(
+                ErrorCodes.BACKUP_RESTORE_R2_CREDENTIAL_MISSING,
+                params={
+                    "reason": (
+                        "R72 P0-10: R2 凭证缺失 — backup_once 需要 R2 凭证,"
+                        "不得在缺少凭证时返回成功(fail-closed)"
+                    ),
+                },
+            )
+
+        # 加密可用性检查
+        from services.backup_crypto import is_encryption_available
+        if not is_encryption_available():
+            raise AppError(
+                ErrorCodes.BACKUP_DECRYPT_KEK_MISSING,
+                params={
+                    "reason": "R72 P0-10: 加密不可用 — backup_once 需要 BACKUP_KEK 配置",
+                },
+            )
+
+        # 读取上次 watermark
+        last_wm = await _get_last_watermark()
+        if last_wm is None:
+            backup_type = "full"
+            watermark = None
+            incremental_count = 0
+        elif last_wm.get("incremental_count", 0) >= _FULL_BACKUP_INTERVAL:
+            backup_type = "full"
+            watermark = None
+            incremental_count = 0
+        else:
+            backup_type = "incremental"
+            watermark = last_wm.get("updated_at")
+            incremental_count = last_wm.get("incremental_count", 0) + 1
+
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        data = await backup_all_tables(watermark=watermark, backup_type=backup_type)
+
+        r38_metadata = data.pop("_r38_p1_5_metadata", {})
+        data = _redact_secrets(data)
+        plaintext = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
+
+        enc_result = encrypt_payload(
+            plaintext,
+            backup_id=timestamp,
+            schema_version=_BACKUP_SCHEMA_VERSION,
+        )
+
+        manifest = _build_bundle_manifest(
+            backup_data=data,
+            content=plaintext,
+            start_time=r38_metadata.get("start_time", datetime.now(timezone.utc)),
+            end_time=r38_metadata.get("end_time", datetime.now(timezone.utc)),
+            backup_type=r38_metadata.get("backup_type", backup_type),
+            watermark=r38_metadata.get("watermark"),
+            prev_watermark=r38_metadata.get("prev_watermark"),
+            ciphertext_sha256=enc_result.get("ciphertext_sha256"),
+            backup_id=timestamp,
+        )
+
+        if enc_result["encrypted"]:
+            from services.backup_crypto import get_key_id
+            manifest["encryption"] = {
+                "encrypted": True,
+                "algorithm": enc_result["algorithm"],
+                "wrapped_dek": enc_result["wrapped_dek"],
+                "nonce": enc_result["nonce"],
+                "key_id": enc_result.get("key_id") or get_key_id(),
+            }
+        else:
+            manifest["encryption"] = {"encrypted": False, "algorithm": "none"}
+
+        # 上传 payload + manifest
+        upload_content = enc_result["ciphertext"]
+        payload_key = f"db_backup/db_backup_{timestamp}_{backup_type}.bin"
+        await r2_storage.upload(
+            payload_key, upload_content,
+            "application/octet-stream" if enc_result["encrypted"] else "application/json",
+        )
+        manifest_key = f"db_backup/manifest_{timestamp}_{backup_type}.json"
+        await r2_storage.upload(
+            manifest_key,
+            json.dumps(manifest, ensure_ascii=False).encode("utf-8"),
+            "application/json",
+        )
+
+        # 保存 watermark
+        current_wm = manifest.get("watermark")
+        await _save_watermark(current_wm, backup_type, incremental_count)
+
+        evidence = {
+            "backup_id": timestamp,
+            "backup_type": backup_type,
+            "manifest": manifest,
+            "payload_key": payload_key,
+            "manifest_key": manifest_key,
+            "status": "success",
+        }
+
+        if output_json_path:
+            from pathlib import Path
+            Path(output_json_path).write_text(
+                json.dumps(evidence, ensure_ascii=False, indent=2, default=str),
+                encoding="utf-8",
+            )
+
+        logger.info(
+            _i18n_t('services.db_backup.s8', backup_id=timestamp, backup_type=backup_type)
+        )
+        return evidence
+
+    finally:
+        try:
+            from database.session import close_db
+            await close_db()
+        except Exception as close_err:
+            logger.warning(_i18n_t('services.db_backup.s9', error=close_err))
+        try:
+            await r2_storage.close()
+        except Exception as close_err:
+            logger.warning(_i18n_t('services.db_backup.s10', error=close_err))
+
+
+def main():
+    """R72 P0-10: db_backup CLI 入口。
+
+    用法:
+      # 一次性备份(不进入 daemon 循环)
+      python -m services.db_backup backup --once --output-json /tmp/backup_evidence.json
+
+      # daemon 模式(原有行为,通过 run_all.py 调用)
+      python -m services.db_backup daemon
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=_i18n_t('services.db_backup.s3')
+    )
+    subparsers = parser.add_subparsers(dest="command")
+
+    # backup 子命令
+    backup_parser = subparsers.add_parser("backup", help=_i18n_t('services.db_backup.s4'))
+    backup_parser.add_argument(
+        "--once", action="store_true",
+        help=_i18n_t('services.db_backup.s5'),
+    )
+    backup_parser.add_argument(
+        "--output-json", type=str, default=None,
+        help=_i18n_t('services.db_backup.s6'),
+    )
+
+    # daemon 子命令
+    daemon_parser = subparsers.add_parser("daemon", help=_i18n_t('services.db_backup.s7'))
+
+    args = parser.parse_args()
+
+    if args.command == "backup" and args.once:
+        result = asyncio.run(backup_once(output_json_path=args.output_json))
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    elif args.command == "daemon":
+        asyncio.run(run_db_backup())
+    else:
+        parser.print_help()
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

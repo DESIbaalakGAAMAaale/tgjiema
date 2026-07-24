@@ -120,6 +120,60 @@ class ConsistencyReport:
 # ════════════════════════════════════════════════════════════════
 
 
+# R72: PR check-run 产生条件 — pull_request 触发且 types 含默认类型
+# (opened/synchronize/reopened)。仅 closed 类型不产生 PR check-run。
+_PR_DEFAULT_TYPES = frozenset({"opened", "synchronize", "reopened"})
+
+
+def _workflow_produces_pr_checkruns(data: dict[str, Any]) -> bool:
+    """R72: 检查 workflow 是否在 PR 场景产生 check-run。
+
+    PR check-run 只在以下情况产生:
+    - ``on: pull_request`` (默认 types: opened/synchronize/reopened)
+    - ``on`` 同时含 ``pull_request`` 和其他触发器
+
+    不产生 PR check-run 的情况(所有 job 应排除):
+    - ``on: push`` / ``on: workflow_dispatch`` / ``on: schedule``
+    - ``on: pull_request: types: [closed]`` (只在 PR 关闭时运行,不产生 check-run)
+    - ``on: pull_request: types: [labeled]`` 等非默认类型
+
+    Args:
+        data: workflow YAML 解析后的 dict
+
+    Returns:
+        True if workflow 在 PR (opened/synchronize/reopened) 场景产生 check-run
+    """
+    # YAML 1.1 陷阱:`on:` 会被 PyYAML 解析为 boolean True 而非字符串 "on"。
+    # 同时检查两种 key 以兼容不同 YAML 解析器行为。
+    on_val = data.get("on")
+    if on_val is None:
+        on_val = data.get(True)
+    if on_val is None:
+        # 无 on 字段 — GitHub 默认 push 触发,不产生 PR check-run
+        return False
+    # on 可能是字符串、列表、或 dict
+    if isinstance(on_val, str):
+        return on_val == "pull_request"
+    if isinstance(on_val, list):
+        # 列表形式:on: [push, pull_request]
+        if "pull_request" not in on_val:
+            return False
+        return True  # pull_request 默认 types 含 opened/synchronize/reopened
+    if isinstance(on_val, dict):
+        pr_cfg = on_val.get("pull_request")
+        if pr_cfg is None:
+            return False  # 无 pull_request 触发器
+        if pr_cfg is True or pr_cfg == {}:
+            return True  # 默认 types (opened/synchronize/reopened)
+        if isinstance(pr_cfg, dict):
+            types_list = pr_cfg.get("types")
+            if not types_list:
+                return True  # 无 types = 默认 types
+            # 检查 types 是否含任一默认类型(产生 check-run 的类型)
+            return bool(_PR_DEFAULT_TYPES & set(types_list))
+    return False
+
+
 def _is_push_only_job(job_def: dict[str, Any]) -> bool:
     """检测 job 是否在 PR 场景下不会产生 check-run(不应作为 BP required context)。
 
@@ -265,6 +319,12 @@ def parse_workflow_file(
     workflow_name = str(data.get("name", path.stem))
     jobs_dict = data.get("jobs") or {}
 
+    # R72: workflow 级触发条件检查 — 如果 workflow 的 on 不含
+    # pull_request(或仅含 closed 等非默认 types),则所有 job 在 PR
+    # 场景都不产生 check-run,全部排除(如 promote-rc.yml 仅
+    # workflow_dispatch、auto-delete-branch.yml 仅 pull_request closed)。
+    workflow_pr_checkruns = _workflow_produces_pr_checkruns(data)
+
     jobs: list[str] = []
     excluded_jobs: list[str] = []
     self_excluded_jobs: list[str] = []
@@ -279,6 +339,11 @@ def parse_workflow_file(
         # release-gates.yml job 名)。
         if include_all_jobs:
             jobs.extend(expanded)
+            continue
+        # R72: workflow 级排除 — workflow 不在 PR 产生 check-run 时,
+        # 所有 job 排除(不作为 BP required context,否则 PR 永久阻塞)。
+        if not workflow_pr_checkruns:
+            excluded_jobs.extend(expanded)
             continue
         # R65 P1-12: 自排除 job(BP 不能要求自身,循环依赖)
         # verify-branch-protection 验证 BP 配置,若 BP 要求此 context 通过

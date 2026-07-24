@@ -69,7 +69,13 @@ R71 Solo Founder 必需的规则(solo-founder 模式,无审批死锁):
                          + require_code_owner_review=false(CODEOWNERS 保留但不阻断)
                          + required_review_thread_resolution=true
   - required_status_checks  strict_required_status_checks_policy=true(current-SHA,不允许 stale parent commit)
-                         + 36 个 required_status_checks(覆盖所有真实 release-gates.yml job 名)
+                         + 29 个 required_status_checks(仅 PR/master 事件可产生的 check,
+                           R72 P1-06 已移除 tag-only/environment-only 的 check 如
+                           compose-runtime-e2e / sign-image / publish-attestation /
+                           attestation-semantics-verify / verify-only-3x /
+                           migration-binding-gate / verify-rc-identity /
+                           production-promotion-gate)
+  - required_linear_history true  — 强制线性历史(无 merge commit,squash/rebase only)
   - bypass_actors        []    — 禁止任何角色(包括 admin)bypass;
                          紧急情况通过 scripts/record_break_glass.py 审计日志
 
@@ -200,14 +206,21 @@ if ! [[ "$REQUIRED_REVIEWERS" =~ ^[0-9]+$ ]] || [ "$REQUIRED_REVIEWERS" -lt 0 ];
   exit 1
 fi
 
-# ─── 4. R71 Solo Founder 必需 status checks(36 项,覆盖所有真实 release-gates.yml job 名) ───
-# R71 P1-02: 必需 status checks 列表必须完整,覆盖所有真实 release-gates.yml job 名。
-# 包括 R71 Wave 2 新增的 compose-runtime-e2e、R71 Wave 4 新增的 validate-oci-rootfs、
-# R71 Wave 5 新增的 verify-rc-identity、R71 Wave 7 新增的 bind-runtime-config,
-# 以及其他 release-gates.yml job。
+# ─── 4. R71 Solo Founder 必需 status checks(29 项,仅 PR/master 事件可产生的 check) ───
+# R71 P1-02: 必需 status checks 列表必须完整,覆盖所有 PR/master 事件实际可产生的
+# release-gates.yml job 名(以及 ci / e2e / deploy-check 中的 job)。
+# R72 P1-06: 移除以下 tag-only / environment-only 的 check(它们不在 PR/master 事件
+#   产出 check,会造成合并死锁):
+#   - compose-runtime-e2e / sign-image / publish-attestation /
+#     attestation-semantics-verify / verify-only-3x / migration-binding-gate:
+#     RC-only job(if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v'))
+#   - verify-rc-identity / production-promotion-gate: environment-only job
+#     (if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/production-v'))
+# 保留 R71 Wave 4 新增的 validate-oci-rootfs 与 R71 Wave 7 新增的 bind-runtime-config
+# (它们在 master push 事件产出 check,满足 PR/master 事件可产生要求)。
 REQUIRED_STATUS_CHECKS="${REQUIRED_STATUS_CHECKS:-}"
 if [ -z "$REQUIRED_STATUS_CHECKS" ]; then
-  REQUIRED_STATUS_CHECKS='["lint","static-gates","test","docker-build","docker-digest-verify","compose-config","redis-acl-matrix","schema-diff","restore-legacy-seal-gate","i18n-strict-export-boundary-gate","migration-manifest-gate","migration-binding-gate","button-flow-real-ux-gate","backup-restore-drill","sbom","pip-audit","trivy","sign-image","sign-artifacts","verify-branch-protection","verify-branch-ruleset","verify-git-source-governance","rc-continuity","publish-attestation","attestation-semantics-verify","verify-only-3x","tag-ruleset-verify","crdb-ru-72h-attribution-gate","production-evidence","production-promotion-gate","oci-allowlist-verify","validate-oci-rootfs","runtime-smoke-compose","compose-runtime-e2e","verify-rc-identity","bind-runtime-config","release-summary"]'
+  REQUIRED_STATUS_CHECKS='["lint","static-gates","test","docker-build","docker-digest-verify","compose-config","redis-acl-matrix","schema-diff","restore-legacy-seal-gate","i18n-strict-export-boundary-gate","migration-manifest-gate","button-flow-real-ux-gate","backup-restore-drill","sbom","pip-audit","trivy","sign-artifacts","verify-branch-protection","verify-branch-ruleset","verify-git-source-governance","rc-continuity","tag-ruleset-verify","crdb-ru-72h-attribution-gate","production-evidence","oci-allowlist-verify","validate-oci-rootfs","runtime-smoke-compose","bind-runtime-config","release-summary"]'
 fi
 # 校验是合法 JSON 数组
 if ! echo "$REQUIRED_STATUS_CHECKS" | jq -e 'type == "array" and length >= 1' > /dev/null 2>&1; then
@@ -219,18 +232,24 @@ if ! echo "$REQUIRED_STATUS_CHECKS" | jq -e 'all(.[]; type == "string")' > /dev/
   echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 数组元素必须全部为字符串"
   exit 1
 fi
-# R71 P1-02: 校验至少包含 36 个 context(覆盖所有真实 release-gates.yml job 名)
+# R71 P1-02 / R72 P1-06: 校验至少包含 29 个 context(仅 PR/master 事件可产生的 check,
+# 已移除 8 个 tag-only/environment-only 的 check: compose-runtime-e2e / sign-image /
+# publish-attestation / attestation-semantics-verify / verify-only-3x /
+# migration-binding-gate / verify-rc-identity / production-promotion-gate)
 REQUIRED_CHECKS_COUNT=$(echo "$REQUIRED_STATUS_CHECKS" | jq 'length')
-if [ "$REQUIRED_CHECKS_COUNT" -lt 36 ]; then
-  echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 至少需要 36 个 context(覆盖所有 release-gates.yml job),实际: $REQUIRED_CHECKS_COUNT"
+if [ "$REQUIRED_CHECKS_COUNT" -lt 29 ]; then
+  echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 至少需要 29 个 context(仅 PR/master 事件可产生的 release-gates.yml job),实际: $REQUIRED_CHECKS_COUNT"
   exit 1
 fi
 
 # ─── 5. 构造 R71 Solo Founder ruleset payload ───
-# R71 P1-01/02/03:
+# R71 P1-01/02/03 + R72 P1-06:
 #   - required_approving_review_count: 0(solo founder,无审批死锁)
 #   - require_code_owner_review: false(CODEOWNERS 保留但不阻断)
 #   - strict_required_status_checks_policy: true(current-SHA,不允许 stale parent commit)
+#   - required_linear_history: true(强制线性历史,无 merge commit,squash/rebase only,
+#     与 .github/branch_ruleset.expected.json 一致 — R72 P1-06 修复: 旧 payload 缺失此 rule)
+#   - do_not_enforce_on_create: false(与 expected.json 一致,创建 PR 时仍强制 check)
 #   - bypass_actors: [](无 admin/app bypass;紧急情况通过 record_break_glass.py 审计日志)
 PAYLOAD=$(jq -n \
   --arg name "$RULESET_NAME" \
@@ -254,6 +273,7 @@ PAYLOAD=$(jq -n \
     {"type": "non_fast_forward"},
     {"type": "update"},
     {"type": "required_signatures"},
+    {"type": "required_linear_history"},
     {
       "type": "pull_request",
       "parameters": {
@@ -268,7 +288,8 @@ PAYLOAD=$(jq -n \
       "type": "required_status_checks",
       "parameters": {
         "required_status_checks": ($required_checks | map({context: .})),
-        "strict_required_status_checks_policy": true
+        "strict_required_status_checks_policy": true,
+        "do_not_enforce_on_create": false
       }
     }
   ]
@@ -405,6 +426,10 @@ echo "Assert: rules 包含 required_signatures (强制 GPG 签名验证)"
 echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "required_signatures")' > /dev/null \
   || { echo "ERROR: [R71 P1-01] rules 缺少 required_signatures 类型"; exit 1; }
 
+echo "Assert: rules 包含 required_linear_history (强制线性历史,无 merge commit)"
+echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "required_linear_history")' > /dev/null \
+  || { echo "ERROR: [R72 P1-06] rules 缺少 required_linear_history 类型(与 expected.json 不一致)"; exit 1; }
+
 echo "Assert: rules 包含 pull_request (PR-only 流程)"
 echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "pull_request")' > /dev/null \
   || { echo "ERROR: [R71 P1-01] rules 缺少 pull_request 类型"; exit 1; }
@@ -433,7 +458,7 @@ echo "Assert: required_status_checks.strict_required_status_checks_policy == tru
 echo "$RULESET_JSON" | jq -e '[.rules[] | select(.type == "required_status_checks") | .parameters.strict_required_status_checks_policy] | add == true' > /dev/null \
   || { echo "ERROR: [R71 P1-03] required_status_checks.strict_required_status_checks_policy != true"; exit 1; }
 
-echo "Assert: required_status_checks 包含全部 36 个必需 check (R71 P1-02)"
+echo "Assert: required_status_checks 包含全部 29 个必需 check (R71 P1-02 / R72 P1-06)"
 ACTUAL_CHECKS=$(echo "$RULESET_JSON" \
   | jq -r '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | sort | join(",")')
 EXPECTED_CHECKS=$(echo "$REQUIRED_STATUS_CHECKS" | jq -r 'sort | join(",")')
@@ -444,8 +469,16 @@ if [ "$ACTUAL_CHECKS" != "$EXPECTED_CHECKS" ]; then
   exit 1
 fi
 
-echo "Assert: required_status_checks 包含 R71 Wave 2/4/5/7 新增 check"
-for ctx in "compose-runtime-e2e" "validate-oci-rootfs" "verify-rc-identity" "bind-runtime-config"; do
+echo "Assert: required_status_checks 不包含 tag-only / environment-only 的 check (R72 P1-06)"
+# R72 P1-06: 以下 check 不在 PR/master 事件产出,会造成合并死锁,必须移除
+for ctx in "compose-runtime-e2e" "sign-image" "publish-attestation" "attestation-semantics-verify" "verify-only-3x" "migration-binding-gate" "verify-rc-identity" "production-promotion-gate"; do
+  echo "$RULESET_JSON" | jq -e --arg c "$ctx" \
+    '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == $c)' > /dev/null \
+    && { echo "ERROR: [R72 P1-06] required_status_checks 不应包含 tag-only/environment-only check: $ctx"; exit 1; }
+done
+
+echo "Assert: required_status_checks 包含 R71 Wave 4/7 新增 check (PR/master 事件可产生)"
+for ctx in "validate-oci-rootfs" "bind-runtime-config"; do
   echo "$RULESET_JSON" | jq -e --arg c "$ctx" \
     '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == $c)' > /dev/null \
     || { echo "ERROR: [R71 P1-02] required_status_checks 缺少 R71 新增 check: $ctx"; exit 1; }
@@ -456,7 +489,7 @@ echo "$RULESET_JSON" | jq -e '(.bypass_actors // []) | length == 0' > /dev/null 
   || { echo "ERROR: [R71 P1-01] bypass_actors 非空(应禁止任何角色 bypass)"; exit 1; }
 
 echo ""
-echo "✓ [R71 P1-01/02/03] 所有断言通过"
+echo "✓ [R71 P1-01/02/03 + R72 P1-06] 所有断言通过"
 echo ""
 echo "最终配置(关键字段):"
 echo "$RULESET_JSON" | jq '{id, name, target, source_type, enforcement, conditions, rules, bypass_actors}'
@@ -465,7 +498,9 @@ echo ""
 echo "=========================================================="
 echo "  ✓ R71 Solo Founder Branch Ruleset 已配置成功"
 echo "  P1-01: required_approving_review_count=0 (无审批死锁)"
-echo "  P1-02: 36 个 required_status_checks (全 release gates)"
+echo "  P1-02: 29 个 required_status_checks (仅 PR/master 事件可产生的 check)"
 echo "  P1-03: strict_required_status_checks_policy=true (current-SHA)"
+echo "  R72 P1-06: required_linear_history=true (强制线性历史)"
+echo "  R72 P1-06: 已移除 8 个 tag-only/environment-only check (避免合并死锁)"
 echo "  bypass_actors=[] (无 admin bypass; 紧急情况用 record_break_glass.py)"
 echo "=========================================================="

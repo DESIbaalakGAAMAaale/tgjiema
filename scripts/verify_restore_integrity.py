@@ -24,7 +24,7 @@
       5. 恢复目标隔离验证(--target-db staging)
       6. 应用启动/读写验证(python -m services.health + INSERT/SELECT/DELETE)
       7. 恢复环境合成交易(synthetic_transaction.run_full_transaction)
-      8. 切换/回滚证据(RestoreOrchestrator import check + 结构化 JSON)
+      8. 切换/回滚证据(R72 P0-12: 实际执行 RestoreOrchestrator switch/rollback + 结构化 JSON)
       9. 机器可读恢复证据(增强 IntegrityEvidence dataclass)
 
 调用方式:
@@ -54,7 +54,7 @@
     - docker compose exec db_writer python -c "..." 执行 SQL
     - docker compose exec db_writer python -m services.health --role db_writer --json
     - scripts/synthetic_transaction.py 的 run_full_transaction()
-    - services.restore_orchestrator 的 import check(不实际执行切换)
+    - services.restore_orchestrator 的实际 switch/rollback 执行(R72 P0-12: 不再只是 import check)
 """
 # R71 RC35: 移除 `from __future__ import annotations`。
 # 根因(RC33 同类): `from __future__ import annotations` + `@dataclass` + PEP 604
@@ -380,6 +380,8 @@ class IntegrityEvidence:
     synthetic_transaction: dict[str, Any] = field(default_factory=dict)
     switch_rollback_evidence: dict[str, Any] = field(default_factory=dict)
     target_db: str = DEFAULT_TARGET_DB
+    # R72 P0-11: evidence 中记录实际使用的数据库路径(容器内绝对路径)
+    actual_db_path: str = ""
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1105,14 +1107,23 @@ def verify_app_read_write(
 # ════════════════════════════════════════════════════════════════
 
 
-def run_synthetic_transaction_in_restored_env(timeout: int = 60) -> dict[str, Any]:
+def run_synthetic_transaction_in_restored_env(
+    timeout: int = 60,
+    target_db: str = DEFAULT_TARGET_DB,
+) -> dict[str, Any]:
     """在恢复环境中运行合成交易。
 
     通过 scripts/synthetic_transaction.py 的 run_full_transaction() 执行。
     合成交易验证完整业务链:Redis Stream → db_writer → SQLite → 幂等 → DLQ → 清理。
 
+    R72 P0-11: target_db 参数化 — 将 verify_restore_integrity 的 target_db 别名
+    (production / staging)解析为容器内绝对路径,传递给
+    synthetic_transaction.run_full_transaction(target_db=<path>),
+    确保合成交易在隔离的 staging 恢复库上执行,不污染 production。
+
     Args:
         timeout: 单步骤最大等待秒数
+        target_db: 目标数据库别名(production / staging),解析为容器内路径
 
     Returns:
         dict: 合成交易证据(TransactionEvidence asdict)
@@ -1121,6 +1132,7 @@ def run_synthetic_transaction_in_restored_env(timeout: int = 60) -> dict[str, An
         return {
             "overall_passed": False,
             "error": f"synthetic_transaction.py 不存在: {SYNTHETIC_TRANSACTION_PATH}",
+            "target_db": target_db,
         }
 
     try:
@@ -1131,6 +1143,7 @@ def run_synthetic_transaction_in_restored_env(timeout: int = 60) -> dict[str, An
             return {
                 "overall_passed": False,
                 "error": "加载 synthetic_transaction 模块失败(spec/loader 为 None)",
+                "target_db": target_db,
             }
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -1139,15 +1152,24 @@ def run_synthetic_transaction_in_restored_env(timeout: int = 60) -> dict[str, An
         return {
             "overall_passed": False,
             "error": f"加载 synthetic_transaction 模块异常: {type(e).__name__}: {e}",
+            "target_db": target_db,
         }
 
+    # R72 P0-11: 将 target_db 别名解析为容器内绝对路径
+    # synthetic_transaction.run_full_transaction 接受路径字符串(非别名),
+    # 因此必须通过 _get_db_path 解析为 /app/data/cache_store.db 或
+    # /app/data/staging/cache_store.db,禁止默认回退到 production 路径。
+    db_path = _get_db_path(target_db)
+
     try:
-        evidence = module.run_full_transaction(timeout=timeout)
+        evidence = module.run_full_transaction(timeout=timeout, target_db=db_path)
     except Exception as e:
         # fail-closed:不吞异常,转换为证据
         return {
             "overall_passed": False,
             "error": f"run_full_transaction 异常: {type(e).__name__}: {e}",
+            "target_db": target_db,
+            "actual_db_path": db_path,
         }
 
     # 将 TransactionEvidence 转换为 dict
@@ -1161,88 +1183,526 @@ def run_synthetic_transaction_in_restored_env(timeout: int = 60) -> dict[str, An
         return {
             "overall_passed": False,
             "error": f"转换 TransactionEvidence 为 dict 失败: {type(e).__name__}: {e}",
+            "target_db": target_db,
+            "actual_db_path": db_path,
         }
+
+    # R72 P0-11: evidence 中记录实际使用的数据库路径
+    evidence_dict["target_db"] = target_db
+    evidence_dict["actual_db_path"] = db_path
 
     return evidence_dict
 
 
 # ════════════════════════════════════════════════════════════════
-# 切换/回滚证据
+# 切换/回滚证据(R72 P0-12: 实际执行,不再只是 import check)
 # ════════════════════════════════════════════════════════════════
 
 
-def generate_switch_rollback_evidence() -> dict[str, Any]:
-    """生成切换/回滚证据(结构化 JSON)。
+def _record_db_identity(target_db: str = DEFAULT_TARGET_DB) -> dict[str, Any]:
+    """R72 P0-12: 记录数据库 identity(用于 switch/rollback 前后比对)。
 
-    不实际执行破坏性切换,只验证切换/回滚流程是否就位:
-      - services.restore_orchestrator 可导入
-      - RestoreOrchestrator 类存在
-      - RestorePhase 枚举包含 BLUE_GREEN_SWITCH 和 ROLLED_BACK 阶段
-      - 文档化切换和回滚步骤
+    记录:
+      - db_path (容器内绝对路径)
+      - schema_version (从 app_meta 读取)
+      - critical table row counts
+      - timestamp
+
+    Args:
+        target_db: 目标数据库别名(production / staging)
 
     Returns:
-        dict: 切换/回滚证据
+        dict: 数据库 identity 快照
     """
-    evidence: dict[str, Any] = {
-        "orchestrator_available": False,
-        "restore_phases": [],
-        "switch_procedure": "",
-        "rollback_procedure": "",
+    db_path = _get_db_path(target_db)
+    identity: dict[str, Any] = {
+        "target_db": target_db,
+        "db_path": db_path,
+        "timestamp": _now_iso(),
+        "schema_version": "",
+        "table_counts": {},
         "error": None,
     }
 
+    # 读取 schema_version
+    rc, stdout, stderr = _exec_sql(
+        "SELECT value as v FROM app_meta WHERE key = 'schema_version'",
+        target_db=target_db,
+    )
+    if rc == 0:
+        try:
+            text = stdout.strip()
+            if text.startswith("["):
+                rows = json.loads(text)
+                identity["schema_version"] = rows[0]["v"] if rows else ""
+        except (json.JSONDecodeError, IndexError, KeyError, ValueError, TypeError):
+            pass
+
+    # 读取关键表 row count
+    for table in CRITICAL_TABLES:
+        rc, stdout, stderr = _exec_sql(
+            f"SELECT COUNT(*) as cnt FROM {table}",
+            target_db=target_db,
+        )
+        if rc == 0:
+            try:
+                text = stdout.strip()
+                if text.startswith("["):
+                    rows = json.loads(text)
+                    identity["table_counts"][table] = rows[0]["cnt"] if rows else 0
+                else:
+                    identity["table_counts"][table] = 0
+            except (json.JSONDecodeError, IndexError, KeyError, ValueError, TypeError):
+                identity["table_counts"][table] = -1
+        else:
+            identity["table_counts"][table] = -1
+
+    return identity
+
+
+def _run_business_probe(target_db: str = DEFAULT_TARGET_DB) -> dict[str, Any]:
+    """R72 P0-12: 执行业务探针(health check + 标记可读性)。
+
+    Args:
+        target_db: 目标数据库别名(production / staging)
+
+    Returns:
+        dict: {"healthy": bool, "details": dict, "error": str|None}
+    """
+    probe: dict[str, Any] = {
+        "healthy": False,
+        "details": {},
+        "error": None,
+        "timestamp": _now_iso(),
+    }
+
+    # health check
+    rc, stdout, stderr = _exec_health(role="db_writer")
+    health_data: dict[str, Any] = {}
+    if rc == 0:
+        try:
+            health_data = json.loads(stdout.strip())
+        except (json.JSONDecodeError, ValueError):
+            health_data = {}
+    probe["details"]["health_check"] = {
+        "returncode": rc,
+        "healthy": bool(health_data.get("healthy", False)),
+        "stdout_excerpt": (stdout or "")[:500],
+        "stderr_excerpt": (stderr or "")[:500],
+    }
+
+    # 标记可读性(SELECT COUNT FROM bot_heartbeat)
+    rc2, stdout2, stderr2 = _exec_sql(
+        f"SELECT COUNT(*) as cnt FROM {MARKER_TABLE}",
+        target_db=target_db,
+    )
+    marker_readable = False
+    if rc2 == 0:
+        try:
+            text = stdout2.strip()
+            if text.startswith("["):
+                rows = json.loads(text)
+                marker_readable = rows[0]["cnt"] >= 0 if rows else True
+        except (json.JSONDecodeError, IndexError, KeyError, ValueError, TypeError):
+            pass
+    probe["details"]["marker_readable"] = {
+        "returncode": rc2,
+        "readable": marker_readable,
+    }
+
+    probe["healthy"] = (
+        bool(health_data.get("healthy", False)) and marker_readable
+    )
+    if not probe["healthy"]:
+        probe["error"] = (
+            f"health={health_data.get('healthy', False)}, "
+            f"marker_readable={marker_readable}"
+        )
+    return probe
+
+
+def _execute_switch_in_container(
+    operation_id: str,
+    approval_id: str,
+    mfa_receipt_id: str,
+    target_db: str = DEFAULT_TARGET_DB,
+) -> dict[str, Any]:
+    """R72 P0-12: 在容器内实际执行蓝绿切换(execute_blue_green_switch)。
+
+    通过 docker compose exec db_writer python -c "..." 执行,
+    构造 RestoreOrchestrator 并调用 execute_blue_green_switch。
+
+    Args:
+        operation_id: 恢复操作 ID(必须处于 AWAIT_APPROVAL 阶段)
+        approval_id: 审批 ID(由 ApprovalAuthority CAS 消费)
+        mfa_receipt_id: MFA receipt ID(由 MFAAuthority CAS 消费)
+        target_db: 目标数据库别名(production / staging)
+
+    Returns:
+        dict: {"success": bool, "switch_version": str, "error": str|None}
+    """
+    # 将参数安全嵌入(json.dumps 保证字符串安全转义)
+    op_id_json = json.dumps(operation_id)
+    appr_id_json = json.dumps(approval_id)
+    mfa_id_json = json.dumps(mfa_receipt_id)
+
+    # 构造容器内 Python 脚本(实际构造 RestoreOrchestrator + 执行 switch)
+    code = (
+        "import asyncio, json, traceback\n"
+        "async def _r72_switch():\n"
+        "    try:\n"
+        "        from database.cache_store import CacheStore\n"
+        "        from services.restore_backends import (\n"
+        "            BackendRegistry, SQLiteRestoreBackend,\n"
+        "        )\n"
+        "        from services.restore_capabilities import (\n"
+        "            ApprovalAuthority, MFAAuthority,\n"
+        "        )\n"
+        "        from services.restore_orchestrator import RestoreOrchestrator\n"
+        "        store = CacheStore()\n"
+        "        await store.init()\n"
+        "        try:\n"
+        "            backends = BackendRegistry()\n"
+        "            backends.register('sqlite', SQLiteRestoreBackend(\n"
+        "                datasource_name='sqlite',\n"
+        "                active_db_path='/app/data/cache_store.db',\n"
+        "            ))\n"
+        "            approval_authority = ApprovalAuthority(store=store)\n"
+        "            mfa_authority = MFAAuthority(store=store)\n"
+        "            orch = RestoreOrchestrator(\n"
+        "                store=store,\n"
+        "                backends=backends,\n"
+        "                approval_authority=approval_authority,\n"
+        "                mfa_authority=mfa_authority,\n"
+        "            )\n"
+        "            switch_version = await orch.execute_blue_green_switch(\n"
+        f"                operation_id={op_id_json},\n"
+        f"                approval_id={appr_id_json},\n"
+        f"                mfa_receipt_id={mfa_id_json},\n"
+        "            )\n"
+        "            print(json.dumps({\n"
+        "                'success': True,\n"
+        "                'switch_version': str(switch_version),\n"
+        "            }))\n"
+        "        finally:\n"
+        "            await store.close()\n"
+        "    except Exception as e:\n"
+        "        print(json.dumps({\n"
+        "            'success': False,\n"
+        "            'error': f'{type(e).__name__}: {e}',\n"
+        "            'traceback': traceback.format_exc()[-2000:],\n"
+        "        }))\n"
+        "asyncio.run(_r72_switch())\n"
+    )
+
+    rc, stdout, stderr = _exec_python(code, timeout=180, target_db=target_db)
+
+    result: dict[str, Any] = {
+        "success": False,
+        "switch_version": "",
+        "error": None,
+        "returncode": rc,
+    }
+    if rc != 0:
+        result["error"] = (
+            f"容器内执行 switch 失败 (exit={rc}): "
+            f"stderr={(stderr or '')[:1000]}"
+        )
+        return result
+
+    try:
+        parsed = json.loads(stdout.strip())
+        result["success"] = bool(parsed.get("success", False))
+        result["switch_version"] = str(parsed.get("switch_version", ""))
+        if not result["success"]:
+            result["error"] = str(parsed.get("error", "未知错误"))
+            result["traceback"] = str(parsed.get("traceback", ""))
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        result["error"] = (
+            f"解析 switch 结果 JSON 失败: {type(e).__name__}: {e}; "
+            f"stdout={(stdout or '')[:1000]}"
+        )
+    return result
+
+
+def _execute_rollback_in_container(
+    operation_id: str,
+    reason: str,
+    target_db: str = DEFAULT_TARGET_DB,
+) -> dict[str, Any]:
+    """R72 P0-12: 在容器内实际执行回滚(rollback_operation)。
+
+    通过 docker compose exec db_writer python -c "..." 执行,
+    构造 RestoreOrchestrator 并调用 rollback_operation。
+
+    Args:
+        operation_id: 恢复操作 ID(必须处于 COMPLETED 阶段)
+        reason: 回滚原因(写入审计事件)
+        target_db: 目标数据库别名(production / staging)
+
+    Returns:
+        dict: {"success": bool, "rollback_version": str, "error": str|None}
+    """
+    op_id_json = json.dumps(operation_id)
+    reason_json = json.dumps(reason)
+
+    code = (
+        "import asyncio, json, traceback\n"
+        "async def _r72_rollback():\n"
+        "    try:\n"
+        "        from database.cache_store import CacheStore\n"
+        "        from services.restore_backends import (\n"
+        "            BackendRegistry, SQLiteRestoreBackend,\n"
+        "        )\n"
+        "        from services.restore_capabilities import (\n"
+        "            ApprovalAuthority, MFAAuthority,\n"
+        "        )\n"
+        "        from services.restore_orchestrator import RestoreOrchestrator\n"
+        "        store = CacheStore()\n"
+        "        await store.init()\n"
+        "        try:\n"
+        "            backends = BackendRegistry()\n"
+        "            backends.register('sqlite', SQLiteRestoreBackend(\n"
+        "                datasource_name='sqlite',\n"
+        "                active_db_path='/app/data/cache_store.db',\n"
+        "            ))\n"
+        "            approval_authority = ApprovalAuthority(store=store)\n"
+        "            mfa_authority = MFAAuthority(store=store)\n"
+        "            orch = RestoreOrchestrator(\n"
+        "                store=store,\n"
+        "                backends=backends,\n"
+        "                approval_authority=approval_authority,\n"
+        "                mfa_authority=mfa_authority,\n"
+        "            )\n"
+        "            rollback_version = await orch.rollback_operation(\n"
+        f"                operation_id={op_id_json},\n"
+        f"                reason={reason_json},\n"
+        "            )\n"
+        "            print(json.dumps({\n"
+        "                'success': True,\n"
+        "                'rollback_version': str(rollback_version),\n"
+        "            }))\n"
+        "        finally:\n"
+        "            await store.close()\n"
+        "    except Exception as e:\n"
+        "        print(json.dumps({\n"
+        "            'success': False,\n"
+        "            'error': f'{type(e).__name__}: {e}',\n"
+        "            'traceback': traceback.format_exc()[-2000:],\n"
+        "        }))\n"
+        "asyncio.run(_r72_rollback())\n"
+    )
+
+    rc, stdout, stderr = _exec_python(code, timeout=180, target_db=target_db)
+
+    result: dict[str, Any] = {
+        "success": False,
+        "rollback_version": "",
+        "error": None,
+        "returncode": rc,
+    }
+    if rc != 0:
+        result["error"] = (
+            f"容器内执行 rollback 失败 (exit={rc}): "
+            f"stderr={(stderr or '')[:1000]}"
+        )
+        return result
+
+    try:
+        parsed = json.loads(stdout.strip())
+        result["success"] = bool(parsed.get("success", False))
+        result["rollback_version"] = str(parsed.get("rollback_version", ""))
+        if not result["success"]:
+            result["error"] = str(parsed.get("error", "未知错误"))
+            result["traceback"] = str(parsed.get("traceback", ""))
+    except (json.JSONDecodeError, ValueError, TypeError) as e:
+        result["error"] = (
+            f"解析 rollback 结果 JSON 失败: {type(e).__name__}: {e}; "
+            f"stdout={(stdout or '')[:1000]}"
+        )
+    return result
+
+
+def generate_switch_rollback_evidence(
+    target_db: str = DEFAULT_TARGET_DB,
+) -> dict[str, Any]:
+    """R72 P0-12: 生成切换/回滚证据 — 实际执行 switch/rollback。
+
+    不再只是 import check,而是实际执行:
+      1. 记录旧数据库 identity
+      2. 执行切换到恢复库(execute_blue_green_switch)
+      3. 执行业务探针(health check)
+      4. 注入失败(模拟故障检测,触发回滚)
+      5. 回滚到旧库(rollback_operation)
+      6. 再次执行业务探针
+      7. 记录 RPO、RTO 和切换时间
+
+    R72 P0-12 fail-closed 原则:
+      - 如果无法实际执行(缺少 RestoreOrchestrator 或凭证),
+        必须返回失败(orchestrator_executed=False, passed=False),
+        不能返回伪成功。
+      - evidence 必须包含实际执行的证据,不是字段存在。
+
+    凭证来源(环境变量):
+      - RESTORE_OPERATION_ID: 恢复操作 ID(必须处于 AWAIT_APPROVAL 阶段)
+      - RESTORE_APPROVAL_ID: 审批 ID
+      - RESTORE_MFA_RECEIPT_ID: MFA receipt ID
+
+    Args:
+        target_db: 目标数据库别名(production / staging)
+
+    Returns:
+        dict: 切换/回滚证据,包含:
+            - orchestrator_available: RestoreOrchestrator 是否可导入
+            - orchestrator_executed: 是否实际执行了 switch/rollback
+            - passed: switch/rollback 是否通过
+            - old_db_identity: 旧数据库 identity
+            - new_db_identity: 回滚后数据库 identity
+            - switch_time_seconds: 切换耗时
+            - rto_seconds: 回滚耗时(RTO)
+            - rpo_seconds: RPO(0 表示无数据丢失)
+            - business_probe_after_switch: 切换后业务探针结果
+            - business_probe_after_rollback: 回滚后业务探针结果
+            - switch_version / rollback_version: 版本指针
+            - error: 错误信息(None 表示无错误)
+    """
+    evidence: dict[str, Any] = {
+        "orchestrator_available": False,
+        "orchestrator_executed": False,
+        "passed": False,
+        "target_db": target_db,
+        "actual_db_path": _get_db_path(target_db),
+        "old_db_identity": {},
+        "new_db_identity": {},
+        "switch_time_seconds": 0.0,
+        "rto_seconds": 0.0,
+        "rpo_seconds": 0.0,
+        "business_probe_after_switch": {},
+        "business_probe_after_rollback": {},
+        "switch_version": "",
+        "rollback_version": "",
+        "restore_phases": [],
+        "error": None,
+    }
+
+    # ── 1. 尝试导入 RestoreOrchestrator(host 侧 import check) ──
     try:
         import services.restore_orchestrator as ro
         evidence["orchestrator_available"] = True
-
-        # 检查 RestorePhase 枚举
         try:
-            phases = [p.value for p in ro.RestorePhase]
-            evidence["restore_phases"] = phases
-        except (AttributeError, TypeError) as e:
-            evidence["error"] = f"无法读取 RestorePhase 枚举: {e}"
-
-        # 检查关键阶段是否存在
-        has_switch = False
-        has_rollback = False
-        try:
-            for phase in ro.RestorePhase:
-                val = phase.value if hasattr(phase, "value") else str(phase)
-                if "switch" in val.lower():
-                    has_switch = True
-                if "rollback" in val.lower() or "rolled_back" in val.lower():
-                    has_rollback = True
+            evidence["restore_phases"] = [p.value for p in ro.RestorePhase]
         except (AttributeError, TypeError):
-            pass
-        evidence["has_switch_phase"] = has_switch
-        evidence["has_rollback_phase"] = has_rollback
-
+            evidence["restore_phases"] = []
     except ImportError as e:
-        evidence["error"] = f"无法导入 services.restore_orchestrator: {e}"
+        evidence["error"] = (
+            f"无法导入 services.restore_orchestrator(fail-closed): {e}"
+        )
         return evidence
     except Exception as e:
-        # fail-closed:不吞异常,记录到证据
-        evidence["error"] = f"导入 restore_orchestrator 异常: {type(e).__name__}: {e}"
+        evidence["error"] = (
+            f"导入 restore_orchestrator 异常(fail-closed): "
+            f"{type(e).__name__}: {e}"
+        )
         return evidence
 
-    # 文档化切换/回滚步骤(不实际执行)
-    evidence["switch_procedure"] = (
-        "切换步骤(由 RestoreOrchestrator 执行,不在 E2E 中实际运行):\n"
-        "1. 验证 staging 数据完整性(通过 verify_restore_integrity.py full-check)\n"
-        "2. 将 staging 提升为 active(RestorePhase.BLUE_GREEN_SWITCH)\n"
-        "3. 记录 previous_version 作为回滚目标\n"
-        "4. 等待新 active 健康检查通过\n"
-        "5. 标记 RestorePhase.COMPLETED"
+    # ── 2. 读取凭证(operation_id / approval_id / mfa_receipt_id) ──
+    # R72 P0-12: 凭证缺失时 fail-closed,不返回伪成功
+    operation_id = os.environ.get("RESTORE_OPERATION_ID", "").strip()
+    approval_id = os.environ.get("RESTORE_APPROVAL_ID", "").strip()
+    mfa_receipt_id = os.environ.get("RESTORE_MFA_RECEIPT_ID", "").strip()
+
+    if not operation_id or not approval_id or not mfa_receipt_id:
+        evidence["error"] = (
+            "缺少恢复操作凭证,无法实际执行 switch/rollback (fail-closed). "
+            "需要环境变量: RESTORE_OPERATION_ID / RESTORE_APPROVAL_ID / "
+            "RESTORE_MFA_RECEIPT_ID. "
+            f"operation_id={'有' if operation_id else '无'}, "
+            f"approval_id={'有' if approval_id else '无'}, "
+            f"mfa_receipt_id={'有' if mfa_receipt_id else '无'}"
+        )
+        return evidence
+
+    # ── 3. 记录旧数据库 identity ──
+    old_identity = _record_db_identity(target_db=target_db)
+    evidence["old_db_identity"] = old_identity
+
+    # ── 4. 执行切换到恢复库(execute_blue_green_switch) ──
+    switch_start = time.time()
+    switch_result = _execute_switch_in_container(
+        operation_id=operation_id,
+        approval_id=approval_id,
+        mfa_receipt_id=mfa_receipt_id,
+        target_db=target_db,
     )
-    evidence["rollback_procedure"] = (
-        "回滚步骤(由 RestoreOrchestrator 执行,不在 E2E 中实际运行):\n"
-        "1. 检测新 active 健康检查失败或数据异常\n"
-        "2. 降级 staging(demote),恢复 production 从 previous backup\n"
-        "3. RestorePhase.ROLLED_BACK\n"
-        "4. 验证回滚后的 active 数据完整性\n"
-        "5. 通知运维团队"
+    switch_time = time.time() - switch_start
+    evidence["switch_time_seconds"] = round(switch_time, 3)
+
+    if not switch_result.get("success", False):
+        evidence["error"] = (
+            f"切换失败(fail-closed): {switch_result.get('error', '未知错误')}"
+        )
+        if switch_result.get("traceback"):
+            evidence["switch_traceback"] = switch_result["traceback"]
+        return evidence
+
+    evidence["switch_version"] = switch_result.get("switch_version", "")
+
+    # ── 5. 切换后业务探针 ──
+    probe_after_switch = _run_business_probe(target_db=target_db)
+    evidence["business_probe_after_switch"] = probe_after_switch
+
+    # ── 6. 注入失败 + 回滚到旧库(rollback_operation) ──
+    # R72 P0-12: 模拟故障检测,触发回滚
+    rollback_start = time.time()
+    rollback_result = _execute_rollback_in_container(
+        operation_id=operation_id,
+        reason="R72 P0-12: E2E 故障注入 — 验证回滚能力",
+        target_db=target_db,
     )
-    evidence["performed_in_e2e"] = False  # E2E 中不实际执行破坏性切换
+    rto = time.time() - rollback_start
+    evidence["rto_seconds"] = round(rto, 3)
+
+    if not rollback_result.get("success", False):
+        evidence["error"] = (
+            f"回滚失败(fail-closed): {rollback_result.get('error', '未知错误')}"
+        )
+        if rollback_result.get("traceback"):
+            evidence["rollback_traceback"] = rollback_result["traceback"]
+        return evidence
+
+    evidence["rollback_version"] = rollback_result.get("rollback_version", "")
+
+    # ── 7. 回滚后业务探针 ──
+    probe_after_rollback = _run_business_probe(target_db=target_db)
+    evidence["business_probe_after_rollback"] = probe_after_rollback
+
+    # ── 8. 记录回滚后数据库 identity + RPO 计算 ──
+    new_identity = _record_db_identity(target_db=target_db)
+    evidence["new_db_identity"] = new_identity
+
+    # RPO: 回滚后 identity 应与旧 identity 一致(数据无丢失)
+    # RPO=0 表示无数据丢失;>0 表示有数据窗口
+    identity_match = (
+        old_identity.get("schema_version") == new_identity.get("schema_version")
+        and old_identity.get("table_counts") == new_identity.get("table_counts")
+    )
+    evidence["rpo_seconds"] = 0.0 if identity_match else round(switch_time + rto, 3)
+
+    # ── 9. 最终判定 ──
+    probe_passed = (
+        bool(probe_after_switch.get("healthy", False))
+        and bool(probe_after_rollback.get("healthy", False))
+    )
+    evidence["orchestrator_executed"] = True
+    evidence["passed"] = bool(identity_match and probe_passed)
+
+    if not evidence["passed"]:
+        evidence["error"] = (
+            f"switch/rollback 已执行但未通过: "
+            f"identity_match={identity_match}, "
+            f"probe_after_switch={probe_after_switch.get('healthy')}, "
+            f"probe_after_rollback={probe_after_rollback.get('healthy')}"
+        )
 
     return evidence
 
@@ -1252,11 +1712,12 @@ def generate_switch_rollback_evidence() -> dict[str, Any]:
 # ════════════════════════════════════════════════════════════════
 
 
-def write_marker(trace_id: str) -> int:
+def write_marker(trace_id: str, target_db: str = DEFAULT_TARGET_DB) -> int:
     """写入测试标记行到 bot_heartbeat 表。
 
     Args:
         trace_id: 唯一标识符(作为 bot_heartbeat.name)
+        target_db: 目标数据库(production / staging)
 
     Returns:
         0 成功,1 失败
@@ -1267,14 +1728,14 @@ def write_marker(trace_id: str) -> int:
         f"(name, last_ping, is_running, total_processed, total_errors) "
         f"VALUES ('{trace_id}', 0, 1, 0, 0)"
     )
-    rc, stdout, stderr = _exec_sql(query)
+    rc, stdout, stderr = _exec_sql(query, target_db=target_db)
     if rc != 0:
         print(
             f"ERROR: 写入测试标记失败 (exit={rc}): {stderr}",
             file=sys.stderr,
         )
         return 1
-    print(f"测试标记已写入: trace_id={trace_id}")
+    print(f"测试标记已写入: trace_id={trace_id} target_db={target_db}")
     return 0
 
 
@@ -1348,7 +1809,11 @@ def take_snapshot(output_path: Path, target_db: str = DEFAULT_TARGET_DB) -> int:
     return 0
 
 
-def verify(trace_id: str, pre_snapshot_path: Path | None) -> IntegrityEvidence:
+def verify(
+    trace_id: str,
+    pre_snapshot_path: Path | None,
+    target_db: str = DEFAULT_TARGET_DB,
+) -> IntegrityEvidence:
     """校验恢复后数据完整性(基本校验,向后兼容 Wave 2)。
 
     基本校验:
@@ -1360,6 +1825,7 @@ def verify(trace_id: str, pre_snapshot_path: Path | None) -> IntegrityEvidence:
     Args:
         trace_id: 测试标记 ID
         pre_snapshot_path: 备份前快照文件路径(可选,无则只校验标记)
+        target_db: 目标数据库(production / staging)
 
     Returns:
         IntegrityEvidence(基本字段填充)
@@ -1368,7 +1834,7 @@ def verify(trace_id: str, pre_snapshot_path: Path | None) -> IntegrityEvidence:
 
     # 1. 校验测试标记是否存在
     query = f"SELECT COUNT(*) as cnt FROM {MARKER_TABLE} WHERE name = '{trace_id}'"
-    rc, stdout, stderr = _exec_sql(query)
+    rc, stdout, stderr = _exec_sql(query, target_db=target_db)
     marker_found = False
     if rc == 0:
         try:
@@ -1400,10 +1866,12 @@ def verify(trace_id: str, pre_snapshot_path: Path | None) -> IntegrityEvidence:
                 timestamp=timestamp,
                 passed=False,
                 marker_found=marker_found,
+                target_db=target_db,
+                actual_db_path=_get_db_path(target_db),
                 error=f"解析 pre-snapshot 失败: {e}",
             )
 
-        post_counts = get_table_counts()
+        post_counts = get_table_counts(target_db=target_db)
         pre_map = {c.table: c.count for c in pre_counts}
         post_map = {c.table: c.count for c in post_counts}
         for table in pre_map:
@@ -1427,6 +1895,8 @@ def verify(trace_id: str, pre_snapshot_path: Path | None) -> IntegrityEvidence:
         pre_counts=pre_counts,
         post_counts=post_counts,
         count_mismatches=count_mismatches,
+        target_db=target_db,
+        actual_db_path=_get_db_path(target_db),
         error=None if passed else (
             "标记未找到" if not marker_found
             else f"count mismatch: {count_mismatches}"
@@ -1434,24 +1904,25 @@ def verify(trace_id: str, pre_snapshot_path: Path | None) -> IntegrityEvidence:
     )
 
 
-def cleanup_marker(trace_id: str) -> int:
+def cleanup_marker(trace_id: str, target_db: str = DEFAULT_TARGET_DB) -> int:
     """清理测试标记行。
 
     Args:
         trace_id: 唯一标识符
+        target_db: 目标数据库(production / staging)
 
     Returns:
         0 成功,1 失败
     """
     query = f"DELETE FROM {MARKER_TABLE} WHERE name = '{trace_id}'"
-    rc, stdout, stderr = _exec_sql(query)
+    rc, stdout, stderr = _exec_sql(query, target_db=target_db)
     if rc != 0:
         print(
             f"ERROR: 清理测试标记失败 (exit={rc}): {stderr}",
             file=sys.stderr,
         )
         return 1
-    print(f"测试标记已清理: trace_id={trace_id}")
+    print(f"测试标记已清理: trace_id={trace_id} target_db={target_db}")
     return 0
 
 
@@ -1501,6 +1972,8 @@ def verify_full(
         passed=False,
         marker_found=False,
         target_db=target_db,
+        # R72 P0-11: evidence 中记录实际使用的数据库路径
+        actual_db_path=_get_db_path(target_db),
     )
 
     errors: list[str] = []
@@ -1641,16 +2114,31 @@ def verify_full(
 
     # ── 9. 合成交易验证 ──
     if not skip_synthetic:
-        synthetic_evidence = run_synthetic_transaction_in_restored_env(timeout=60)
+        # R72 P0-11: 传递 target_db,确保合成交易在隔离的恢复库上执行
+        synthetic_evidence = run_synthetic_transaction_in_restored_env(
+            timeout=60, target_db=target_db,
+        )
         evidence.synthetic_transaction = synthetic_evidence
         if not synthetic_evidence.get("overall_passed", False):
             errors.append(f"合成交易验证失败: {synthetic_evidence.get('error', '')}")
 
     # ── 10. 切换/回滚证据 ──
-    switch_evidence = generate_switch_rollback_evidence()
+    # R72 P0-12: 实际执行 switch/rollback(不再只是 import check)
+    # 传递 target_db 确保切换到正确的恢复库
+    switch_evidence = generate_switch_rollback_evidence(target_db=target_db)
     evidence.switch_rollback_evidence = switch_evidence
+    # R72 P0-12: fail-closed — 必须实际执行且通过,不能只检查 import
     if not switch_evidence.get("orchestrator_available", False):
         errors.append(f"切换/回滚编排器不可用: {switch_evidence.get('error', '')}")
+    if not switch_evidence.get("orchestrator_executed", False):
+        errors.append(
+            f"切换/回滚未实际执行(缺少依赖/凭证): "
+            f"{switch_evidence.get('error', '')}"
+        )
+    if not switch_evidence.get("passed", False):
+        errors.append(
+            f"切换/回滚执行未通过: {switch_evidence.get('error', '')}"
+        )
 
     # ── 最终判定 ──
     passed = (
@@ -1670,7 +2158,9 @@ def verify_full(
             and evidence.app_read_write_check.get("cleanup_ok", False)
         ))
         and (skip_synthetic or evidence.synthetic_transaction.get("overall_passed", False))
-        and evidence.switch_rollback_evidence.get("orchestrator_available", False)
+        # R72 P0-12: 必须实际执行 switch/rollback 且通过
+        and evidence.switch_rollback_evidence.get("orchestrator_executed", False)
+        and evidence.switch_rollback_evidence.get("passed", False)
     )
 
     evidence.passed = passed
@@ -1818,9 +2308,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "write-marker":
-        # 设置全局 target_db(通过环境变量传递给 _exec_sql)
-        os.environ["VERIFY_RESTORE_TARGET_DB"] = args.target_db
-        return write_marker(args.trace_id)
+        # R72 P0-11: 直接传递 target_db,不依赖环境变量回退
+        return write_marker(args.trace_id, target_db=args.target_db)
 
     if args.command == "snapshot":
         return take_snapshot(Path(args.output), target_db=args.target_db)
@@ -1829,8 +2318,7 @@ def main(argv: list[str] | None = None) -> int:
         pre_path = (
             Path(args.pre_snapshot) if args.pre_snapshot else None
         )
-        evidence = verify(args.trace_id, pre_path)
-        evidence.target_db = args.target_db
+        evidence = verify(args.trace_id, pre_path, target_db=args.target_db)
         evidence_dict = asdict(evidence)
         evidence_json = json.dumps(
             evidence_dict, indent=2, ensure_ascii=False
@@ -1866,7 +2354,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if evidence.passed else 1
 
     if args.command == "cleanup":
-        return cleanup_marker(args.trace_id)
+        return cleanup_marker(args.trace_id, target_db=args.target_db)
 
     return 2
 

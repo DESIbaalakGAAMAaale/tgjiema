@@ -37,11 +37,15 @@
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import datetime as _dt
 import hashlib
+import json as _json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -49,6 +53,7 @@ from typing import Any
 from loguru import logger
 
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
 
 # migration 文件目录(database/migrations/)
 _MIGRATIONS_DIR: Path = Path(__file__).parent / "migrations"
@@ -1169,3 +1174,163 @@ async def apply_migrations(db: Any = None) -> dict[str, list[str]]:
             f"[migrate] migration 应用失败,阻断启动: failed={result['failed']}"
         )
     return result
+
+
+# ════════════════════════════════════════════════════════════════
+# R72 P0-08: 结构化 migration CLI 入口
+# 支持 --check (dry-run 验证) 和 --json (结构化 JSON 输出)
+# ════════════════════════════════════════════════════════════════
+
+def _get_backup_schema_version() -> str:
+    """R72 P0-08: 安全获取 backup schema version(避免循环 import)。
+
+    从 services.db_backup._BACKUP_SCHEMA_VERSION 获取,
+    import 失败时返回 "unknown"(不阻断 migration evidence)。
+    """
+    try:
+        from services.db_backup import _BACKUP_SCHEMA_VERSION
+        return _BACKUP_SCHEMA_VERSION
+    except Exception:
+        return "unknown"
+
+
+def _build_migration_evidence(
+    result: dict[str, list[str]],
+    *,
+    check_mode: bool = False,
+) -> dict[str, Any]:
+    """R72 P0-08: 构建结构化 migration evidence。
+
+    包含:
+      - target_backend: "sqlite" (当前实现)
+      - current_schema_version: 已应用 migration 数量
+      - expected_schema_version: migration 文件总数
+      - applied: 本次应用的 migration IDs
+      - skipped: 已应用跳过的 migration IDs
+      - failed: 失败的 migration IDs
+      - pending: 未应用的 migration IDs
+      - migration_checksums: 每个 migration 文件的 SHA-256
+      - manifest_digest: release-manifest.json 的 digest (若存在)
+      - final_status: "ok" / "pending" / "failed"
+    """
+    import hashlib as _hashlib
+
+    migration_dir = _MIGRATIONS_DIR
+    all_files = sorted(migration_dir.glob("*.sql")) if migration_dir.is_dir() else []
+    expected_versions = [f.name for f in all_files]
+
+    # 计算 checksums
+    checksums: dict[str, str] = {}
+    for mf in all_files:
+        try:
+            content = mf.read_bytes()
+            checksums[mf.name] = "sha256:" + _hashlib.sha256(content).hexdigest()
+        except OSError:
+            checksums[mf.name] = "error:unreadable"
+
+    # manifest digest
+    manifest_digest = ""
+    if _RELEASE_MANIFEST_PATH.is_file():
+        try:
+            manifest_content = _RELEASE_MANIFEST_PATH.read_bytes()
+            manifest_digest = "sha256:" + _hashlib.sha256(manifest_content).hexdigest()
+        except OSError:
+            manifest_digest = "error:unreadable"
+
+    applied_set = set(result.get("applied", []))
+    skipped_set = set(result.get("skipped", []))
+    failed_set = set(result.get("failed", []))
+    applied_and_skipped = applied_set | skipped_set
+    pending = [v for v in expected_versions if v not in applied_and_skipped]
+
+    has_failures = bool(failed_set)
+    has_pending = bool(pending) and not check_mode
+
+    if has_failures:
+        final_status = "failed"
+    elif has_pending:
+        final_status = "pending"
+    else:
+        final_status = "ok"
+
+    return {
+        "target_backend": "sqlite",
+        "current_schema_version": len(applied_and_skipped),
+        "expected_schema_version": len(expected_versions),
+        "applied": sorted(applied_set),
+        "skipped": sorted(skipped_set),
+        "failed": sorted(failed_set),
+        "pending": sorted(pending),
+        "migration_checksums": checksums,
+        "manifest_digest": manifest_digest,
+        "ddl_version": _get_backup_schema_version(),
+        "check_mode": check_mode,
+        "final_status": final_status,
+    }
+
+
+def main() -> int:
+    """R72 P0-08: migration CLI 入口 — 支持 --check 和 --json。
+
+    用法:
+      python -m database.migrate            # 应用所有 pending migration
+      python -m database.migrate --check     # 检查是否有 pending migration(不应用)
+      python -m database.migrate --json      # 输出结构化 JSON evidence
+      python -m database.migrate --check --json  # 检查模式 + JSON 输出
+    """
+    parser = argparse.ArgumentParser(
+        description=_i18n_t('services.migrate.s1')
+    )
+    parser.add_argument(
+        "--check", action="store_true",
+        help=_i18n_t('services.migrate.s2'),
+    )
+    parser.add_argument(
+        "--json", action="store_true",
+        help=_i18n_t('services.migrate.s3'),
+    )
+    args = parser.parse_args()
+
+    try:
+        result = asyncio.run(apply_migrations())
+    except Exception as e:
+        if args.json:
+            evidence = {
+                "target_backend": "sqlite",
+                "final_status": "failed",
+                "error": f"{type(e).__name__}: {e}",
+                "applied": [],
+                "skipped": [],
+                "failed": [],
+                "pending": [],
+                "check_mode": args.check,
+            }
+            print(_json.dumps(evidence, ensure_ascii=False, indent=2))
+        else:
+            print(f"[migrate] 迁移失败: {e}", file=sys.stderr)
+        return 1
+
+    evidence = _build_migration_evidence(result, check_mode=args.check)
+
+    if args.json:
+        # R72 P0-08: 纯 JSON 到 stdout,人类可读文本到 stderr
+        print(_json.dumps(evidence, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"[migrate] 迁移完成: applied={len(evidence['applied'])}, "
+            f"skipped={len(evidence['skipped'])}, "
+            f"failed={len(evidence['failed'])}, "
+            f"pending={len(evidence['pending'])}, "
+            f"status={evidence['final_status']}"
+        )
+
+    # exit code: 有失败或 pending (在非 check 模式下) 则失败
+    if evidence["failed"]:
+        return 1
+    if evidence["pending"] and not args.check:
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

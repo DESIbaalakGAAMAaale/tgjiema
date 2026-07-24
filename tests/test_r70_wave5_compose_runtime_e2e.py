@@ -670,11 +670,14 @@ class TestPhaseExecutionMocked:
                 )
                 return _make_completed_process(returncode=0, stdout="started")
             if "ps" in cmd_strs:
-                # 返回 redis 和 db_writer 服务
+                # R72 P0-06: 返回所有 4 个核心服务(redis-acl-init/redis/
+                # migration/db_writer)的期望状态,匹配 _wait_for_services 的 expected_core
                 return _make_completed_process(
                     returncode=0,
-                    stdout='{"Service": "redis", "State": "running"}\n'
-                           '{"Service": "db_writer", "State": "running"}',
+                    stdout='{"Service": "redis-acl-init", "State": "exited", "ExitCode": 0}\n'
+                           '{"Service": "redis", "State": "running", "Health": "healthy"}\n'
+                           '{"Service": "migration", "State": "exited", "ExitCode": 0}\n'
+                           '{"Service": "db_writer", "State": "running", "Health": "healthy"}',
                 )
             return _make_completed_process(returncode=0)
 

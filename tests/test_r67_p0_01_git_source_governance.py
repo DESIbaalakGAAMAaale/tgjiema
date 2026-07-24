@@ -113,8 +113,11 @@ class TestBranchRulesetExpectedJson:
             "(current-SHA,不允许 stale parent commit)"
         )
         # R71 P1-02: 必须包含 R71 Wave 2/4/5 新增的 context
+        # R72 P1-06: compose-runtime-e2e / verify-rc-identity 是 tag-only,
+        # 在 PR 场景不产生 check-run,已从 required_status_checks 移除
+        # (避免合并死锁)。仅保留 validate-oci-rootfs(PR 场景会运行)。
         contexts = [c["context"] for c in params.get("required_status_checks", [])]
-        for ctx in ("compose-runtime-e2e", "validate-oci-rootfs", "verify-rc-identity"):
+        for ctx in ("validate-oci-rootfs", "bind-runtime-config"):
             assert ctx in contexts, (
                 f"R71 P1-02: required_status_checks 必须包含 R71 新增 context: {ctx}"
             )
