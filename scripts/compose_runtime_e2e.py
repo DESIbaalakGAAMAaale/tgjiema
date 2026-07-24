@@ -88,6 +88,13 @@ SYNTHETIC_TRANSACTION_PATH = REPO_ROOT / "scripts" / "synthetic_transaction.py"
 # verify_restore_integrity.py 路径(R71 Wave 2/3: 恢复完整性校验)
 VERIFY_RESTORE_INTEGRITY_PATH = REPO_ROOT / "scripts" / "verify_restore_integrity.py"
 
+# R72 P0-05 fix: 脚本以 `python scripts/compose_runtime_e2e.py` 启动时,
+# Python 把 sys.path[0] 设为脚本所在目录(scripts/),不含仓库根。这导致
+# `from services.health import ROLE_REQUIREMENTS` 抛 ImportError,被旧版
+# `except ImportError: pass` 静默吞掉,使 role_set_equality 假性失败。
+# 显式把仓库根加入 sys.path,确保项目内模块在任意 cwd 下可导入。
+sys.path.insert(0, str(REPO_ROOT))
+
 # R71 Wave 7 (P1-04/05/P0-13): 运行配置身份绑定校验模块
 # 用于严格校验 TGJIEMA_IMAGE 格式 + host config digest 绑定 + 当前 SHA 绑定
 try:
@@ -617,29 +624,58 @@ def phase_preflight(timeout: int) -> PhaseResult:
         v for v in SERVICE_ROLES.values() if v != "infrastructure"
     }
 
+    # R72 P0-05 fix: 旧版用 `except ImportError: health_roles = set()` 静默吞异常,
+    # 在 CI(cwd=仓库根,但 sys.path[0]=scripts/)中 `from services.health import ...`
+    # 抛 ImportError 被吞,导致 health_roles 为空集 → role_set_equality 假性失败。
+    # 改为 fail-closed:导入失败立即返回失败结果,把真实异常写入证据(禁止吞异常)。
     health_roles: set[str] = set()
+    health_import_error: str | None = None
     try:
         from services.health import ROLE_REQUIREMENTS as _health_roles
         health_roles = set(_health_roles.keys())
-    except ImportError:
-        health_roles = set()
+    except ImportError as e:
+        health_import_error = (
+            f"ImportError importing services.health.ROLE_REQUIREMENTS: {e}. "
+            f"sys.path[0]={sys.path[0]!r}, REPO_ROOT={str(REPO_ROOT)!r}. "
+            f"R72 P0-05: 不允许吞异常导致 role_set_equality 假性通过/失败。"
+        )
 
     # 别名归一化: health 使用 up_bot/idx_bot 等,entrypoint/compose 使用 up/idx
-    try:
-        from services.health import _ROLE_ALIASES as _aliases
-        normalized_health = set()
-        for r in health_roles:
-            found = False
-            for short_name, canonical in _aliases.items():
-                if canonical == r and short_name:
-                    normalized_health.add(short_name)
-                    found = True
-                    break
-            if not found:
-                normalized_health.add(r)
-        health_roles = normalized_health
-    except ImportError:
-        pass
+    if health_import_error is None:
+        try:
+            from services.health import _ROLE_ALIASES as _aliases
+            normalized_health = set()
+            for r in health_roles:
+                found = False
+                for short_name, canonical in _aliases.items():
+                    if canonical == r and short_name:
+                        normalized_health.add(short_name)
+                        found = True
+                        break
+                if not found:
+                    normalized_health.add(r)
+            health_roles = normalized_health
+        except ImportError as e:
+            health_import_error = (
+                f"ImportError importing services.health._ROLE_ALIASES: {e}. "
+                f"R72 P0-05: 不允许吞异常。"
+            )
+
+    if health_import_error is not None:
+        return _fail_result(
+            phase="preflight",
+            description=description,
+            started=started,
+            error=health_import_error,
+            readiness_checks=[
+                {"check": "docker_daemon", "status": "pass"},
+                {"check": "compose_file", "status": "pass"},
+                {"check": "env_file", "status": "pass"},
+                {"check": "image_digest", "status": "pass"},
+                {"check": "redis_passwords", "status": "pass"},
+                {"check": "role_set_equality", "status": "fail"},
+            ],
+        )
 
     role_mismatches: list[str] = []
     if entrypoint_roles != compose_roles:
