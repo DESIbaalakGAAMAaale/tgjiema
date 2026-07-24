@@ -600,6 +600,10 @@ def _verify_compose_smoke() -> dict[str, Any]:
     R71 RC52: docker-compose.yml 使用 ${REDIS_*_PASSWORD:?...} fail-closed 语法,
     compose config 校验需要这些变量存在。与 compose-config job 一致,
     提供 CI 占位符值使 config 校验通过(不实际启动 Redis)。
+
+    R71 RC53: docker-compose.yml 的 env_file 引用 .env.shared 和
+    .env.secrets.<service>,compose config 会校验这些文件存在。
+    需要在临时目录中创建占位文件,通过 --project-directory 指向。
     """
     compose_file = REPO_ROOT / "docker-compose.yml"
     if not compose_file.exists():
@@ -617,28 +621,49 @@ def _verify_compose_smoke() -> dict[str, Any]:
             "status": "warning",
             "message": "docker not installed (compose smoke skipped)",
         }
-    # R71 RC52: 提供 REDIS_*_PASSWORD 占位符,使 compose config 校验通过
-    # (与 compose-config job 的 .env 占位策略一致)
-    compose_env = os.environ.copy()
-    compose_env.setdefault("REDIS_HEALTH_PASSWORD", "ci-placeholder-health")
-    compose_env.setdefault("REDIS_WRITER_PASSWORD", "ci-placeholder-writer")
-    compose_env.setdefault("REDIS_READER_PASSWORD", "ci-placeholder-reader")
-    compose_env.setdefault("REDIS_ADMIN_PASSWORD", "ci-placeholder-admin")
-    # 只做 compose config 校验(不实际启动,避免 CI 资源消耗)
-    rc, out, err = _run_cmd(
-        ["docker", "compose", "-f", str(compose_file), "config", "--quiet"],
-        timeout=30,
-        env=compose_env,
-    )
-    return {
-        "name": "compose_smoke",
-        "passed": rc == 0,
-        "message": (
-            "compose config validated"
-            if rc == 0
-            else f"compose config failed: {err[:500]}"
-        ),
-    }
+    # R71 RC53: 创建临时目录,生成 .env.shared + .env.secrets.* 占位文件
+    # (compose config 校验 env_file 引用的文件必须存在)
+    import tempfile
+    tmpdir = Path(tempfile.mkdtemp(prefix="compose-smoke-"))
+    try:
+        # 创建 .env.shared 占位
+        (tmpdir / ".env.shared").write_text("CI=true\n", encoding="utf-8")
+        # 创建所有 .env.secrets.<service> 占位(compose 文件引用的服务)
+        for svc in ("migration", "db_writer", "crdb_sync", "up", "idx",
+                    "dsp", "mon", "admin_bot", "admin", "db_backup",
+                    "prometheus_exporter"):
+            (tmpdir / f".env.secrets.{svc}").write_text("", encoding="utf-8")
+        # 创建 .env 提供 REDIS_*_PASSWORD 占位符(compose 变量插值)
+        env_content = (
+            "REDIS_HEALTH_PASSWORD=ci-placeholder-health\n"
+            "REDIS_WRITER_PASSWORD=ci-placeholder-writer\n"
+            "REDIS_READER_PASSWORD=ci-placeholder-reader\n"
+            "REDIS_ADMIN_PASSWORD=ci-placeholder-admin\n"
+        )
+        (tmpdir / ".env").write_text(env_content, encoding="utf-8")
+        # 复制 docker-compose.yml 到临时目录(env_file 路径相对 compose 文件)
+        # 实际上 compose 会以 --project-directory 解析 env_file 相对路径
+        # 使用 --project-directory 指向临时目录
+        rc, out, err = _run_cmd(
+            ["docker", "compose",
+             "--project-directory", str(tmpdir),
+             "-f", str(compose_file),
+             "config", "--quiet"],
+            timeout=30,
+        )
+        return {
+            "name": "compose_smoke",
+            "passed": rc == 0,
+            "message": (
+                "compose config validated"
+                if rc == 0
+                else f"compose config failed: {err[:500]}"
+            ),
+        }
+    finally:
+        # 清理临时目录
+        import shutil
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _verify_restore_contract() -> dict[str, Any]:
