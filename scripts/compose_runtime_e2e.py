@@ -82,6 +82,11 @@ ENV_FILE = REPO_ROOT / ".env"
 # docker/entrypoint.py 路径(R71 Wave 2: 角色集合自动导出源)
 ENTRYPOINT_PATH = REPO_ROOT / "docker" / "entrypoint.py"
 
+# services/health.py 路径(R72 P0-05 fix: 用 AST 解析替代 import,
+# 避免 services.health 顶层 `from loguru import logger` 在 CI host
+# 进程(GitHub Actions runner 裸 Python,无 loguru)触发 ImportError)
+HEALTH_PATH = REPO_ROOT / "services" / "health.py"
+
 # synthetic_transaction.py 路径(R71 Wave 2: 合成交易执行器)
 SYNTHETIC_TRANSACTION_PATH = REPO_ROOT / "scripts" / "synthetic_transaction.py"
 
@@ -168,6 +173,79 @@ def _get_entrypoint_roles() -> set[str]:
                     # 如果 BinOp 中有 SERVICE_ROLE_MODULE.keys() 调用,
                     # 我们已经在上面 SERVICE_ROLE_MODULE 分支收集过 keys
     return roles
+
+
+def _get_health_roles_and_aliases() -> tuple[set[str], dict[str, str]]:
+    """R72 P0-05 fix: 用 AST 解析 services/health.py 提取角色集合,不导入模块。
+
+    旧版用 `from services.health import ROLE_REQUIREMENTS` 在 CI 中触发
+    ImportError(因为 services/health.py 顶层 `from loguru import logger`,
+    而 GitHub Actions runner 的 host Python 没装 loguru)。
+
+    本函数沿用与 `_get_entrypoint_roles()` 相同的 AST 解析模式,从源码静态
+    提取两个常量:
+      - ROLE_REQUIREMENTS: dict[str, dict[str, bool]] — 提取所有 key
+        (即 health 模块认定的全部规范角色名,如 up_bot/idx_bot/db_writer...)
+      - _ROLE_ALIASES: dict[str, str] — 提取 key→value 映射
+        (即 entrypoint 简写 → health 规范名,如 "up" → "up_bot")
+
+    Returns:
+        (role_keys, aliases) 二元组:
+        - role_keys: ROLE_REQUIREMENTS 的所有 key 集合
+        - aliases: _ROLE_ALIASES 的 key→value 字典
+
+    fail-closed:解析失败时返回 (set(), {})。调用方据此返回失败结果。
+    """
+    role_keys: set[str] = set()
+    aliases: dict[str, str] = {}
+    if not HEALTH_PATH.is_file():
+        return role_keys, aliases
+    try:
+        src = HEALTH_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+    except (OSError, SyntaxError):
+        return role_keys, aliases
+
+    for node in ast.walk(tree):
+        # 同时支持 ast.Assign(无类型注解)和 ast.AnnAssign(有类型注解,如
+        # `ROLE_REQUIREMENTS: dict[str, dict[str, bool]] = {...}`)。
+        # services/health.py 中两个常量都用 AnnAssign 形式。
+        assign_target: ast.Name | None = None
+        assign_value: ast.expr | None = None
+        if isinstance(node, ast.Assign):
+            if len(node.targets) != 1 or not isinstance(node.targets[0], ast.Name):
+                continue
+            assign_target = node.targets[0]
+            assign_value = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if not isinstance(node.target, ast.Name) or node.value is None:
+                continue
+            assign_target = node.target
+            assign_value = node.value
+        else:
+            continue
+
+        if assign_target.id == "ROLE_REQUIREMENTS":
+            # ROLE_REQUIREMENTS: dict[str, dict[str, bool]] = {"role": {...}, ...}
+            # 提取所有 key
+            if isinstance(assign_value, ast.Dict):
+                for key in assign_value.keys:
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                        role_keys.add(key.value)
+        elif assign_target.id == "_ROLE_ALIASES":
+            # _ROLE_ALIASES: dict[str, str] = {"short": "canonical", ...}
+            # 提取 key→value 映射
+            if isinstance(assign_value, ast.Dict):
+                keys = assign_value.keys
+                vals = assign_value.values
+                for k, v in zip(keys, vals):
+                    if (
+                        isinstance(k, ast.Constant) and isinstance(k.value, str)
+                        and isinstance(v, ast.Constant) and isinstance(v.value, str)
+                    ):
+                        aliases[k.value] = v.value
+    return role_keys, aliases
+
 
 # ── 服务角色映射(SERVICE_ROLE 环境变量值) ──
 # 取自 docker-compose.prod.yml 中每个服务的 environment.SERVICE_ROLE
@@ -627,46 +705,27 @@ def phase_preflight(timeout: int) -> PhaseResult:
     # R72 P0-05 fix: 旧版用 `except ImportError: health_roles = set()` 静默吞异常,
     # 在 CI(cwd=仓库根,但 sys.path[0]=scripts/)中 `from services.health import ...`
     # 抛 ImportError 被吞,导致 health_roles 为空集 → role_set_equality 假性失败。
-    # 改为 fail-closed:导入失败立即返回失败结果,把真实异常写入证据(禁止吞异常)。
-    health_roles: set[str] = set()
-    health_import_error: str | None = None
-    try:
-        from services.health import ROLE_REQUIREMENTS as _health_roles
-        health_roles = set(_health_roles.keys())
-    except ImportError as e:
-        health_import_error = (
-            f"ImportError importing services.health.ROLE_REQUIREMENTS: {e}. "
-            f"sys.path[0]={sys.path[0]!r}, REPO_ROOT={str(REPO_ROOT)!r}. "
-            f"R72 P0-05: 不允许吞异常导致 role_set_equality 假性通过/失败。"
-        )
-
-    # 别名归一化: health 使用 up_bot/idx_bot 等,entrypoint/compose 使用 up/idx
-    if health_import_error is None:
-        try:
-            from services.health import _ROLE_ALIASES as _aliases
-            normalized_health = set()
-            for r in health_roles:
-                found = False
-                for short_name, canonical in _aliases.items():
-                    if canonical == r and short_name:
-                        normalized_health.add(short_name)
-                        found = True
-                        break
-                if not found:
-                    normalized_health.add(r)
-            health_roles = normalized_health
-        except ImportError as e:
-            health_import_error = (
-                f"ImportError importing services.health._ROLE_ALIASES: {e}. "
-                f"R72 P0-05: 不允许吞异常。"
-            )
-
-    if health_import_error is not None:
+    #
+    # 真实根因(RC49 evidence 实锤):services/health.py 顶层
+    # `from loguru import logger`,而 GitHub Actions runner 的 host Python
+    # 没装 loguru。即使 sys.path 含仓库根,`import services.health` 仍会触发
+    # loguru 导入失败。
+    #
+    # 最终修复:用 AST 静态解析 services/health.py 提取 ROLE_REQUIREMENTS
+    # 和 _ROLE_ALIASES,完全不导入模块(与 _get_entrypoint_roles() 同一模式)。
+    # 这样 host 进程不依赖 services.health 的运行时依赖链。
+    health_role_keys, health_aliases = _get_health_roles_and_aliases()
+    if not health_role_keys:
         return _fail_result(
             phase="preflight",
             description=description,
             started=started,
-            error=health_import_error,
+            error=(
+                f"R72 P0-05: AST 解析 services/health.py 失败,无法提取 "
+                f"ROLE_REQUIREMENTS。HEALTH_PATH={str(HEALTH_PATH)!r}, "
+                f"exists={HEALTH_PATH.is_file()}. 不允许吞异常导致 "
+                f"role_set_equality 假性通过/失败。"
+            ),
             readiness_checks=[
                 {"check": "docker_daemon", "status": "pass"},
                 {"check": "compose_file", "status": "pass"},
@@ -676,6 +735,18 @@ def phase_preflight(timeout: int) -> PhaseResult:
                 {"check": "role_set_equality", "status": "fail"},
             ],
         )
+
+    # 别名归一化: health 使用 up_bot/idx_bot 等,entrypoint/compose 使用 up/idx
+    # 把 health 规范名通过 _ROLE_ALIASES 反向映射回 entrypoint 简写
+    normalized_health: set[str] = set()
+    for r in health_role_keys:
+        found_short = None
+        for short_name, canonical in health_aliases.items():
+            if canonical == r and short_name:
+                found_short = short_name
+                break
+        normalized_health.add(found_short if found_short is not None else r)
+    health_roles = normalized_health
 
     role_mismatches: list[str] = []
     if entrypoint_roles != compose_roles:
