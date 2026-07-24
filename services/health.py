@@ -925,15 +925,24 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
     """dsp_bot 专属: Redis Stream 消费者状态检查。
 
     R72 P1-04: 运行态(非 PRE_LAUNCH)中必须验证消费者活跃性:
-    - stream 不存在 → 失败
-    - group 不存在(NOGROUP)→ 失败
+    - stream 不存在 → 健康(R72 RC51 fix: stream 由 first XADD 惰性创建,
+      在 producer 发送首条消息前 stream 不存在是合法状态;
+      db_writer/dsp_bot 已就绪待消费,只是尚无消息可消费)
+    - group 不存在(NOGROUP)→ 失败(stream 存在但 group 未创建,
+      说明消费者未正确初始化)
     - active consumer 不存在 → 失败
-    - consumer idle 超过 _CONSUMER_IDLE_THRESHOLD → 失败
+    - consumer idle 超过 _CONSUMER_IDLE_THRESHOLD 且有 pending → 失败
     - pending 数量超过 _CONSUMER_PENDING_THRESHOLD → 失败
-    - last-delivered-id 未推进(为 "0-0" 或空)→ 失败
+    - last-delivered-id 未推进(为 "0-0" 或空)且 stream 有消息 → 失败
+    - last-delivered-id 未推进且 stream 为空 → 健康(无消息可消费)
 
     PRE_LAUNCH 模式:NOGROUP/no key 视为健康(Stream/Group 尚未创建,
     先有鸡还是先有蛋问题)。只有 PRE_LAUNCH 阶段可以允许 group 尚未创建。
+
+    R72 RC51 fix: 运行态 stream 不存在不再视为失败。Redis Stream 由 first
+    XADD 惰性创建(无显式 CREATE 命令)。在 compose-runtime-e2e 的 start_core
+    阶段(producer 在 business_smoke 阶段才 XADD),stream 不存在是合法的
+    "就绪待消费"状态。仅当 stream 存在但 group 缺失才视为消费者未初始化。
 
     Returns:
         (healthy, error)
@@ -976,26 +985,40 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
             # ── 运行态严格检查:XINFO STREAM / GROUPS / CONSUMERS ──
             if not pre_launch:
                 # 1. Stream 是否存在(XINFO STREAM 不存在时抛 ResponseError)
+                #    R72 RC51 fix: stream 不存在是合法的"就绪待消费"状态。
+                #    Redis Stream 由 first XADD 惰性创建,在 producer 发送
+                #    首条消息前 stream 不存在是正常的。仅当 stream 存在但
+                #    group/consumer 异常才视为失败。
+                stream_length = 0
                 try:
                     stream_info = await asyncio.wait_for(
                         client.xinfo_stream(stream_key),
                         timeout=_REDIS_PING_TIMEOUT,
                     )
+                    # 提取 stream 长度(用于后续 last-delivered-id 判断)
+                    stream_length = stream_info.get("length", 0) if isinstance(
+                        stream_info, dict
+                    ) else 0
+                    if isinstance(stream_length, bytes):
+                        stream_length = int(stream_length)
                 except Exception as e:
                     err_str = str(e)
                     if (
                         "no such key" in err_str.lower()
                         or "NOGROUP" in err_str
                     ):
-                        return False, (
-                            f"Redis Stream {stream_key!r} not exists "
-                            f"(runtime mode requires stream to be created)"
+                        # R72 RC51: stream 不存在 → 健康(就绪待消费)
+                        return True, (
+                            f"Stream {stream_key!r} not yet created "
+                            f"(no producer XADD — consumer is ready, "
+                            f"waiting for first message)"
                         )
                     return False, (
                         f"Redis XINFO STREAM failed: {e}"
                     )
 
                 # 2. Consumer Group 是否存在(XINFO GROUPS)
+                #    stream 已存在但 group 不存在 → 失败(消费者未初始化)
                 try:
                     groups_info = await asyncio.wait_for(
                         client.xinfo_groups(stream_key),
@@ -1006,8 +1029,8 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
                     if "NOGROUP" in err_str or "no such key" in err_str.lower():
                         return False, (
                             f"Consumer Group {group!r} not exists on "
-                            f"Stream {stream_key!r} (runtime mode requires "
-                            f"group to be created)"
+                            f"Stream {stream_key!r} (stream exists but "
+                            f"group not created — consumer init failed)"
                         )
                     return False, f"Redis XINFO GROUPS failed: {e}"
 
@@ -1026,7 +1049,10 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
                         f"{stream_key!r} (runtime mode requires group)"
                     )
 
-                # 3. last-delivered-id 未推进 → 失败
+                # 3. last-delivered-id 未推进 → 仅当 stream 有消息时才失败
+                #    R72 RC51 fix: stream 为空时 last-delivered-id="0-0" 是
+                #    合法状态(无消息可消费)。仅当 stream 有消息但
+                #    last-delivered-id 未推进才视为消费者卡死。
                 last_delivered_id = target_group_info.get(
                     "last-delivered-id", ""
                 )
@@ -1034,11 +1060,11 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
                     last_delivered_id = last_delivered_id.decode(
                         "utf-8", errors="replace"
                     )
-                if not last_delivered_id or last_delivered_id == "0-0":
+                if (not last_delivered_id or last_delivered_id == "0-0") and stream_length > 0:
                     return False, (
                         f"Consumer Group {group!r} last-delivered-id is "
-                        f"{last_delivered_id!r} (never advanced — consumer "
-                        f"never processed any message)"
+                        f"{last_delivered_id!r} (stream has {stream_length} "
+                        f"messages but consumer never processed any)"
                     )
 
                 # 4. pending 数量失控 → 失败
@@ -1073,6 +1099,9 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
                     )
 
                 # 检查所有 consumer 的 idle 时间
+                # R72 RC51 fix: 当 stream 无消息且 pending=0 时,consumer idle
+                # 是合法的(无消息可消费,consumer 处于等待状态)。
+                # 仅当有 pending 消息或 stream 有未消费消息时,idle 才视为异常。
                 stale_consumers: list[str] = []
                 any_active = False
                 for c in consumers_info:
@@ -1091,9 +1120,19 @@ async def _check_redis_stream_consumer() -> tuple[bool, Optional[str]]:
                     else:
                         any_active = True
                 if not any_active:
+                    # 所有 consumer idle 超过阈值 — 仅当有工作积压时才失败
+                    if pending_count == 0 and stream_length == 0:
+                        # 无 pending 且 stream 空 — consumer 处于空闲等待,
+                        # 这是合法状态(无消息可消费)
+                        return True, (
+                            f"Consumers idle (no messages in stream, "
+                            f"no pending work — consumer is ready, "
+                            f"waiting for messages)"
+                        )
                     return False, (
-                        f"All consumers idle > {_CONSUMER_IDLE_THRESHOLD}s: "
-                        f"{stale_consumers}"
+                        f"All consumers idle > {_CONSUMER_IDLE_THRESHOLD}s "
+                        f"with {pending_count} pending and {stream_length} "
+                        f"stream messages: {stale_consumers}"
                     )
                 return True, None
 

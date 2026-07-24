@@ -964,6 +964,18 @@ def phase_start_core(timeout: int) -> PhaseResult:
             service_failures.append(f"{svc}: {', '.join(reasons)}")
 
     if service_failures or not all_ready:
+        # R72 RC51 fix: 捕获失败容器的 docker logs 用于诊断
+        # (db_writer healthcheck 失败时,需要看到容器内日志才能定位根因)
+        container_logs: dict[str, Any] = {}
+        for svc in expected_core:
+            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "300", svc])
+            try:
+                logs_result = _run(logs_cmd, timeout=15, cwd=REPO_ROOT)
+                svc_log = (logs_result.stdout or "") + (logs_result.stderr or "")
+                if svc_log.strip():
+                    container_logs[svc] = svc_log[-6000:]
+            except (subprocess.TimeoutExpired, OSError):
+                pass
         return _fail_result(
             phase="start_core",
             description=description,
@@ -978,6 +990,7 @@ def phase_start_core(timeout: int) -> PhaseResult:
                 "failures": service_failures,
                 "wait_timeout_seconds": 180,
                 "all_ready": all_ready,
+                "container_logs": container_logs,
             },
             readiness_checks=readiness_checks,
         )
