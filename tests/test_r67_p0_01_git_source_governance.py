@@ -274,7 +274,11 @@ class TestVerifyGitSourceGovernanceScript:
         而是以 GitHub API verification 为权威源。
         - 本地 X/U + GitHub API verified=false → fail
         - 本地 X/U + GitHub API verified=true  → pass(GitHub 持有公钥)
-        - 本地 B/R/E(明确签名错误)            → 直接 fail
+        - 本地 B/R(明确签名错误)              → 直接 fail
+        - 本地 E(用户密钥过期)                 → 直接 fail(R68 P0-05)
+        - 本地 E(GitHub web-flow 签名)         → 走 GitHub API fallback(R71 RC49)
+          原因:GitHub squash/rebase merge commit 由 GitHub 用 noreply@github.com 签名,
+          本地 %G?=E 是信任库中的 GitHub GPG 公钥过期,GitHub API 是权威源
 
         本测试验证 B(bad signature)状态仍直接 fail(不软化)。
         """
@@ -283,8 +287,11 @@ class TestVerifyGitSourceGovernanceScript:
         assert 'B) fail "commit 签名验证失败' in content
         # R(revoked)状态仍必须直接 fail
         assert 'R) fail "commit 签名已撤销' in content
-        # E(expired key)状态仍必须直接 fail
-        assert 'E) fail "commit 签名无法验证' in content
+        # E(expired key)+ 用户签名必须 fail(R68 P0-05)
+        assert 'fail "commit 签名无法验证(E — expired key,用户密钥过期)"' in content
+        # R71 RC49: E + GitHub web-flow 签名走 GitHub API fallback(IS_GITHUB_SIGNED=true)
+        assert 'IS_GITHUB_SIGNED' in content
+        assert 'noreply@github.com' in content
         # GitHub API verified=false 必须 fail(权威源)
         assert 'GitHub API verification.verified=false' in content
 

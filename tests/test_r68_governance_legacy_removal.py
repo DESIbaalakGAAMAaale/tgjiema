@@ -189,16 +189,33 @@ class TestR68P0_05GitSourceGovernance:
             re.IGNORECASE | re.DOTALL,
         ), "GitHub API verified=false 必须 fail — R68 P0-05"
 
-    def test_b_r_e_states_still_hard_fail(self):
-        """B(bad)/R(revoked)/E(expired)签名状态仍必须硬失败."""
+    def test_b_r_states_still_hard_fail(self):
+        """B(bad)/R(revoked)签名状态仍必须硬失败.
+
+        R71 RC49 更新:E(expired)状态区分:
+        - 用户签名:E 仍 hard fail(R68 P0-05 保留)
+        - GitHub web-flow 签名(squash/rebase merge):E 走 GitHub API fallback
+          原因:本地 %G?=E 是信任库中的 GitHub GPG 公钥过期,GitHub API 是权威源
+        """
         script = REPO_ROOT / "scripts" / "verify_git_source_governance.sh"
         content = script.read_text(encoding="utf-8")
 
-        for state in ["B", "R", "E"]:
+        for state in ["B", "R"]:
             pattern = rf'{state}\)\s+fail\s+"'
             assert re.search(pattern, content), (
                 f"签名状态 {state} 必须 fail — 不应被软化(R68 P0-05)"
             )
+
+        # E 状态:用户签名必须 fail(R68 P0-05),GitHub 签名走 fallback(R71 RC49)
+        assert 'fail "commit 签名无法验证(E — expired key,用户密钥过期)"' in content, (
+            "E 状态(用户密钥过期)必须 fail — R68 P0-05"
+        )
+        assert "IS_GITHUB_SIGNED" in content, (
+            "R71 RC49: 脚本必须区分 GitHub web-flow 签名 vs 用户签名"
+        )
+        assert "noreply@github.com" in content, (
+            "R71 RC49: 必须检测 GitHub web-flow 签名邮箱 noreply@github.com"
+        )
 
 
 # ════════════════════════════════════════════════════════════════

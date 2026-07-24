@@ -69,11 +69,21 @@ echo ""
 #   Y: expired key but valid signature (密钥过期但签名有效)
 #   R: revoked key (密钥已撤销)
 #   E: expired key (密钥过期)
-#      → R68 P0-05: E 状态必须直接 hard fail(密钥过期 = 签名不可信)
-#      与 B/R 状态一致:明确的签名验证失败,不由 GitHub API 软化
+#      → R68 P0-05: E 状态(用户签名)必须直接 hard fail(密钥过期 = 签名不可信)
+#      → R71 RC49: E 状态(GitHub web-flow 签名)走 GitHub API fallback
+#        原因:GitHub squash/rebase merge commit 由 GitHub 用 noreply@github.com 签名
+#        本地 %G?=E 是信任库中的 GitHub GPG 公钥已过期,GitHub API 是权威源
 # ════════════════════════════════════════════════════════════════
 echo "--- 检查 1: git verify-commit ${GITHUB_SHA:0:12} ---"
 COMMIT_SIG_STATUS=$(git log --pretty='%G?' -1 "${GITHUB_SHA}" 2>/dev/null || echo "X")
+# R71 RC49: 获取 committer email 用于区分 GitHub web-flow 签名 vs 用户签名
+# GitHub squash/rebase merge commit 由 GitHub 用 noreply@github.com 邮箱签名
+# 本地 %G?=E 表示本地信任库中的 GitHub GPG 公钥已过期,但 GitHub API 是权威源
+COMMITTER_EMAIL=$(git log --pretty='%ce' -1 "${GITHUB_SHA}" 2>/dev/null || echo "")
+IS_GITHUB_SIGNED=false
+if [[ "$COMMITTER_EMAIL" == "noreply@github.com" ]]; then
+  IS_GITHUB_SIGNED=true
+fi
 case "$COMMIT_SIG_STATUS" in
   G) echo "  ✓ commit 已签名且验证通过(G — good signature)" ;;
   B) fail "commit 签名验证失败(B — bad signature)" ;;
@@ -81,7 +91,16 @@ case "$COMMIT_SIG_STATUS" in
   X) echo "  ⚠ commit 无签名(X — no signature,本地未检测到任何 GPG 签名)" ;;
   Y) echo "  ✓ commit 已签名且验证通过(Y — expired key but valid signature)" ;;
   R) fail "commit 签名已撤销(R — revoked)" ;;
-  E) fail "commit 签名无法验证(E — expired key,密钥过期)" ;;
+  E)
+    # R71 RC49: E 状态需区分 GitHub web-flow 签名 vs 用户签名
+    # - GitHub web-flow 签名(squash/rebase merge): 本地信任库过时,走 GitHub API fallback
+    # - 用户签名: 密钥过期 = 签名不可信,hard fail(R68 P0-05)
+    if [ "$IS_GITHUB_SIGNED" = "true" ]; then
+      echo "  ⚠ commit 签名状态=E(GitHub web-flow 签名,本地信任库可能过时)— 将由 GitHub API 裁决"
+    else
+      fail "commit 签名无法验证(E — expired key,用户密钥过期)"
+    fi
+    ;;
   *) fail "commit 签名状态未知: ${COMMIT_SIG_STATUS}" ;;
 esac
 
@@ -89,7 +108,8 @@ esac
 #   - G/Y: 应该通过(本地有公钥且签名有效)
 #   - U: 签名本身有效,但本地缺公钥 → 不视为硬失败,由 GitHub API 裁决
 #   - X: 无签名,git verify-commit 必然失败 → 不视为硬失败,由 GitHub API + reason 裁决
-#   - B/R/E: 硬失败(签名无效/撤销/密钥过期)
+#   - E + GitHub-signed: 本地信任库过时 → 由 GitHub API 裁决
+#   - E + user-signed / B/R: 硬失败(签名无效/撤销/密钥过期)
 case "$COMMIT_SIG_STATUS" in
   G|Y)
     if git verify-commit "${GITHUB_SHA}" >/dev/null 2>&1; then
@@ -102,6 +122,14 @@ case "$COMMIT_SIG_STATUS" in
     # U: 签名有效但缺公钥 / X: 无签名 — 由 GitHub API 裁决
     echo "  [INFO] ${COMMIT_SIG_STATUS} 状态 — 将由 GitHub API verification.reason 裁决"
     ;;
+  E)
+    if [ "$IS_GITHUB_SIGNED" = "true" ]; then
+      # GitHub web-flow 签名的 commit,本地 E 状态是信任库过时,由 GitHub API 裁决
+      echo "  [INFO] E 状态(GitHub web-flow 签名)— 将由 GitHub API verification.reason 裁决"
+    else
+      fail "git verify-commit ${GITHUB_SHA} 失败(签名状态=E,用户密钥过期)"
+    fi
+    ;;
   *)
     fail "git verify-commit ${GITHUB_SHA} 失败(签名状态=${COMMIT_SIG_STATUS})"
     ;;
@@ -113,7 +141,9 @@ esac
 #   - U (签名有效,缺公钥): GitHub API verified=true 即可接受(签名本身有效)
 #   - X (无签名): 必须检查 reason — 只有明确的 GitHub web-flow / squash
 #     签名类型才可接受;普通 unsigned commit 即使 API verified=true 也必须失败
-#   - E (密钥过期): R68 P0-05 要求直接 hard fail,不进入 API fallback
+#   - E (密钥过期): R71 RC49 区分:
+#     * GitHub web-flow 签名: 走 GitHub API fallback(本地信任库过时)
+#     * 用户签名: hard fail(R68 P0-05 保留)
 # ════════════════════════════════════════════════════════════════
 echo ""
 echo "--- 检查 2: GitHub API commit verification ---"
@@ -141,6 +171,18 @@ else
         # GitHub API 持有公钥,verified=true 即为权威源(签名确实有效)
         echo "  ✓ ${COMMIT_SIG_STATUS} 状态(签名有效,本地无法验证)— GitHub API 验证通过"
         echo "    签名本身有效,GitHub 持有公钥,verified=true 即为权威源"
+        ;;
+      E)
+        # R71 RC49: E 状态 + GitHub web-flow 签名 — GitHub API 是权威源
+        # 本地 %G?=E 表示信任库中的 GitHub GPG 公钥已过期,但 GitHub API verified=true
+        # 说明 GitHub 内部用最新公钥验证签名有效(IS_GITHUB_SIGNED 已在检查 1 判定)
+        if [ "$IS_GITHUB_SIGNED" = "true" ]; then
+          echo "  ✓ E 状态(GitHub web-flow 签名)— GitHub API verified=true,签名有效"
+          echo "    本地信任库中的 GitHub GPG 公钥已过期,但 GitHub API 是权威源"
+        else
+          # 用户密钥过期的 commit,API verified=true 也不接受(R68 P0-05)
+          fail "E 状态(用户密钥过期)+ GitHub API verified=true — R68 P0-05 要求 hard fail"
+        fi
         ;;
       X)
         # R69 P0-8: X 状态 — commit 无签名,API verified=true 必须有明确原因
@@ -278,13 +320,22 @@ if [[ "$GITHUB_REF" == refs/tags/* ]]; then
     fi
 
     # 4e. tag 指向的 commit 本身必须已签名(commit 签名独立于 tag 签名)
-    # R68 P0-05: E 状态(密钥过期)必须直接 hard fail,不由 GitHub API 软化
+    # R68 P0-05: E 状态(用户密钥过期)必须直接 hard fail,不由 GitHub API 软化
+    # R71 RC49: E 状态 + GitHub web-flow 签名允许(GitHub API 是权威源)
     TAG_COMMIT_SIG=$(git log --pretty='%G?' -1 "${TAG_COMMIT}" 2>/dev/null || echo "X")
     case "$TAG_COMMIT_SIG" in
       G|Y) echo "  ✓ tag 指向的 commit 签名验证通过(${TAG_COMMIT_SIG})" ;;
       U)
         echo "  ⚠ tag 指向的 commit 签名状态=${TAG_COMMIT_SIG}(本地无法验证,由 GitHub API 裁决)"
         # GitHub API fallback 已在检查 2 完成,若到达此处说明 API verified=true
+        ;;
+      E)
+        # R71 RC49: E 状态需区分 GitHub web-flow 签名 vs 用户签名
+        if [ "$IS_GITHUB_SIGNED" = "true" ]; then
+          echo "  ⚠ tag 指向的 commit 签名状态=${TAG_COMMIT_SIG}(GitHub web-flow 签名,本地信任库过时,由 GitHub API 裁决)"
+        else
+          fail "tag 指向的 commit 签名状态=${TAG_COMMIT_SIG}(用户密钥过期,tag 签名不能替代 commit 签名)"
+        fi
         ;;
       *) fail "tag 指向的 commit 签名状态=${TAG_COMMIT_SIG}(tag 签名不能替代 commit 签名)" ;;
     esac
