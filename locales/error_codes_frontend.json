@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 148,
-    "generated_at": "2026-07-21T06:04:39.436564Z",
+    "enum_count": 149,
+    "generated_at": "2026-07-23T18:00:12.224600Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,7 +13,7 @@
       "show_retry_button": "是否显示重试按钮(R61 P1-05: 独立显式设置,通常等于 retryable 但可独立覆盖)",
       "telegram_presentation": "Bot 端展示方式(R61 P1-05 显式字段): short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)/modal/toast(预留扩展)"
     },
-    "total_codes": 148,
+    "total_codes": 149,
     "version": "R56-§5.2"
   },
   "codes": {
@@ -1574,6 +1574,22 @@
       "retryable": false,
       "safe_params": [
         "environment"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "PRODUCTION.ESCAPE_HATCH.DETECTED": {
+      "audit_level": "critical",
+      "code": "PRODUCTION.ESCAPE_HATCH.DETECTED",
+      "http_status": 500,
+      "message_key": "errors.production.escape_hatch.detected",
+      "retryable": false,
+      "safe_params": [
+        "caller",
+        "hatch_count",
+        "hatch_details",
+        "reason"
       ],
       "severity": "critical",
       "show_retry_button": false,

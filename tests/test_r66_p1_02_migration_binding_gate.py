@@ -170,19 +170,22 @@ class TestMigrationBindingGateJob:
         )
 
     def test_migration_binding_gate_if_includes_master(self, workflow_yaml):
-        """migration-binding-gate if: 必须包含 refs/heads/master。"""
+        """R70 P0-10: migration-binding-gate if: 必须包含 rc-v*(RC candidate 命名空间)。
+
+        旧的 master/main push 触发已废弃,改为 rc-v* tag 触发(同 sign-image)。
+        """
         job = workflow_yaml["jobs"].get("migration-binding-gate", {})
         if_cond = job.get("if", "")
-        assert "refs/heads/master" in if_cond, (
-            f"R66 P1-02: migration-binding-gate if: 必须包含 refs/heads/master,实际: {if_cond}"
+        assert "rc-v" in if_cond, (
+            f"R70 P0-10: migration-binding-gate if: 必须包含 rc-v*(RC candidate),实际: {if_cond}"
         )
 
     def test_migration_binding_gate_if_includes_tag(self, workflow_yaml):
-        """R66 P1-01/P1-02: migration-binding-gate if: 必须包含 refs/tags/v*。"""
+        """R70 P0-10: migration-binding-gate if: 必须包含 refs/tags/rc-v*。"""
         job = workflow_yaml["jobs"].get("migration-binding-gate", {})
         if_cond = job.get("if", "")
-        assert "refs/tags/v" in if_cond or "startsWith(github.ref, 'refs/tags/v'" in if_cond, (
-            f"R66 P1-02: migration-binding-gate if: 必须包含 refs/tags/v*,实际: {if_cond}"
+        assert "refs/tags/rc-v" in if_cond or "startsWith(github.ref, 'refs/tags/rc-v'" in if_cond, (
+            f"R70 P0-10: migration-binding-gate if: 必须包含 refs/tags/rc-v*,实际: {if_cond}"
         )
 
     def test_migration_binding_gate_if_excludes_pr(self, workflow_yaml):

@@ -20,6 +20,13 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # R71 RC41: 安全网 — 防止后台线程/死锁导致测试无限期挂起(此前 r40-collector
+    # 线程在测试环境持续抛错导致 CI 卡 50+ 分钟才被 GHA 默认 6h 超时杀掉)。
+    # 根因已由 tests/conftest.py 的 disable_r40_collector_thread fixture 修复,
+    # 此 timeout 为兜底,确保未来类似问题能在 60 分钟内被 GHA 终止并报失败。
+    # R71 RC42: 30 → 60 分钟。完整套件 7996+ 测试在 GHA shared runner 上
+    # 约 25-40 分钟(此前 30 分钟 timeout 导致正常跑完的套件被误杀)。
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -41,7 +48,7 @@ jobs:
         # R44: hash 校验在 release-gates.yml 的 pip-audit job 中强制执行,
         # 此处用 requirements.txt 避免占位 hash 导致失败
         pip install -r requirements.txt
-        pip install pytest pytest-asyncio pytest-cov aiosqlite pyyaml
+        pip install pytest pytest-asyncio pytest-cov pytest-timeout aiosqlite pyyaml
 
     # R66 P0-01: 构建阶段自动重生 migration manifest(catalog-only 模型)。
     # R66 P0-01 整改:catalog 不再绑定 release_commit/tree_sha(自引用循环根因)。
@@ -54,7 +61,13 @@ jobs:
 
     - name: Run tests
       run: |
-        python -m pytest tests/ -v --tb=short --maxfail=5 --cov=services --cov=database --cov=utils --cov=bots --cov=admin --cov-report=xml:coverage.xml --cov-report=term-missing
+        # R71 RC41: --timeout=120 防止单个测试挂起导致整个套件卡死
+        # (此前 r40-collector 后台线程 + dsp_bot 限速器累积导致 CI 卡 50+ 分钟)
+        # R71 RC43: timeout --signal=KILL 兜底 — 即使 aiosqlite 后台线程导致
+        # pytest 退出阶段挂起,也能在测试完成后 10 分钟被强制终止。
+        # 根因: aiosqlite._connection_worker_thread 在事件循环关闭后仍运行,
+        # pytest_sessionfinish hook 尝试清理但可能无法覆盖所有场景。
+        timeout --signal=KILL 50m python -m pytest tests/ -v --tb=short --maxfail=5 --timeout=120 --cov=services --cov=database --cov=utils --cov=bots --cov=admin --cov-report=xml:coverage.xml --cov-report=term-missing
 
     - name: Upload coverage report
       if: always()
@@ -366,6 +379,10 @@ jobs:
 
   fault-injection:
     runs-on: ubuntu-latest
+    # R71 RC42: 兜底超时 — 此前 fault-injection job 无 timeout-minutes,
+    # 导致 r40-collector 线程 hang 时 job 卡 24+ 小时才被 GHA 默认 6h 超时杀掉。
+    # 30 分钟足够过滤后的子集(~1000 测试)跑完,正常 2-3 分钟完成。
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
     - name: Set up Python
@@ -376,11 +393,13 @@ jobs:
       run: |
         python -m pip install --upgrade pip
         pip install -r requirements.txt
-        pip install pytest pytest-asyncio aiosqlite pyyaml
+        pip install pytest pytest-asyncio pytest-timeout aiosqlite pyyaml
     - name: Run fault injection tests
       run: |
         # R36 B0-4: 故障注入测试(崩溃恢复、Redis 中断、消息重放)
-        python -m pytest tests/ -v --tb=short -k "crash or fault or inject or recovery or restore or dlq or inbox" --maxfail=3
+        # R71 RC42: 添加 --timeout=120 防止单个测试挂起导致 job 卡死
+        # R71 RC43: timeout --signal=KILL 兜底 — 防止 aiosqlite 后台线程导致 pytest 退出挂起
+        timeout --signal=KILL 25m python -m pytest tests/ -v --tb=short -k "crash or fault or inject or recovery or restore or dlq or inbox" --maxfail=3 --timeout=120
       continue-on-error: true
 
   # R44: Migration dry-run(从原 release-gates job 迁移,校验 DDL/MIGRATION 语句语法)

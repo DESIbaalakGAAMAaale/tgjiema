@@ -911,8 +911,14 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
         async def _fake_sqlite(tables_data, merge, result, is_relay=False):
             captured["sqlite_tables"] = tables_data
 
+        # R69 Wave 2: _restore_from_backup_data 已从 services.db_restore 迁移到
+        # services.restore_writer,函数体内查找的是 services.restore_writer.__dict__,
+        # 因此 patch 路径必须指向 services.restore_writer(同时 patch db_restore
+        # 保持向后兼容)。
         with patch("services.db_restore._restore_crdb_tables", _fake_crdb), \
-             patch("services.db_restore._restore_sqlite_tables_to_db", _fake_sqlite):
+             patch("services.db_restore._restore_sqlite_tables_to_db", _fake_sqlite), \
+             patch("services.restore_writer._restore_crdb_tables", _fake_crdb), \
+             patch("services.restore_writer._restore_sqlite_tables_to_db", _fake_sqlite):
             result = await _restore_from_backup_data(
                 verified_payload,
                 _capability=cap,

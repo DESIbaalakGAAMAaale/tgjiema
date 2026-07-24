@@ -430,14 +430,17 @@ class TestFailClosedBehavior:
             with patch.object(orch.subprocess, "run") as mock_run:
                 # docker info 成功(returncode=0)
                 # 但 docker compose up -d 失败(returncode=1)
+                # R71 RC5: compose up 失败时捕获 4 个服务的容器日志
                 mock_run.side_effect = [
                     _make_completed_process(returncode=0),  # docker info
                     _make_completed_process(
                         returncode=1, stdout="", stderr="compose up failed"
-                    ),  # docker compose up -d redis db_writer
-                    _make_completed_process(
-                        returncode=1, stdout="", stderr="compose ps failed"
-                    ),  # docker compose ps
+                    ),  # docker compose up -d redis db_writer (失败)
+                    # compose up 失败后,phase_start_core 捕获 4 个服务日志
+                    _make_completed_process(returncode=0, stdout="", stderr=""),  # logs redis-acl-init
+                    _make_completed_process(returncode=0, stdout="", stderr=""),  # logs redis
+                    _make_completed_process(returncode=0, stdout="", stderr=""),  # logs migration
+                    _make_completed_process(returncode=0, stdout="", stderr=""),  # logs db_writer
                 ]
                 result = orch.phase_start_core(timeout=30)
                 assert result.status == "fail", (
@@ -558,7 +561,7 @@ class TestPhaseExecutionMocked:
             lambda *a, **kw: _make_completed_process(returncode=0),
         )
         # 模拟环境变量
-        monkeypatch.setenv("TGJIEMA_IMAGE", "ghcr.io/maxiuquan/tgjiema@sha256:abc123")
+        monkeypatch.setenv("TGJIEMA_IMAGE", "ghcr.io/maxiuquan/tgjiema@sha256:" + "a" * 64)
         monkeypatch.setenv("REDIS_WRITER_PASSWORD", "writer_pass")
         monkeypatch.setenv("REDIS_READER_PASSWORD", "reader_pass")
         monkeypatch.setenv("REDIS_HEALTH_PASSWORD", "health_pass")
@@ -617,7 +620,7 @@ class TestPhaseExecutionMocked:
             orch.subprocess, "run",
             lambda *a, **kw: _make_completed_process(returncode=0),
         )
-        monkeypatch.setenv("TGJIEMA_IMAGE", "ghcr.io/maxiuquan/tgjiema@sha256:abc")
+        monkeypatch.setenv("TGJIEMA_IMAGE", "ghcr.io/maxiuquan/tgjiema@sha256:" + "a" * 64)
         # 部分 REDIS 密码为空
         monkeypatch.setenv("REDIS_WRITER_PASSWORD", "writer_pass")
         monkeypatch.setenv("REDIS_READER_PASSWORD", "")  # 空

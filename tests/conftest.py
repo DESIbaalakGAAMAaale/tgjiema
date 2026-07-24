@@ -303,6 +303,30 @@ _install_httpx_mock_if_missing()
 _ensure_tested_modules_importable()
 
 
+def _disable_r40_collector_at_import_time() -> None:
+    """R71 RC41: 在收集阶段(最早)直接替换 prometheus_exporter._start_r40_collector。
+
+    根因: collect_metrics() 内部懒调用 _start_r40_collector() 启动 r40-collector
+    守护线程。autouse fixture 在每个测试前运行,但如果测试模块在导入时就
+    触发了 collect_metrics()(通过模块级常量/类属性/import 链),线程会在
+    fixture 生效前启动。一旦 _r40_collector_started=True,线程持续运行,
+    store._db 为 MagicMock 时抛 TypeError 阻塞测试退出。
+
+    本函数在收集阶段(所有测试模块导入前)直接替换模块属性为 no-op,
+    确保 prometheus_exporter 被导入时 _start_r40_collector 已是 no-op。
+    """
+    try:
+        import services.prometheus_exporter as _pe
+        _pe._start_r40_collector = lambda: None
+        # 同时重置已启动标志,防止此前任何导入已触发
+        _pe._r40_collector_started = True
+    except ImportError:
+        pass  # 模块不可导入则无需处理
+
+
+_disable_r40_collector_at_import_time()
+
+
 @pytest.fixture(autouse=True)
 def reset_redis_queue_state():
     """每个用例前重置 redis_queue 模块全局缓存状态,避免上一个用例的连接缓存影响下一个。
@@ -358,6 +382,62 @@ def reset_dsp_bot_module_state():
         _dsp._report_debounce.clear()
         _dsp._report_debounce_last_gc = 0.0
     yield
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """R71 RC43: 测试完成后清理 aiosqlite 后台线程,防止 pytest 进程挂起。
+
+    根因: 测试中创建的 CacheStore 实例可能未被显式 close(),aiosqlite 的
+    _connection_worker_thread 后台线程在事件循环关闭后仍继续运行,
+    尝试调用 call_soon_threadsafe 时抛 RuntimeError: Event loop is closed,
+    导致 pytest 进程无法正常退出(挂起 48+ 分钟直到 GHA 超时)。
+
+    本 hook 在所有测试完成后:
+    1. 遍历 gc 中所有 aiosqlite.Connection 对象
+    2. 若连接未关闭,创建新事件循环调用 close()
+    3. 强制 join 后台线程
+    """
+    import gc
+    import asyncio
+    import threading
+
+    # 收集所有 aiosqlite.Connection 对象
+    conns_to_close = []
+    for obj in gc.get_objects():
+        try:
+            # aiosqlite.Connection 的类名
+            if obj.__class__.__name__ == "Connection" and hasattr(obj, "_conn") and obj._conn is not None:
+                conns_to_close.append(obj)
+        except Exception:
+            pass
+
+    if not conns_to_close:
+        return
+
+    # 创建新事件循环关闭所有连接
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        for conn in conns_to_close:
+            try:
+                loop.run_until_complete(conn.close())
+            except Exception:
+                pass
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+    # 等待所有非主线程退出(最多 5 秒)
+    for t in threading.enumerate():
+        if t is threading.main_thread():
+            continue
+        if t.daemon:
+            continue
+        try:
+            t.join(timeout=5)
+        except Exception:
+            pass
+
 
 
 @pytest.fixture(autouse=True)

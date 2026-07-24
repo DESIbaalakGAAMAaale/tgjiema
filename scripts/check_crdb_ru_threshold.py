@@ -113,6 +113,9 @@ async def run_check(args: argparse.Namespace) -> int:
     # R64 P1-10: 本脚本仅需读取 SQLite kv_store,不需要真实 Bot Token / CRDB URL
     if not os.environ.get("SERVICE_ROLE"):
         os.environ["SERVICE_ROLE"] = "prometheus_exporter"  # 无 secrets 依赖的角色
+    # R70 Wave 1: APP_ENV 必填,否则 Settings fail-closed(EnvironmentResolutionError)
+    if not os.environ.get("APP_ENV"):
+        os.environ["APP_ENV"] = "development"  # CI 脚本模式(非 production)
     # 提供占位值避免 Settings 校验失败(本脚本不实际使用这些值)
     for var in ("UPLOAD_BOT_TOKEN", "DECODER_BOT_TOKEN", "SENDER_BOT_TOKEN",
                 "MON_BOT_TOKEN", "ADMIN_BOT_TOKEN", "COCKROACHDB_URL"):

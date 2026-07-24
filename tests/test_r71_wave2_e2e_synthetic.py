@@ -541,9 +541,11 @@ class TestReleaseGatesWorkflow:
         # 找到 compose-runtime-e2e job 定义
         job_idx = content.find("  compose-runtime-e2e:")
         assert job_idx != -1, "compose-runtime-e2e job 未定义"
-        # 查看 job 后 1000 字符(包含 if 条件)
+        # 查看 job 后 1500 字符(包含 if 条件)
         job_section = content[job_idx:job_idx + 1500]
-        assert "startsWith(github.ref, 'refs/tags/rc-v-')" in job_section, (
+        # R70 P0-10: rc-v* tag 使用 startsWith(github.ref, 'refs/tags/rc-v')
+        # (不带尾随 dash,匹配 rc-v1.0.0 / rc-v2.0.0 等)
+        assert "startsWith(github.ref, 'refs/tags/rc-v')" in job_section, (
             "compose-runtime-e2e job 必须仅在 rc-v* tag 触发"
         )
         assert "environment: rc-candidate" in job_section, (

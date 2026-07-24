@@ -453,6 +453,10 @@ class TestNewCheckFunctions:
         """_check_crdb_sync_lag 在 cache_store.db 不存在时 fail-closed。"""
         # 若 database.cache_store 依赖的 aiosqlite 缺失,跳过
         pytest.importorskip("aiosqlite", reason="aiosqlite 未安装,跳过 DB 相关测试")
+        # R71 RC47: 清除 CI/GITHUB_ACTIONS 环境变量,避免 _is_ci_mode() 旁路
+        # fail-closed 逻辑(CI 中 crdb_sync 进程未运行是正常的,但测试需验证真实 fail-closed)
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         # 模拟 DB_PATH 不存在
         mock_path = type("MockPath", (), {"exists": lambda self: False})()
         monkeypatch.setattr(
@@ -467,6 +471,10 @@ class TestNewCheckFunctions:
         """_check_scheduler_heartbeat 在 cache_store.db 不存在时 fail-closed。"""
         # 若 database.cache_store 依赖的 aiosqlite 缺失,跳过
         pytest.importorskip("aiosqlite", reason="aiosqlite 未安装,跳过 DB 相关测试")
+        # R71 RC47: 清除 CI/GITHUB_ACTIONS 环境变量,避免 _is_ci_mode() 旁路
+        # fail-closed 逻辑(CI 中 scheduler 未运行是正常的,但测试需验证真实 fail-closed)
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
         mock_path = type("MockPath", (), {"exists": lambda self: False})()
         monkeypatch.setattr(
             "database.cache_store.DB_PATH", mock_path, raising=False
@@ -968,6 +976,17 @@ class TestDeprecatedWrappers:
 
 class TestEntrypointReadinessGate:
     """验证 docker/entrypoint.py 的 readiness gate 函数存在。"""
+
+    @pytest.fixture(autouse=True)
+    def _clear_ci_env(self, monkeypatch):
+        """R71 RC47: 清除 CI/GITHUB_ACTIONS 环境变量。
+
+        _run_readiness_gate() 在 CI 模式下提前返回(R71 RC28),跳过
+        readiness 检查不执行 sys.exit(4)。测试需验证真实 fail-closed 逻辑,
+        因此必须清除 CI 环境变量。
+        """
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
 
     def test_run_readiness_gate_exists(self, entry_module):
         """_run_readiness_gate 函数应存在。"""

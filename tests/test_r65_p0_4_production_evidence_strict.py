@@ -590,20 +590,25 @@ class TestReleaseGatesWorkflow:
         return yaml.safe_load(workflow_path.read_text(encoding="utf-8"))
 
     def test_workflow_triggers_on_version_tags(self, workflow_yaml):
-        """workflow 必须在 v*.*.* tag push 时触发(用于 production-promotion-gate)。"""
+        """workflow 必须在 rc-v*/production-v* tag push 时触发。
+
+        R70 P0-10: master/staging/RC/production 命名空间完全分离。
+        旧的 v*.*.* tag 已废弃,改为 rc-v*(RC candidate)+ production-v*(production)。
+        """
         push_config = workflow_yaml.get(True, {})  # YAML "on:" 被解析为 True
         # on: 可能被解析为 True(Python yaml 怪癖)
         if push_config is True or not isinstance(push_config, dict):
             # 检查 raw content
             content = (REPO_ROOT / ".github" / "workflows" / "release-gates.yml").read_text()
             assert "tags:" in content, "workflow 必须配置 tags 触发器"
-            assert "v*.*.*" in content, "workflow 必须以 v*.*.* tag 模式触发"
+            assert "rc-v*" in content, "workflow 必须以 rc-v* tag 模式触发(RC candidate)"
+            assert "production-v*" in content, "workflow 必须以 production-v* tag 模式触发(production)"
             return
         push_dict = push_config.get("push", {})
         assert "tags" in push_dict, "workflow push 触发器必须含 tags"
-        assert "v*.*.*" in push_dict["tags"], (
-            "workflow 必须以 v*.*.* tag 模式触发"
-        )
+        tags = push_dict["tags"]
+        assert "rc-v*" in tags, "workflow 必须以 rc-v* tag 模式触发(RC candidate)"
+        assert "production-v*" in tags, "workflow 必须以 production-v* tag 模式触发(production)"
 
     def test_workflow_has_production_promotion_gate_job(self, workflow_yaml):
         """workflow 必须含 production-promotion-gate job。"""
@@ -613,14 +618,18 @@ class TestReleaseGatesWorkflow:
         )
 
     def test_production_promotion_gate_runs_only_on_version_tags(self, workflow_yaml):
-        """production-promotion-gate 必须仅在 v*.*.* tag 上运行(if: startsWith)。"""
+        """production-promotion-gate 必须仅在 production-v* tag 或 workflow_dispatch 上运行。
+
+        R70 P0-10: production 部署通过 production-v* tag 或 workflow_dispatch 触发
+        (配合 R71 P0-11 RC 身份核验输入)。旧的 v*.*.* tag 已废弃。
+        """
         job = workflow_yaml["jobs"]["production-promotion-gate"]
         if_cond = job.get("if", "")
         assert "startsWith(github.ref" in if_cond, (
             f"production-promotion-gate 的 if 必须检查 github.ref tag,实际: {if_cond}"
         )
-        assert "refs/tags/v" in if_cond, (
-            f"production-promotion-gate 的 if 必须匹配 refs/tags/v* ,实际: {if_cond}"
+        assert "refs/tags/production-v" in if_cond, (
+            f"production-promotion-gate 的 if 必须匹配 refs/tags/production-v* ,实际: {if_cond}"
         )
 
     def test_production_promotion_gate_needs_production_evidence(self, workflow_yaml):

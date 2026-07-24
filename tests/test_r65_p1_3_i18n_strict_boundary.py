@@ -61,8 +61,12 @@ def clean_env(monkeypatch):
 @pytest.fixture
 def strict_mode(monkeypatch):
     """启用 fail-closed 严格模式(I18N_ALLOW_FALLBACK=0)。"""
+    # R71 RC44: 清除 CI/GITHUB_ACTIONS 环境变量,避免 _get_i18n_allow_fallback()
+    # 的 CI 模式旁路(R71 RC29)在检查 I18N_ALLOW_FALLBACK 之前返回 True。
     monkeypatch.setenv("I18N_ALLOW_FALLBACK", "0")
     monkeypatch.delenv("RELEASE_BUILD", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     from services.i18n import _reset_i18n_fallback_cache
     _reset_i18n_fallback_cache()
     yield
@@ -74,6 +78,8 @@ def loose_mode(monkeypatch):
     """禁用 fail-closed 严格模式(I18N_ALLOW_FALLBACK=1,允许 fallback)。"""
     monkeypatch.setenv("I18N_ALLOW_FALLBACK", "1")
     monkeypatch.delenv("RELEASE_BUILD", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     from services.i18n import _reset_i18n_fallback_cache
     _reset_i18n_fallback_cache()
     yield
@@ -85,6 +91,8 @@ def release_mode(monkeypatch):
     """启用 release 构建(RELEASE_BUILD=1,隐含 fail-closed 严格模式)。"""
     monkeypatch.setenv("RELEASE_BUILD", "1")
     monkeypatch.delenv("I18N_ALLOW_FALLBACK", raising=False)
+    monkeypatch.delenv("CI", raising=False)
+    monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
     from services.i18n import _reset_i18n_fallback_cache
     _reset_i18n_fallback_cache()
     yield

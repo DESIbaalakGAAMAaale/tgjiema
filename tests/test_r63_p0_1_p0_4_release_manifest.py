@@ -774,17 +774,20 @@ class TestWorkflowDependencyChain:
         )
 
     def test_sign_image_only_runs_on_master_push(self, workflow_yaml):
-        """sign-image 必须只在 push 到 master/main 时运行(if 条件)。
+        """sign-image 必须只在 rc-v* tag push 时运行(if 条件)。
 
-        P0-01: PR 场景不应运行签名(无 OIDC keyless 上下文)。
+        R70 P0-10: master/staging/RC/production 命名空间完全分离。
+        master/main push 只产 staging(镜像构建 + 测试 + lint),不签名;
+        rc-v* tag 才产生 production candidate evidence(sign-image)。
+        PR 场景不应运行签名(无 OIDC keyless 上下文)。
         """
         sign_image = workflow_yaml["jobs"]["sign-image"]
         if_cond = sign_image.get("if", "")
         assert "push" in str(if_cond), (
             "P0-01: sign-image 的 if 条件必须限制为 push 事件"
         )
-        assert "master" in str(if_cond) or "main" in str(if_cond), (
-            "P0-01: sign-image 的 if 条件必须限制为 master/main 分支"
+        assert "rc-v" in str(if_cond), (
+            "R70 P0-10: sign-image 的 if 条件必须限制为 rc-v* tag(RC candidate 命名空间)"
         )
 
     def test_release_summary_requires_sign_image_success_on_release_target(self, workflow_yaml):

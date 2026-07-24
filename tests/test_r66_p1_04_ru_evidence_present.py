@@ -154,9 +154,10 @@ class TestGateStepWritesEvidencePresent:
         """release tag + 数据缺失场景必须写入 evidence_present=false(在 exit 1 之前)。"""
         content = _read_workflow()
         gate_section = _extract_gate_section(content)
-        # 找到 "FAIL: release tag 场景要求" 附近,必须有 evidence_present=false
-        fail_idx = gate_section.find("FAIL: release tag 场景要求")
-        assert fail_idx != -1, "未找到 release tag 数据缺失的 FAIL 分支"
+        # R70 P0-10: 命名空间分离后,FAIL 分支从 "release tag" 改为 "production-v* tag"
+        # (rc-v* tag 缺数据走 first_rc_baseline + exit 0;production-v* tag 缺数据才 exit 1)
+        fail_idx = gate_section.find("FAIL: production-v* tag 场景要求")
+        assert fail_idx != -1, "未找到 production-v* tag 数据缺失的 FAIL 分支"
         # 在 FAIL 分支后查找 evidence_present=false(在 exit 1 之前)
         after_fail = gate_section[fail_idx:fail_idx + 800]
         assert 'evidence_present=false' in after_fail, (
@@ -188,7 +189,8 @@ class TestGateStepWritesEvidencePresent:
         """数据缺失分支中,evidence_present=false 必须在 exit 1 之前写入。"""
         content = _read_workflow()
         gate_section = _extract_gate_section(content)
-        fail_idx = gate_section.find("FAIL: release tag 场景要求")
+        # R70 P0-10: 命名空间分离后,FAIL 分支从 "release tag" 改为 "production-v* tag"
+        fail_idx = gate_section.find("FAIL: production-v* tag 场景要求")
         assert fail_idx != -1
         after_fail = gate_section[fail_idx:fail_idx + 800]
         ep_idx = after_fail.find('evidence_present=false')
