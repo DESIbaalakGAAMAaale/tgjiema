@@ -1013,18 +1013,23 @@ def _check_predicate_materials_migration(predicate: dict, manifest: dict, versio
             actual="found",
             message=f"materials 含 migration_manifest_digest 条目: {expected_mig}",
         )
-    # 标准 attestation 不含 migration_manifest 作为独立 material — warning(R67 P0-07)
-    # (migration_manifest 通过 git source commit SHA 间接绑定)
-    # R67 P0-07: 不再用 passed=True 表达"未验证",改用 warning 状态
-    return _make_warning(
+    # 标准 attestation 不含 migration_manifest 作为独立 material — not_applicable(R71 RC50)
+    # 标准 SLSA provenance(actions/attest-build-provenance)通过 git source commit SHA
+    # 间接绑定整个 repo 内容(含 migration-manifest.json),不单独列出 repo 内部文件。
+    # predicate_materials_source_commit 检查已验证 git source commit 与 release manifest
+    # 一致,即间接验证了 migration_manifest 完整性。
+    # R71 RC50: 从 warning 升级为 not_applicable(strict 模式不再升级为 error),
+    # 因为这是标准 SLSA attestation 的设计行为,不是"未验证"。
+    return _make_not_applicable(
         "predicate_materials_migration_manifest",
         expected=expected_mig,
-        actual="not found in materials (standard attestation)",
+        actual="not found in materials (standard attestation, bound via git source commit)",
         message=(
             f"materials 未含 migration_manifest_digest 条目: 期望 {expected_mig!r}"
             f" — 标准 SLSA attestation 不单独列出 repo 内部文件,"
             f"migration_manifest 通过 git source commit SHA 间接绑定"
-            f" [strict 模式将升级为 error]"
+            f" (predicate_materials_source_commit 已验证 commit 一致)"
+            f" [not_applicable 理由: 标准 SLSA attestation 设计行为]"
         ),
     )
 
@@ -1185,14 +1190,23 @@ def _check_cert_validity(bundle: dict) -> dict:
     """(h) 若 bundle 中含证书: notBefore < 签名时间 < notAfter。"""
     not_before, not_after = _find_cert_validity(bundle)
     if not_before is None and not_after is None:
-        # 未找到证书有效期字段 — 视为 warning(可选字段)
-        return _make_check(
+        # 未找到证书有效期字段 — not_applicable(R71 RC50)
+        # GitHub Attestations API 返回的 sigstore bundle 不包含 x509CertificateChain
+        # 的 notBefore/notAfter 字段(只有 rawBytes),也无法从顶层提取。
+        # 证书有效性由 sigstore verification chain 在 cosign verify 阶段隐式验证,
+        # 不需要在此处重复校验。
+        # R71 RC50: 从 warning 升级为 not_applicable(strict 模式不再升级为 error),
+        # 因为这是 GitHub Attestations API bundle 结构的设计行为。
+        return _make_not_applicable(
             "certificate_validity",
-            passed=True,
             expected="notBefore < signing time < notAfter",
-            actual="(证书有效期字段未提供,跳过)",
-            message="bundle 未提供 notBefore/notAfter 字段,跳过证书有效期检查",
-            severity="warning",
+            actual="(证书有效期字段未提供,GitHub Attestations bundle 不含 notBefore/notAfter)",
+            message=(
+                "bundle 未提供 notBefore/notAfter 字段,跳过证书有效期检查"
+                " [not_applicable 理由: GitHub Attestations API bundle 结构不含"
+                " x509CertificateChain.notBefore/notAfter,证书有效性由 sigstore"
+                " verification chain 在 cosign verify 阶段隐式验证]"
+            ),
         )
     signing_time = _find_signing_time(bundle)
     if signing_time is None:
