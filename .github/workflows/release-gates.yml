@@ -4210,10 +4210,24 @@ jobs:
           echo "  R71 P1-04: 必须使用预期 registry/repository@sha256:<64-hex>"
           exit 1
         fi
+        # R71 RC51: 根据 R70 P0-10 namespace 分离确定 expected repository
+        #   - rc-v* / production-v* tag → 生产命名空间 (maxiuquan/tgjiema)
+        #   - master/main push → staging 命名空间 (maxiuquan/tgjiema-staging)
+        #   - PR/非 master → CI 命名空间 (maxiuquan/tgjiema-ci)
+        REPO="${GITHUB_REPOSITORY}"
+        if [[ "${GITHUB_REF}" == refs/tags/rc-v* || "${GITHUB_REF}" == refs/tags/production-v* ]]; then
+          EXPECTED_REPO="${REPO}"
+        elif [[ "${GITHUB_REF}" == "refs/heads/master" || "${GITHUB_REF}" == "refs/heads/main" ]]; then
+          EXPECTED_REPO="${REPO}-staging"
+        else
+          EXPECTED_REPO="${REPO}-ci"
+        fi
         echo "  TGJIEMA_IMAGE: ${TGJIEMA_IMAGE}"
+        echo "  expected_repository: ${EXPECTED_REPO}"
         python scripts/validate_runtime_config_binding.py \
           --mode full-evidence \
           --image "${TGJIEMA_IMAGE}" \
+          --expected-repository "${EXPECTED_REPO}" \
           --repo-root "${PWD}" \
           --output runtime-config-binding.json
         # R71 P0-13: 注入 GITHUB_SHA / GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT 到 evidence

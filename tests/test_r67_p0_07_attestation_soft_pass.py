@@ -253,8 +253,14 @@ class TestStatusModelMutex:
 class TestPredicateMaterialsMigrationSoftPassFix:
     """R67 P0-07: _check_predicate_materials_migration 不再返回 passed=True 表达"未验证"。"""
 
-    def test_migration_material_missing_returns_warning_status(self):
-        """manifest 提供 migration_manifest_digest 但 materials 缺该条目 → status="warning"。"""
+    def test_migration_material_missing_returns_not_applicable_status(self):
+        """R71 RC50: manifest 提供 migration_manifest_digest 但 materials 缺该条目 → status="not_applicable"。
+
+        R67 P0-07 旧行为:返回 warning(未验证但有可解释理由)。
+        R71 RC50 新行为:返回 not_applicable(标准 SLSA 设计行为,不是"未验证")。
+        标准 SLSA provenance 不单独列出 repo 内部文件,通过 git source commit SHA
+        间接绑定。predicate_materials_source_commit 检查已验证 commit 一致。
+        """
         statement = _make_valid_statement()
         # 移除 migration material,只保留 source material
         statement["predicate"]["materials"] = [
@@ -264,12 +270,12 @@ class TestPredicateMaterialsMigrationSoftPassFix:
             statement, _make_valid_manifest(),
         )
         check = _check_named(result, "predicate_materials_migration_manifest")
-        # R67 P0-07: 不再 passed=True + severity="warning"(soft-pass bug)
-        assert check["status"] == "warning"
+        # R71 RC50: not_applicable(标准 SLSA 设计行为)
+        assert check["status"] == "not_applicable"
         assert check["passed"] is False
 
-    def test_migration_material_missing_warning_is_recorded(self):
-        """R67 P0-07: warning 必须被记录到 result["warnings"](不再被聚合器静默丢弃)。"""
+    def test_migration_material_missing_not_applicable_not_in_warnings(self):
+        """R71 RC50: not_applicable 不应进入 result["warnings"](与 warning 区别)。"""
         statement = _make_valid_statement()
         statement["predicate"]["materials"] = [
             statement["predicate"]["materials"][0]
@@ -278,25 +284,34 @@ class TestPredicateMaterialsMigrationSoftPassFix:
             statement, _make_valid_manifest(),
         )
         warning_msgs = result.get("warnings", [])
-        assert any("migration_manifest" in w for w in warning_msgs), (
-            f"R67 P0-07 关键修复:warning 必须被记录,实际 warnings: {warning_msgs}"
+        assert not any("migration_manifest" in w for w in warning_msgs), (
+            f"R71 RC50: not_applicable 不应进入 warnings,实际 warnings: {warning_msgs}"
         )
 
-    def test_migration_material_missing_strict_escalates_to_error(self):
-        """R67 P0-07: strict 模式下 migration material 缺失必须升级为 error。"""
+    def test_migration_material_missing_strict_does_not_escalate(self):
+        """R71 RC50: strict 模式下 migration material 缺失不升级为 error。
+
+        R67 P0-07 旧行为:warning → strict 模式升级为 error → overall 失败。
+        R71 RC50 新行为:not_applicable → strict 模式不升级 → overall 通过。
+        (提供 valid bundle 避免 bundle_present warning 干扰)
+        """
         statement = _make_valid_statement()
         statement["predicate"]["materials"] = [
             statement["predicate"]["materials"][0]
         ]
         result = _verify_mod.verify_attestation_semantics(
-            statement, _make_valid_manifest(), strict=True,
+            statement, _make_valid_manifest(),
+            bundle=_make_valid_bundle(), strict=True,
         )
-        # 旧 bug:warning 被静默丢弃,strict 模式不升级,overall 通过
-        # 新行为:warning 被记录,strict 模式升级为 error,overall 失败
-        assert not result["overall_passed"]
+        # not_applicable 不升级为 error
+        assert result["overall_passed"], (
+            f"R71 RC50: not_applicable 不应阻断 overall_passed,实际 errors: "
+            f"{result.get('errors', [])}"
+        )
         error_msgs = result.get("errors", [])
-        assert any("migration_manifest" in e for e in error_msgs)
-        assert any("[strict]" in e for e in error_msgs)
+        assert not any("migration_manifest" in e for e in error_msgs), (
+            f"R71 RC50: not_applicable 不应升级为 error,实际 errors: {error_msgs}"
+        )
 
     def test_migration_manifest_missing_field_returns_not_applicable(self):
         """manifest 未提供 migration_manifest_digest → status="not_applicable"。"""
@@ -367,8 +382,14 @@ class TestOidcIssuerSoftPassFix:
 class TestNegativeDigestIdentityMismatches:
     """R67 P0-07: 负向测试 — digest 被替换、wrong tree/commit/repo/issuer、empty predicate。"""
 
-    def test_migration_digest_replaced_fails(self):
-        """migration digest 在 materials 中被替换为错误值 → failed(不匹配)。"""
+    def test_migration_digest_replaced_is_not_applicable(self):
+        """R71 RC50: migration digest 在 materials 中被替换为错误值 → not_applicable。
+
+        R67 P0-07 旧行为:未找到匹配 → warning(soft),strict 模式升级为 error。
+        R71 RC50 新行为:未找到匹配 → not_applicable(标准 SLSA 设计行为)。
+        标准 SLSA provenance 不单独列出 repo 内部文件,digest 不匹配与缺失
+        语义相同(均通过 git source commit SHA 间接绑定)。
+        """
         statement = _make_valid_statement()
         # 替换 migration material 的 digest 为错误值
         statement["predicate"]["materials"][1]["digest"]["sha256"] = WRONG_DIGEST
@@ -376,14 +397,15 @@ class TestNegativeDigestIdentityMismatches:
             statement, _make_valid_manifest(),
         )
         check = _check_named(result, "predicate_materials_migration_manifest")
-        assert check["status"] == "warning"  # 未找到匹配 → warning(soft)
-        # 非 strict 模式:warning 不阻断
+        # R71 RC50: not_applicable(标准 SLSA 设计行为)
+        assert check["status"] == "not_applicable"
+        # 非 strict 模式:not_applicable 不阻断
         assert result["overall_passed"]
-        # strict 模式应阻断
+        # strict 模式:not_applicable 不升级为 error
         result_strict = _verify_mod.verify_attestation_semantics(
             statement, _make_valid_manifest(), bundle=_make_valid_bundle(), strict=True,
         )
-        assert not result_strict["overall_passed"]
+        assert result_strict["overall_passed"]
 
     def test_subject_digest_mismatch_fails(self):
         """subject digest 与 manifest.image_digest 不匹配 → failed。"""
