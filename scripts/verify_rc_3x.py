@@ -766,6 +766,7 @@ def run_3x_verification(
     expected_sbom_digest: str | None = None,
     expected_provenance_digest: str | None = None,
     output_dir: Path | None = None,
+    human_stream: Any = None,
 ) -> dict[str, Any]:
     """R67 P0-04: 对同一 image digest 连续运行 3 次完整验证链。
 
@@ -773,6 +774,11 @@ def run_3x_verification(
         - 3 次都必须首次成功(不允许人工 rerun)
         - 3 次使用的 digest 必须完全一致(验证不可变性)
         - 记录 registry 传播 SLI
+
+    Args:
+        human_stream: 人类可读输出流(默认 sys.stdout)。当 --json 模式下,
+            调用方应传 sys.stderr,使 stdout 仅输出 JSON,便于 shell 重定向
+            (例如 `--json > result.json`)捕获纯 JSON。
 
     Returns:
         {
@@ -783,18 +789,21 @@ def run_3x_verification(
             "total_duration_seconds": float,
         }
     """
+    if human_stream is None:
+        human_stream = sys.stdout
+
     overall_start = time.time()
     verifications: list[dict[str, Any]] = []
     digest_consistent = True
     first_success_times: list[str | None] = []
 
     for i in range(1, REQUIRED_VERIFICATIONS + 1):
-        print(f"\n{'=' * 70}")
-        print(f"R67 P0-04: Verification #{i}/{REQUIRED_VERIFICATIONS}")
-        print(f"  image: {image_name}@{image_digest}")
-        print(f"  commit: {expected_commit[:12]}")
-        print(f"  tree: {expected_tree[:12]}")
-        print(f"{'=' * 70}")
+        print(f"\n{'=' * 70}", file=human_stream)
+        print(f"R67 P0-04: Verification #{i}/{REQUIRED_VERIFICATIONS}", file=human_stream)
+        print(f"  image: {image_name}@{image_digest}", file=human_stream)
+        print(f"  commit: {expected_commit[:12]}", file=human_stream)
+        print(f"  tree: {expected_tree[:12]}", file=human_stream)
+        print(f"{'=' * 70}", file=human_stream)
 
         result = run_full_verification_chain(
             image_name=image_name,
@@ -820,17 +829,17 @@ def run_3x_verification(
             first_success_times.append(None)
 
         # 打印本次验证摘要
-        print(f"\nVerification #{i} summary:")
-        print(f"  passed: {result['passed']}")
-        print(f"  warning_count: {result['warning_count']}")
-        print(f"  failed_count: {result['failed_count']}")
+        print(f"\nVerification #{i} summary:", file=human_stream)
+        print(f"  passed: {result['passed']}", file=human_stream)
+        print(f"  warning_count: {result['warning_count']}", file=human_stream)
+        print(f"  failed_count: {result['failed_count']}", file=human_stream)
         for check in result["checks"]:
             status = "PASS" if check["passed"] else ("WARN" if check.get("status") == "warning" else "FAIL")
-            print(f"    [{status}] {check['name']}: {check['message'][:80]}")
+            print(f"    [{status}] {check['name']}: {check['message'][:80]}", file=human_stream)
 
         if not result["passed"]:
-            print(f"\nFAIL: Verification #{i} did not pass")
-            print(f"R67 P0-04: 3 次验证必须全部首次成功 — 第 {i} 次失败即整体失败")
+            print(f"\nFAIL: Verification #{i} did not pass", file=human_stream)
+            print(f"R67 P0-04: 3 次验证必须全部首次成功 — 第 {i} 次失败即整体失败", file=human_stream)
             break  # 失败立即停止,不允许继续
 
     overall_duration = time.time() - overall_start
@@ -858,7 +867,7 @@ def run_3x_verification(
         output_dir.mkdir(parents=True, exist_ok=True)
         report_path = output_dir / f"rc_verify_3x_{int(time.time())}.json"
         report_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
-        print(f"\nR67 P0-04: 3x verification report saved to {report_path}")
+        print(f"\nR67 P0-04: 3x verification report saved to {report_path}", file=human_stream)
 
     return summary
 
@@ -914,6 +923,11 @@ def main() -> int:
     args = parse_args()
     output_dir = Path(args.output_dir) if args.output_dir else None
 
+    # R71 RC54: 当 --json 模式启用时,人类可读输出发送到 stderr,
+    # stdout 仅输出纯 JSON,使 shell 重定向(`--json > result.json`)
+    # 捕获合法 JSON 文件,避免下游 `json.load()` 因混合内容失败。
+    human_stream = sys.stderr if args.json else sys.stdout
+
     summary = run_3x_verification(
         image_name=args.image_name,
         image_digest=args.image_digest,
@@ -924,21 +938,23 @@ def main() -> int:
         expected_sbom_digest=args.expected_sbom_digest,
         expected_provenance_digest=args.expected_provenance_digest,
         output_dir=output_dir,
+        human_stream=human_stream,
     )
 
     if args.json:
+        # stdout: 纯 JSON(供 shell 重定向捕获)
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     if summary["passed"]:
-        print(f"\nPASS: R67 P0-04 3x verify-only verification succeeded")
-        print(f"  verifications: {summary['actual_verifications']}/{summary['required_verifications']}")
-        print(f"  digest: {summary['image_digest'][:24]}...")
-        print(f"  total_duration: {summary['total_duration_seconds']:.1f}s")
+        print(f"\nPASS: R67 P0-04 3x verify-only verification succeeded", file=human_stream)
+        print(f"  verifications: {summary['actual_verifications']}/{summary['required_verifications']}", file=human_stream)
+        print(f"  digest: {summary['image_digest'][:24]}...", file=human_stream)
+        print(f"  total_duration: {summary['total_duration_seconds']:.1f}s", file=human_stream)
         return 0
     else:
-        print(f"\nFAIL: R67 P0-04 3x verify-only verification failed")
-        print(f"  verifications: {summary['actual_verifications']}/{summary['required_verifications']}")
-        print(f"  R67 P0-04: 3 次验证必须全部首次成功 — 不允许人工 rerun 掩盖不稳定")
+        print(f"\nFAIL: R67 P0-04 3x verify-only verification failed", file=human_stream)
+        print(f"  verifications: {summary['actual_verifications']}/{summary['required_verifications']}", file=human_stream)
+        print(f"  R67 P0-04: 3 次验证必须全部首次成功 — 不允许人工 rerun 掩盖不稳定", file=human_stream)
         return 1
 
 
