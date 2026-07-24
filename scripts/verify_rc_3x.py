@@ -146,14 +146,20 @@ def _run_cmd(
     *,
     timeout: int = 60,
     capture: bool = True,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
-    """运行命令,返回 (returncode, stdout, stderr)。"""
+    """运行命令,返回 (returncode, stdout, stderr)。
+
+    Args:
+        env: 可选的环境变量字典。None 表示继承当前进程环境变量。
+    """
     try:
         result = subprocess.run(
             cmd,
             capture_output=capture,
             text=True,
             timeout=timeout,
+            env=env,
         )
         return result.returncode, result.stdout or "", result.stderr or ""
     except subprocess.TimeoutExpired as e:
@@ -283,10 +289,19 @@ def _verify_digest_pull(image_name: str, image_digest: str) -> dict[str, Any]:
 
 
 def _verify_image_startup(image_name: str, image_digest: str) -> dict[str, Any]:
-    """验证 2: image startup (容器启动)。"""
+    """验证 2: image startup (容器启动)。
+
+    R71 RC52: 容器 ENTRYPOINT (docker/entrypoint.py) 在 APP_ENV=production 下
+    要求 SERVICE_ROLE,未指定则 exit 1。本检查目的是验证容器 Python 环境可用,
+    而非验证生产入口逻辑(生产入口由 compose_runtime_e2e 覆盖)。
+    因此通过 --entrypoint python 覆盖 ENTRYPOINT,直接运行 Python 命令。
+    """
     image_ref = f"{image_name}@{image_digest}"
     rc, out, err = _run_cmd(
-        ["docker", "run", "--rm", image_ref, "python", "-c",
+        ["docker", "run", "--rm",
+         "-e", "CI=true",
+         "--entrypoint", "python",
+         image_ref, "-c",
          "import sys; print(f'Python {sys.version}'); print('startup OK')"],
         timeout=30,
     )
@@ -296,7 +311,7 @@ def _verify_image_startup(image_name: str, image_digest: str) -> dict[str, Any]:
         "message": (
             "container started and executed python successfully"
             if rc == 0
-            else f"container startup failed (rc={rc}): {err[:200]}"
+            else f"container startup failed (rc={rc}): {err[:500]}"
         ),
     }
 
@@ -581,6 +596,10 @@ def _verify_compose_smoke() -> dict[str, Any]:
     """验证 11: Compose smoke (最小 profile 启动)。
 
     本地无 docker compose 时返回 warning。
+
+    R71 RC52: docker-compose.yml 使用 ${REDIS_*_PASSWORD:?...} fail-closed 语法,
+    compose config 校验需要这些变量存在。与 compose-config job 一致,
+    提供 CI 占位符值使 config 校验通过(不实际启动 Redis)。
     """
     compose_file = REPO_ROOT / "docker-compose.yml"
     if not compose_file.exists():
@@ -598,10 +617,18 @@ def _verify_compose_smoke() -> dict[str, Any]:
             "status": "warning",
             "message": "docker not installed (compose smoke skipped)",
         }
+    # R71 RC52: 提供 REDIS_*_PASSWORD 占位符,使 compose config 校验通过
+    # (与 compose-config job 的 .env 占位策略一致)
+    compose_env = os.environ.copy()
+    compose_env.setdefault("REDIS_HEALTH_PASSWORD", "ci-placeholder-health")
+    compose_env.setdefault("REDIS_WRITER_PASSWORD", "ci-placeholder-writer")
+    compose_env.setdefault("REDIS_READER_PASSWORD", "ci-placeholder-reader")
+    compose_env.setdefault("REDIS_ADMIN_PASSWORD", "ci-placeholder-admin")
     # 只做 compose config 校验(不实际启动,避免 CI 资源消耗)
     rc, out, err = _run_cmd(
         ["docker", "compose", "-f", str(compose_file), "config", "--quiet"],
         timeout=30,
+        env=compose_env,
     )
     return {
         "name": "compose_smoke",
@@ -609,13 +636,26 @@ def _verify_compose_smoke() -> dict[str, Any]:
         "message": (
             "compose config validated"
             if rc == 0
-            else f"compose config failed: {err[:200]}"
+            else f"compose config failed: {err[:500]}"
         ),
     }
 
 
 def _verify_restore_contract() -> dict[str, Any]:
-    """验证 12: restore contract (restore 契约验证)。"""
+    """验证 12: restore contract (restore 契约验证)。
+
+    R71 RC52: 导入 services.restore_orchestrator 会触发传递依赖链:
+      restore_orchestrator → database.unit_of_work → database/__init__.py
+      → database.session → database.cache → config.settings → Settings()
+      → parse_app_env(allow_default_development=False)
+
+    Settings() 在模块级创建,要求 APP_ENV/ENVIRONMENT/DEPLOY_ENV 至少一个被设置,
+    否则 raise EnvironmentResolutionError(fail-closed)。
+    CI 环境下未设置这些变量,需显式传递 APP_ENV=development 使导入通过。
+    """
+    # R71 RC52: 传递 APP_ENV=development 避免 parse_app_env fail-closed
+    contract_env = os.environ.copy()
+    contract_env.setdefault("APP_ENV", "development")
     # 检查 restore orchestrator 模块可导入
     rc, out, err = _run_cmd(
         ["python3", "-c",
@@ -623,6 +663,7 @@ def _verify_restore_contract() -> dict[str, Any]:
          "print('restore contract verified')"],
         timeout=30,
         capture=True,
+        env=contract_env,
     )
     return {
         "name": "restore_contract",
@@ -630,7 +671,7 @@ def _verify_restore_contract() -> dict[str, Any]:
         "message": (
             "restore orchestrator module importable"
             if rc == 0
-            else f"restore contract failed: {err[:200]}"
+            else f"restore contract failed: {err[:500]}"
         ),
     }
 
