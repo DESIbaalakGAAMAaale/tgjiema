@@ -504,10 +504,24 @@ def _get_compose_ps_info(
                 exit_code = int(exit_code)
             except (ValueError, TypeError):
                 exit_code = None
+        # R72 RC55 fix: 捕获容器实际 Name / ID,供后续 docker inspect 使用。
+        # docker compose ps JSON 输出可能用 "Name"/"Containers"/"ID" 等字段,
+        # container_name 在 compose 文件中显式声明时通常是 "tgjiema-{svc}",
+        # 但在某些 docker compose 版本 / 配置下可能带项目前缀或 -1 后缀。
+        # 使用 compose ps 返回的真实 Name 最稳健。
+        container_name = (
+            svc_info.get("Name")
+            or svc_info.get("name")
+            or svc_info.get("Container")
+            or ""
+        )
+        container_id = svc_info.get("ID") or svc_info.get("Id") or ""
         info[svc_name] = {
             "state": str(state),
             "health": str(health),
             "exit_code": exit_code,
+            "container_name": str(container_name) if container_name else "",
+            "container_id": str(container_id) if container_id else "",
         }
     return info
 
@@ -1233,18 +1247,38 @@ def phase_start_bots(timeout: int) -> PhaseResult:
                 })
 
         # R72 P1-02: 验证容器实际使用的 RepoDigest(不是环境变量请求的 digest)
+        # R72 RC55 fix: 使用 docker compose ps 返回的真实容器名,
+        # 不再硬编码 "tgjiema-{svc}" 前缀(可能因 docker compose 版本/配置差异)
+        svc_info_entry = service_info.get(svc, {})
+        container_name = (
+            svc_info_entry.get("container_name")
+            or svc_info_entry.get("container_id")
+            or f"tgjiema-{svc}"  # fallback: 旧式 container_name 声明
+        )
         inspect_cmd = [
             "docker", "inspect",
             "--format", "{{.Image}}|{{json .RepoDigests}}|{{.Config.Image}}",
-            f"tgjiema-{svc}",
+            container_name,
         ]
         inspect_result = _run(inspect_cmd, timeout=10)
         if inspect_result.returncode != 0:
-            digest_failures.append(f"{svc}: docker inspect 失败")
+            # R72 RC55 fix: 捕获 stderr 用于诊断 docker inspect 失败原因
+            # (常见原因:容器名不匹配 / docker daemon 权限 / 容器已被移除)
+            stderr_snippet = (inspect_result.stderr or "").strip()[:200]
+            stdout_snippet = (inspect_result.stdout or "").strip()[:200]
+            digest_failures.append(
+                f"{svc}: docker inspect 失败 "
+                f"(container_name={container_name!r}, "
+                f"stderr={stderr_snippet!r}, stdout={stdout_snippet!r})"
+            )
             readiness_checks.append({
                 "check": f"repo_digest_{svc}",
                 "status": "fail",
                 "reason": "inspect_failed",
+                "stderr": stderr_snippet,
+                "stdout": stdout_snippet,
+                "cmd": " ".join(inspect_cmd),
+                "container_name": container_name,
             })
         else:
             inspect_output = inspect_result.stdout.strip()
