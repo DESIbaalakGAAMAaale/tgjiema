@@ -61,8 +61,11 @@ def _load_manifest() -> dict:
 
 
 def _file_sha256(path: Path) -> str:
-    """计算文件 SHA-256(十六进制小写)。"""
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """计算文件 SHA-256(十六进制小写)。
+
+    RC58 fix: 规范化 CRLF→LF,与 database.migrate._compute_sha256 一致(跨平台)。
+    """
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def _write_manifest_copy(manifest_data: dict, tmp_path: Path) -> Path:

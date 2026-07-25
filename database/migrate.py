@@ -413,8 +413,10 @@ def _verify_release_manifest_consistency(data: dict[str, Any]) -> None:
     #    实际 sha256(防止 release manifest 引用旧 migration-manifest.json)
     expected_mm_digest = str(release_data.get("migration_manifest_digest", "")).strip()
     if expected_mm_digest:
+        # RC58: 规范化 CRLF→LF(migration-manifest.json 在 CI/Linux 生成 LF,
+        # Windows 检出为 CRLF,raw bytes digest 不匹配)
         actual_mm_digest = hashlib.sha256(
-            _MANIFEST_PATH.read_bytes()
+            _MANIFEST_PATH.read_bytes().replace(b"\r\n", b"\n")
         ).hexdigest()
         if expected_mm_digest != actual_mm_digest:
             raise AppError(
@@ -844,25 +846,41 @@ def _list_migration_files() -> list[Path]:
 
 
 def _compute_sha256(file_path: Path) -> str:
-    """计算文件原始字节内容的 SHA-256 校验和(十六进制小写)。
+    """计算文件内容的 SHA-256 校验和(十六进制小写)。
 
     用于在应用 migration 时记录其 SQL 内容指纹,启动时比对以检测文件被篡改
     (R60 P0-05: fail-closed,篡改/删除的 migration 文件阻断服务启动)。
+
+    RC58 fix: 规范化 CRLF→LF 后再计算 sha256,确保跨平台一致。
+    migration-manifest.json 在 CI(Linux,LF)中生成,Windows 检出文件
+    因 core.autocrlf=true 会变成 CRLF,导致 raw bytes sha256 不匹配。
+    规范化行尾后 Windows/Linux 计算结果一致。
     """
     h = hashlib.sha256()
     with file_path.open("rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
+            # RC58: CRLF→LF 规范化,跨平台 sha256 一致
+            h.update(chunk.replace(b"\r\n", b"\n"))
     return h.hexdigest()
 
 
-async def _get_applied_versions(db: Any) -> dict[str, str]:
+async def _get_applied_versions(
+    db: Any,
+    *,
+    check_mode: bool = False,
+) -> dict[str, str]:
     """查询已应用的 migration 版本及其 SHA-256 校验和。
 
     若 ``_migrations_applied`` 表不存在则自动创建(首次运行,R60 新 schema)。
     若旧 schema(无 sha256 / duration_ms 列)已存在,通过 ALTER TABLE ADD COLUMN
     补列(向后兼容 R59 已部署实例);旧记录的 sha256 留空,由 ``apply_migrations``
     用当前文件内容回填。
+
+    R72 P0-08 / RC58 fix: ``check_mode=True`` 时跳过所有 DDL(CREATE TABLE /
+    ALTER TABLE / COMMIT),仅执行 SELECT。若 ``_migrations_applied`` 表不存在,
+    返回空 dict(视为"所有 migration 未应用" = 全部 pending)。这避免了
+    check_mode 下的写锁争抢(虽然 _migrations_applied 表很小,DDL 很快,
+    但与 db_writer 进程的写操作仍可能冲突导致短暂等待)。
 
     R60 P0-05 schema:
         version     TEXT PRIMARY KEY  — migration 文件名
@@ -872,10 +890,27 @@ async def _get_applied_versions(db: Any) -> dict[str, str]:
 
     Args:
         db: aiosqlite.Connection
+        check_mode: True 时跳过 DDL,仅 SELECT(只读模式)
 
     Returns:
         {version: sha256} 映射(已应用 migration 的文件名 → 校验和,空串表示旧记录未回填)
     """
+    if check_mode:
+        # RC58 fix: check_mode 下跳过 DDL,仅 SELECT
+        # 若表不存在(极少数情况:migration_runner 未运行或失败),SELECT 会抛
+        # sqlite3.OperationalError "no such table",捕获后返回空 dict(全部 pending)
+        try:
+            cursor = await db.execute("SELECT version, sha256 FROM _migrations_applied")
+            rows = await cursor.fetchall()
+            return {str(row[0]): (row[1] or "") for row in rows}
+        except Exception as e:
+            if "no such table" in str(e).lower():
+                logger.warning(
+                    "[migrate] RC58: check_mode 下 _migrations_applied 表不存在 "
+                    "(migration_runner 可能未运行) → 视为全部 pending"
+                )
+                return {}
+            raise
     # 创建版本记录表(首次运行,R60 新 schema;对已存在表是 no-op)
     await db.execute(
         """CREATE TABLE IF NOT EXISTS _migrations_applied (
@@ -1024,6 +1059,12 @@ async def apply_migrations(
 ) -> dict[str, list[str]]:
     """R59 P1: 应用所有未执行的 SQLite migration。
 
+    R72 P0-08 / RC58 fix: ``check_mode=True`` 时使用直连 SQLite 只读连接,
+    不调用 ``cache_store.init()``(会执行大量 DDL CREATE TABLE/ALTER TABLE,
+    与运行中的 db_writer 进程争抢 SQLite 写锁,导致 600s 超时)。
+    check_mode 仅需读取 ``_migrations_applied`` 表 + 计算 migration 文件 sha256,
+    无需初始化 cache_store 的全部业务表 DDL。
+
     本函数是迁移框架的主入口,执行流程:
       1. 获取数据库连接(参数传入或从 CacheStore 获取)
       2. 创建 ``_migrations_applied`` 版本记录表(首次运行,R60 新 schema)
@@ -1070,15 +1111,46 @@ async def apply_migrations(
         check_mode=True 时 applied 永远为 [](未应用任何 migration)。
     """
     # 获取数据库连接
+    # R72 P0-08 / RC58 fix: check_mode=True 时直接用 aiosqlite 打开 SQLite 文件,
+    # 跳过 cache_store.init()。cache_store.init() 执行 ~30 条 DDL(CREATE TABLE
+    # IF NOT EXISTS / ALTER TABLE / CREATE INDEX),每条 DDL 都需要 SQLite 写锁。
+    # 当 migration_check 阶段通过 `docker compose exec db_writer python -m
+    # database.migrate --check` 在运行中的 db_writer 容器内启动新进程时,
+    # 新进程的 cache_store.init() DDL 与 db_writer 主进程的写操作争抢 WAL 写锁,
+    # 导致 600s 超时(prstat busy_timeout=15s × 30+ DDL = 450s+,接近超时边界)。
+    # check_mode 只需读取 _migrations_applied 表 + 计算 sha256,无需业务表 DDL。
     own_connection = False
+    should_close = False  # RC58: 仅 check_mode 自建连接需关闭(cache_store 连接不关)
     if db is None:
-        from database.cache_store import get_cache_store
-        store = get_cache_store()
-        if not store._db:
-            # CacheStore 未初始化,尝试 init
-            await store.init()
-        db = store._db
-        own_connection = True
+        if check_mode:
+            # RC58 fix: check_mode 直连 SQLite,不初始化 cache_store
+            # 运行时读取 DB_PATH(非 import 时绑定),支持 monkeypatch 测试
+            import aiosqlite as _aiosqlite
+            import database.cache_store as _cache_store_mod
+            _DB_PATH = _cache_store_mod.DB_PATH
+            try:
+                db = await _aiosqlite.connect(str(_DB_PATH), timeout=10)
+                await db.execute("PRAGMA journal_mode=WAL")
+                await db.execute("PRAGMA busy_timeout=5000")
+                own_connection = True
+                should_close = True
+                logger.info(
+                    f"[migrate] R72 P0-08/RC58: check_mode 直连 SQLite "
+                    f"(path={_DB_PATH}, 跳过 cache_store.init 的 30+ DDL)"
+                )
+            except Exception as conn_err:
+                logger.error(
+                    f"[migrate] RC58: check_mode 直连 SQLite 失败: {conn_err}"
+                )
+                return {"applied": [], "skipped": [], "failed": []}
+        else:
+            from database.cache_store import get_cache_store
+            store = get_cache_store()
+            if not store._db:
+                # CacheStore 未初始化,尝试 init
+                await store.init()
+            db = store._db
+            own_connection = True
     if db is None:
         logger.error("[migrate] 无法获取 SQLite 连接,迁移中止")
         return {"applied": [], "skipped": [], "failed": []}
@@ -1091,15 +1163,19 @@ async def apply_migrations(
 
     # 查询已应用版本
     try:
-        applied_versions = await _get_applied_versions(db)
+        applied_versions = await _get_applied_versions(db, check_mode=check_mode)
     except Exception as e:
         logger.error(f"[migrate] 查询已应用版本失败: {e}")
+        if should_close:
+            await db.close()
         return result
 
     # 列出所有 migration 文件
     migration_files = _list_migration_files()
     if not migration_files:
         logger.warning("[migrate] 无 migration 文件可执行")
+        if should_close:
+            await db.close()
         return result
 
     # R60 P0-05: 启动时校验已应用 migration 文件的 SHA-256(fail-closed)
@@ -1149,15 +1225,23 @@ async def apply_migrations(
                     f"refusing to backfill empty stored_sha256 from untrusted disk"
                 )
             # disk 与 manifest 一致 → 用 manifest 的 sha256 回填(trust anchor)
-            await db.execute(
-                "UPDATE _migrations_applied SET sha256 = ? WHERE version = ?",
-                (manifest_sha256, version),
-            )
-            await db.commit()
-            logger.info(
-                f"[migrate] R61 P0-05: 补齐历史 migration {version} 的 sha256 "
-                f"(from signed manifest, disk verified match)"
-            )
+            # R72 P0-08 / RC58 fix: check_mode 下跳过 UPDATE 回填(避免写锁争抢),
+            # 仅验证 disk == manifest 一致即可(check_mode 是只读验证,不需要持久化回填)
+            if check_mode:
+                logger.info(
+                    f"[migrate] R61 P0-05/RC58: check_mode 下跳过 sha256 回填 "
+                    f"(disk==manifest 一致验证通过, {version})"
+                )
+            else:
+                await db.execute(
+                    "UPDATE _migrations_applied SET sha256 = ? WHERE version = ?",
+                    (manifest_sha256, version),
+                )
+                await db.commit()
+                logger.info(
+                    f"[migrate] R61 P0-05: 补齐历史 migration {version} 的 sha256 "
+                    f"(from signed manifest, disk verified match)"
+                )
         elif actual_sha256 != stored_sha256:
             raise RuntimeError(
                 f"Migration file {version} has been modified or removed "
@@ -1187,6 +1271,9 @@ async def apply_migrations(
                 result["skipped"].append(version)
             # 未应用的 migration 不加入 applied/skipped/failed,
             # 由 _build_migration_evidence 从 expected_versions 差集计算 pending 列表
+        # RC58: 关闭 check_mode 自建连接(避免文件锁泄漏)
+        if should_close:
+            await db.close()
         return result
 
     for mf in migration_files:

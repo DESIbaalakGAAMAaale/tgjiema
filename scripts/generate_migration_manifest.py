@@ -41,8 +41,11 @@ MIGRATIONS_DIR = REPO_ROOT / "database" / "migrations"
 
 
 def _file_sha256(path: Path) -> str:
-    """计算文件内容的 sha256(十六进制小写)。"""
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """计算文件内容的 sha256(十六进制小写)。
+
+    RC58 fix: 规范化 CRLF→LF,确保跨平台 digest 一致(CI/Linux LF,Windows CRLF)。
+    """
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def regenerate_manifest(verbose: bool = True) -> None:

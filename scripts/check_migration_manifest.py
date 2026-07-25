@@ -69,8 +69,11 @@ EXPECTED_MIGRATION_IDS: list[str] = [f"{i:03d}" for i in range(1, 9)]
 
 
 def _file_sha256(path: Path) -> str:
-    """计算文件内容的 sha256(十六进制小写)。"""
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """计算文件内容的 sha256(十六进制小写)。
+
+    RC58 fix: 规范化 CRLF→LF,确保跨平台 digest 一致(CI/Linux LF,Windows CRLF)。
+    """
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def _extract_ddl_version(schema_fingerprint: str | None) -> int | None:

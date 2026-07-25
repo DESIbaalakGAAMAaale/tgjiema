@@ -119,8 +119,13 @@ def _load_manifest() -> dict:
 
 
 def _file_sha256(path: Path) -> str:
-    """计算文件内容的 sha256(十六进制小写)。"""
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    """计算文件内容的 sha256(十六进制小写)。
+
+    RC58 fix: 规范化 CRLF→LF 后再计算,与 database.migrate._compute_sha256 一致。
+    migration-manifest.json 在 CI(Linux,LF)中生成,Windows 检出文件因
+    core.autocrlf=true 会变成 CRLF,raw bytes sha256 不匹配。
+    """
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 # ════════════════════════════════════════════════════════════════

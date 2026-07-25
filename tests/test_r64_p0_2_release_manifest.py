@@ -74,7 +74,8 @@ def _load_manifest() -> dict:
 
 
 def _file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    # RC58 fix: 规范化 CRLF→LF,与 database.migrate._compute_sha256 一致(跨平台)
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def _git_rev_parse(rev: str) -> str | None:
