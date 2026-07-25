@@ -288,10 +288,11 @@ class TestRc66CommentPresent:
         source = _read_source()
         idx = source.find("restore_cmd = _compose_cmd(")
         assert idx >= 0, "未找到 restore_cmd 定义"
-        before = source[max(0, idx - 1200):idx]
+        # 取 restore_cmd 之前 3000 字符(容纳 RC63-RC67 多重注释叠加)
+        before = source[max(0, idx - 3000):idx]
         assert "RC66" in before, (
             "R72 RC66: restore_cmd 上方注释必须提及 RC66 修复, "
-            f"实际前 1200 字符: {before[-300:]}"
+            f"实际前 3000 字符: {before[-300:]}"
         )
 
     def test_backup_cmd_comment_explains_no_deps_rationale(self):
