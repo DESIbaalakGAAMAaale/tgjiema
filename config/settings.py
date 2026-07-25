@@ -130,6 +130,13 @@ class Settings(BaseSettings):
     # R38 P1-4: 备份 KEK 文件路径(与 BACKUP_KEK 二选一,生产环境推荐用文件避免命令行泄漏)
     # 优先级: BACKUP_KEK > BACKUP_KEK_FILE(直接值优先于文件路径)
     BACKUP_KEK_FILE: str = ""
+    # R60 P0-04: COMPLETE marker HMAC 签名密钥(32 字节十六进制字符串)
+    # backup 用此密钥签名 COMPLETE marker,restore 用同一密钥验证签名(round-trip)。
+    # 未配置时 strict service validate_backup_completeness() 在 signing_key
+    # 为空时返回 invalid(fail-closed,不允许跳过验签)。
+    # 必须在 config/settings.py 中显式定义此字段,否则 pydantic 不会从
+    # 环境变量加载(即使 .env.shared 中已配置)。
+    BACKUP_SIGNING_KEY: str = ""
     # R37 P1-4: 备份强制加密开关
     # True(生产默认建议): KEK 不可用时停止备份任务并告警,绝不上传明文
     # False(本地开发): 允许明文降级(仅 warning)

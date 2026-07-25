@@ -390,7 +390,16 @@ async def run_restore(
     #    调用私有写入器(services.restore_writer._restore_from_backup_data)。
     #    旧格式备份(无 COMPLETE marker)在 strict service 内 fail-closed
     #    (COMPLETE marker 不存在 → AppError)。
-    signing_key = getattr(settings, "BACKUP_SIGNING_KEY", b"") or b""
+    # R72 RC69: BACKUP_SIGNING_KEY 在 Settings 中定义为 str,
+    # hmac.new 需要 bytes,所以做 encode 转换。
+    # Settings 未定义此字段时 getattr 返回 b"",isinstance(str) 为 False,
+    # 直接返回原值(向后兼容)。
+    _signing_key_raw = getattr(settings, "BACKUP_SIGNING_KEY", "") or ""
+    signing_key = (
+        _signing_key_raw.encode("utf-8")
+        if isinstance(_signing_key_raw, str)
+        else _signing_key_raw
+    )
     if not signing_key:
         logger.error(_LOG_SIGNING_KEY_NOT_CONFIGURED)
         raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
