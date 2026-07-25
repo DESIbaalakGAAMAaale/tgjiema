@@ -260,3 +260,81 @@ class TestDbRestoreFailsClosedWithoutSigningKey:
         assert "signing_key is required" in source or "signing_key 缺失" in source, (
             "R72 RC69: backup_dr_validate.py 必须在 signing_key 为空时返回 invalid"
         )
+
+
+# ════════════════════════════════════════════════════════════════
+# D. Settings 类必须定义 BACKUP_SIGNING_KEY 字段
+# ════════════════════════════════════════════════════════════════
+
+
+class TestSettingsDefinesBackupSigningKeyField:
+    """R72 RC69: config/settings.py 必须定义 BACKUP_SIGNING_KEY 字段。
+
+    根因: pydantic Settings 类不会加载未定义的字段(即使 .env 中有此变量)。
+    RC69 第一版只注入了环境变量,但未在 Settings 中定义字段,
+    导致 getattr(settings, "BACKUP_SIGNING_KEY", b"") 仍返回空值。
+    """
+
+    def test_settings_file_exists(self):
+        """config/settings.py 必须存在。"""
+        settings_path = REPO_ROOT / "config" / "settings.py"
+        assert settings_path.is_file(), (
+            f"R72 RC69: config/settings.py 必须存在: {settings_path}"
+        )
+
+    def test_settings_defines_backup_signing_key_field(self):
+        """Settings 类必须显式定义 BACKUP_SIGNING_KEY 字段。"""
+        settings_path = REPO_ROOT / "config" / "settings.py"
+        source = settings_path.read_text(encoding="utf-8")
+        # 匹配 `BACKUP_SIGNING_KEY: str = ""` 或类似定义
+        pattern = r"BACKUP_SIGNING_KEY\s*:\s*str\s*=\s*"
+        assert re.search(pattern, source), (
+            "R72 RC69: config/settings.py 必须定义 BACKUP_SIGNING_KEY: str = ... 字段,"
+            "否则 pydantic 不会从环境变量加载此值"
+        )
+
+
+# ════════════════════════════════════════════════════════════════
+# E. 调用方必须将 str 转换为 bytes(hmac.new 要求 bytes)
+# ════════════════════════════════════════════════════════════════
+
+
+class TestSigningKeyStrToBytesConversion:
+    """R72 RC69: 调用方必须将 BACKUP_SIGNING_KEY 从 str 转换为 bytes。
+
+    根因: Settings 中定义为 str(环境变量总是 str),但 hmac.new(key, ...)
+    要求 key 为 bytes。如果不做 encode 转换,backup 签名时会抛 TypeError。
+    """
+
+    def test_db_backup_encodes_signing_key_to_bytes(self):
+        """db_backup.py 必须将 BACKUP_SIGNING_KEY 从 str 转换为 bytes。"""
+        db_backup_path = REPO_ROOT / "services" / "db_backup.py"
+        source = db_backup_path.read_text(encoding="utf-8")
+        # 验证存在 encode("utf-8") 转换
+        assert "encode(\"utf-8\")" in source or "encode('utf-8')" in source, (
+            "R72 RC69: db_backup.py 必须将 BACKUP_SIGNING_KEY (str) "
+            "encode 为 bytes(hmac.new 要求 bytes)"
+        )
+        # 验证不再直接使用 b"" 默认值(应该用 str 默认值 "")
+        # 旧代码: getattr(settings, "BACKUP_SIGNING_KEY", b"") or b""
+        # 新代码: getattr(settings, "BACKUP_SIGNING_KEY", "") or ""
+        old_pattern = r'getattr\(settings,\s*"BACKUP_SIGNING_KEY",\s*b""\)\s*or\s*b""'
+        assert not re.search(old_pattern, source), (
+            "R72 RC69: db_backup.py 不得再使用 `getattr(..., b'') or b''` 旧模式,"
+            "应改为 str 默认值 + encode 转换"
+        )
+
+    def test_db_restore_encodes_signing_key_to_bytes(self):
+        """db_restore.py 必须将 BACKUP_SIGNING_KEY 从 str 转换为 bytes。"""
+        db_restore_path = REPO_ROOT / "services" / "db_restore.py"
+        source = db_restore_path.read_text(encoding="utf-8")
+        assert "encode(\"utf-8\")" in source or "encode('utf-8')" in source, (
+            "R72 RC69: db_restore.py 必须将 BACKUP_SIGNING_KEY (str) "
+            "encode 为 bytes(hmac.new 要求 bytes)"
+        )
+        # 旧代码模式不应再存在
+        old_pattern = r'getattr\(settings,\s*"BACKUP_SIGNING_KEY",\s*b""\)\s*or\s*b""'
+        assert not re.search(old_pattern, source), (
+            "R72 RC69: db_restore.py 不得再使用 `getattr(..., b'') or b''` 旧模式,"
+            "应改为 str 默认值 + encode 转换"
+        )

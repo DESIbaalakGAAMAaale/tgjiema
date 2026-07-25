@@ -864,6 +864,14 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
     # (该入口构造不可伪造的 _RestoreCapability 并调用私有 _restore_from_backup_data)
     # R62 P0-01: 不再支持 skip_strict_validation=True 绕过(已移除该参数)。
     # 三段式备份需提供完整验证参数(signing_key/decryptor 等)。
+    # R72 RC69: BACKUP_SIGNING_KEY 在 Settings 中定义为 str,
+    # hmac.new 需要 bytes,所以做 encode 转换。
+    _signing_key_raw = getattr(settings, "BACKUP_SIGNING_KEY", "") or ""
+    _signing_key_bytes = (
+        _signing_key_raw.encode("utf-8")
+        if isinstance(_signing_key_raw, str)
+        else _signing_key_raw
+    )
     from services.backup_dr_validate import validate_and_restore_backup_strict
     return await validate_and_restore_backup_strict(
         data=data,
@@ -873,7 +881,7 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
         timestamp=str(data.get("backup_time", data.get("backup_id", ""))),
         backup_type="full",
         r2_storage=r2_storage,
-        signing_key=getattr(settings, "BACKUP_SIGNING_KEY", b"") or b"",
+        signing_key=_signing_key_bytes,
         decryptor=_build_db_backup_decryptor(),
         expected_manifest_key=str(data.get("manifest_key", "")),
         expected_backup_id=str(data.get("backup_id", "")),
