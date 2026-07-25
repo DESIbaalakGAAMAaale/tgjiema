@@ -2578,17 +2578,43 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
         cleanup_err = _safe_cleanup_marker(vri_module, trace_id)
         if pre_snapshot_path.exists():
             pre_snapshot_path.unlink(missing_ok=True)
+        # R72 RC73: restore 失败时执行环境变量诊断,定位 BACKUP_KEK / BACKUP_SIGNING_KEY
+        # 是否被容器加载。只打印长度和前缀,不暴露 secret 值。
+        diag_cmd = _compose_cmd([
+            "run", "--rm", "-T",
+            "--no-deps",
+            "--entrypoint", "python",
+            "db_writer",
+            "-c",
+            "import os; "
+            "print('BACKUP_KEK_set=', bool(os.environ.get('BACKUP_KEK',''))); "
+            "print('BACKUP_KEK_len=', len(os.environ.get('BACKUP_KEK',''))); "
+            "print('BACKUP_KEK_FILE_set=', bool(os.environ.get('BACKUP_KEK_FILE',''))); "
+            "print('BACKUP_SIGNING_KEY_set=', bool(os.environ.get('BACKUP_SIGNING_KEY',''))); "
+            "print('BACKUP_SIGNING_KEY_len=', len(os.environ.get('BACKUP_SIGNING_KEY',''))); "
+            "print('R2_ACCOUNT_ID_set=', bool(os.environ.get('R2_ACCOUNT_ID',''))); "
+            "print('R2_BUCKET_NAME_set=', bool(os.environ.get('R2_BUCKET_NAME',''))); "
+            "print('APP_ENV=', os.environ.get('APP_ENV','')); "
+            "print('SERVICE_ROLE=', os.environ.get('SERVICE_ROLE',''))",
+        ])
+        try:
+            diag_result = _run(diag_cmd, timeout=30, cwd=REPO_ROOT)
+            diag_output = diag_result.stdout or ""
+        except Exception as diag_exc:
+            diag_output = f"diag_failed: {type(diag_exc).__name__}: {diag_exc}"
         return _fail_result(
             phase="backup_restore",
             description=description,
             started=started,
             error=f"restore 失败 (exit={restore_result.returncode})"
-                 + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
+                 + (f" | cleanup_err={cleanup_err}" if cleanup_err else "")
+                 + f" | env_diag={diag_output[:500]}",
             stdout=restore_result.stdout,
             stderr=restore_result.stderr,
             returncode=restore_result.returncode,
             readiness_checks=readiness_checks + [
                 {"check": "restore_triggered", "status": "fail"},
+                {"check": "env_diag", "status": "pass" if diag_output else "fail"},
             ],
         )
     readiness_checks.append({"check": "restore_triggered", "status": "pass"})

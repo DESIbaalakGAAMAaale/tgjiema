@@ -129,11 +129,13 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
     # 守卫调用不调用 legacy writer,因此不影响白名单 allowed_callees。
     # R70 Wave 7: db_restore.py 重写为薄 adapter,run_restore 源码随之变化,
     # source_digest 重新生成。
+    # R72 RC69: 添加 BACKUP_SIGNING_KEY 字符串到字节转换逻辑(供 HMAC 签名),
+    # source_digest 重新生成。函数语义未变(仍是 CLI 入口 → strict service 委托)。
     {
         "file": "services/db_restore.py",
         "function": "run_restore",
-        "ast_signature": "cc5940e83a299ee5df0bd20e7f2d736f9634043a146925bcae1f45a53d3e4139",
-        "source_digest": "907f5519186ed8af3a24a00bed74034d25d42b3603098e7fb03169aa6768ffda",
+        "ast_signature": "579eadb612b09618369620cf58b041a753ccf4dbb0ffc61d7686e401582eabe9",
+        "source_digest": "eae9c989c23fe3212e4787ed26d63be24410a757e915be100abb0127dbd1b002",
         "allowed_callees": frozenset({"validate_and_restore_backup_strict"}),
         "reason": "CLI 入口委托:run_restore → validate_and_restore_backup_strict(strict service)",
     },
@@ -187,11 +189,13 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
     # 长期目标:迁移到 RestoreOrchestrator 蓝绿切换路径后移除这些白名单条目。
     #
     # db_backup.py: restore_from_backup 公共入口委托给 validate_and_restore_backup_strict
+    # R72 RC69: 添加 BACKUP_SIGNING_KEY 字符串到字节转换逻辑(供 HMAC 签名),
+    # source_digest 重新生成。函数语义未变(仍是 sealed 公共入口 → strict service 委托)。
     {
         "file": "services/db_backup.py",
         "function": "restore_from_backup",
-        "ast_signature": "f245c82dee6e6b60c98af026d546a6045a11b9fbc9aa5a4b10fa49c9302d7b8d",
-        "source_digest": "09783912c92f0dd7295f5c1fc355a6145c2637d2e53138f6e22e7eb825e0863e",
+        "ast_signature": "fd9d01c2f1569c7872fbc9a72dc237cfc2028048995184904392efedf797b88f",
+        "source_digest": "23219be711b675bbfdda5f71cef846e98516d5105940a878b308a5084cc8b849",
         "allowed_callees": frozenset({"validate_and_restore_backup_strict"}),
         "reason": (
             "sealed 公共入口:"

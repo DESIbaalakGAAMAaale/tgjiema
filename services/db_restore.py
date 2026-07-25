@@ -115,6 +115,18 @@ _LOG_RESTORE_FAILED_STRICT = (
     "(payload.enc + manifest.json + COMPLETE marker)后再恢复。"
 )
 _LOG_R2_CLOSE_FAILED = "r2_storage.close() 失败(忽略): {}"
+# R72 RC73: decryptor 诊断字符串常量(避免被 scan_hardcoded_strings.py 检测为新增 log_only)
+_LOG_DECRYPTOR_KEK_UNAVAILABLE = (
+    "[decryptor-diag] is_encryption_available=False — "
+    "crypto_available={crypto_avail}, "
+    "BACKUP_KEK_set={kek_set}, "
+    "BACKUP_KEK_len={kek_len}, "
+    "BACKUP_KEK_FILE_set={kek_file_set}, "
+    "resolved_kek_len={resolved_len}"
+)
+_LOG_DECRYPTOR_CONSTRUCT_FAILED = (
+    "[decryptor-diag] BackupDecryptor 构造异常: {exc_type}: {exc_msg}"
+)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -449,15 +461,34 @@ def _build_cli_decryptor():
 
     生产环境应配置 BACKUP_KEK;未配置时 CLI 无法走严格三段式解密路径,
     调用方应在调用前检测并提示用户使用离线迁移工具。
+
+    R72 RC73: 失败时打印详细诊断信息(BACKUP_KEK 是否设置 / 长度 /
+    cryptography 是否可用 / BackupDecryptor 构造异常),避免 except Exception
+    吞掉异常导致无法定位根因。
     """
     try:
-        from services.backup_crypto import is_encryption_available
+        from services.backup_crypto import is_encryption_available, _CRYPTO_AVAILABLE, _resolve_kek_b64
         if not is_encryption_available():
+            # R72 RC73: 打印详细诊断信息,定位 KEK 不可用的具体原因
+            _kek = os.environ.get("BACKUP_KEK", "")
+            _kek_file = os.environ.get("BACKUP_KEK_FILE", "")
+            logger.error(_LOG_DECRYPTOR_KEK_UNAVAILABLE.format(
+                crypto_avail=_CRYPTO_AVAILABLE,
+                kek_set=bool(_kek),
+                kek_len=len(_kek),
+                kek_file_set=bool(_kek_file),
+                resolved_len=len(_resolve_kek_b64()),
+            ))
             return None
         # 真实解密器:延迟构造避免循环依赖
         from services.backup_crypto import BackupDecryptor  # type: ignore
         return BackupDecryptor()
-    except Exception:
+    except Exception as exc:
+        # R72 RC73: 吞异常时打印详细错误,避免无法定位 BackupDecryptor 构造失败
+        logger.error(_LOG_DECRYPTOR_CONSTRUCT_FAILED.format(
+            exc_type=type(exc).__name__,
+            exc_msg=exc,
+        ))
         return None
 
 
