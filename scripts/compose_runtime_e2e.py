@@ -2525,8 +2525,15 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
     #           使 _production_guard.assert_no_legacy_restore_in_production() 通过
     #           (生产环境无逃生舱,即使 ALLOW_LEGACY_RESTORE=1 也拒绝;
     #            development 环境允许 ALLOW_LEGACY_RESTORE 逃生舱)。
-    #           --target staging 已在 db_restore.main() 内部 setdefault
-    #           ALLOW_LEGACY_RESTORE=1(scripts 场景逃生舱)。
+    # R72 RC68: docker-compose.prod.yml 为所有服务设置 `ALLOW_LEGACY_RESTORE=`
+    #           (空字符串,生产安全策略 — 防止逃生舱被意外启用)。
+    #           db_restore.main() 中 `os.environ.setdefault("ALLOW_LEGACY_RESTORE", "1")`
+    #           仅在 key 不存在时设置;compose 文件已设置空字符串,
+    #           setdefault 无法覆盖,导致 run_restore() capability-seal 检查
+    #           (line 348: `os.environ.get("ALLOW_LEGACY_RESTORE", "").lower()
+    #            not in ("1", "true", "yes")`)失败,抛 AppError(legacy_writer_sealed)。
+    #           修复方案:显式设置 -e ALLOW_LEGACY_RESTORE=1 覆盖 compose 文件的
+    #           空字符串值,使 capability-seal 检查通过。
     #           合理性:compose-runtime-e2e 是 CI 测试场景,不涉及生产数据
     #           (--target staging 恢复到隔离 staging 数据库)。
     restore_evidence_path = REPO_ROOT / "data" / f"restore_evidence_{trace_id}.json"
@@ -2537,6 +2544,7 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
         "--no-deps",
         "--entrypoint", "python",
         "-e", "APP_ENV=development",
+        "-e", "ALLOW_LEGACY_RESTORE=1",
         "-v", f"{db_restore_host_path}:/app/services/db_restore.py:ro",
         "db_writer",
         "-m", "services.db_restore",
