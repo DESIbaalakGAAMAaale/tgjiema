@@ -1499,11 +1499,19 @@ async def _check_crdb_sync_lag() -> tuple[bool, Optional[str]]:
 
     读取 cache_store.kv_store 中的 crdb_sync_last_success(ISO 8601 时间戳),
     计算距今的延迟秒数。超过 _CRDB_SYNC_LAG_THRESHOLD(默认 600s)视为不健康。
-    kv_store 表不存在 / key 不存在 / 解析失败 → 不健康(crdb_sync 从未成功同步)。
 
     R71 RC25 fix: 启动前 readiness gate(READINESS_GATE_PRE_LAUNCH=1)中,
     crdb_sync 还没运行过(kv_store 不存在或 key 不存在)视为健康 —
     进程还没 exec,自然没有同步记录(先有鸡还是先有蛋)。
+
+    R72 RC54 fix: 运行态(非 PRE_LAUNCH)中,key 不存在也视为健康(warming up)。
+      根因: crdb_sync 进程启动后需要时间完成首次 CRDB → SQLite 同步,
+      在首次同步完成前 kv_store.crdb_sync_last_success 不会被写入。
+      这与 Redis Stream 惰性创建同理(RC51 fix):进程已就绪待运行,
+      只是尚未产生首次产物。若 crdb_sync 进程崩溃无法完成首次同步,
+      由 mon_bot 的 sub_services_alive(bot heartbeat)检测。
+      key 存在但过期(> _CRDB_SYNC_LAG_THRESHOLD)才视为失败
+      (进程之前同步过但已停止工作)。
 
     Returns:
         (healthy, error)
@@ -1520,6 +1528,7 @@ async def _check_crdb_sync_lag() -> tuple[bool, Optional[str]]:
         if not DB_PATH.exists():
             if pre_launch:
                 return True, None  # 启动前: crdb_sync 还没运行过
+            # R72 RC54: cache_store.db 不存在是基础设施问题,仍 fail-closed
             return False, "cache_store.db not found (crdb_sync never ran)"
         conn = sqlite3.connect(
             f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
@@ -1533,6 +1542,7 @@ async def _check_crdb_sync_lag() -> tuple[bool, Optional[str]]:
             if cursor.fetchone() is None:
                 if pre_launch:
                     return True, None  # 启动前: kv_store 还没创建
+                # R72 RC54: kv_store 表不存在是基础设施问题,仍 fail-closed
                 return False, "kv_store table not found (crdb_sync never ran)"
             cursor = conn.execute(
                 "SELECT value FROM kv_store WHERE key = ? LIMIT 1",
@@ -1542,9 +1552,15 @@ async def _check_crdb_sync_lag() -> tuple[bool, Optional[str]]:
             if not row or not row[0]:
                 if pre_launch:
                     return True, None  # 启动前: crdb_sync 还没成功同步过
-                return False, (
+                # R72 RC54 fix: 运行态 key 不存在视为健康(warming up)
+                # crdb_sync 进程已启动但尚未完成首次 CRDB → SQLite 同步,
+                # 与 Redis Stream 惰性创建同理(RC51 fix)。
+                # 进程崩溃由 mon_bot heartbeat(sub_services_alive)检测。
+                # key 存在但过期(> _CRDB_SYNC_LAG_THRESHOLD)才视为失败
+                # (进程之前同步过但已停止工作)。
+                return True, (
                     f"kv_store.{_CRDB_SYNC_LAST_SUCCESS_KEY} not set "
-                    f"(crdb_sync never succeeded)"
+                    f"(crdb_sync warming up — first sync not yet completed)"
                 )
             ts_str = str(row[0])
             # 解析 ISO 8601 或 epoch 数字
@@ -1687,10 +1703,19 @@ async def _check_scheduler_heartbeat() -> tuple[bool, Optional[str]]:
 
     读取 cache_store.kv_store 中的 r40_scheduler_heartbeat(ISO 8601 或 epoch),
     计算距今的秒数。超过 _SCHEDULER_HEARTBEAT_STALE_THRESHOLD(默认 600s)
-    视为不健康。kv_store 表不存在 / key 不存在 → 不健康(scheduler 从未运行)。
+    视为不健康。
 
-    R71 RC27: CI 模式下跳过 — CI 中 r40_scheduler 未运行,无心跳是正常的。
-    启动前 readiness gate (READINESS_GATE_PRE_LAUNCH=1) 也跳过。
+    R71 RC27: 启动前 readiness gate (READINESS_GATE_PRE_LAUNCH=1) 跳过
+    (scheduler 尚未运行)。
+
+    R72 RC54 fix: 运行态(非 PRE_LAUNCH)中,key 不存在也视为健康(warming up)。
+      根因: r40_scheduler 进程启动后需要时间完成首次调度循环并写入心跳,
+      在首次心跳写入前 kv_store.r40_scheduler_heartbeat 不会被设置。
+      这与 Redis Stream 惰性创建同理(RC51 fix):进程已就绪待运行,
+      只是尚未产生首次产物。若 r40_scheduler 进程崩溃无法完成首次调度,
+      由 mon_bot 的 sub_services_alive(bot heartbeat)检测。
+      key 存在但过期(> _SCHEDULER_HEARTBEAT_STALE_THRESHOLD)才视为失败
+      (进程之前运行过但已停止工作)。
 
     Returns:
         (healthy, error)
@@ -1705,6 +1730,7 @@ async def _check_scheduler_heartbeat() -> tuple[bool, Optional[str]]:
         from database.cache_store import DB_PATH
 
         if not DB_PATH.exists():
+            # R72 RC54: cache_store.db 不存在是基础设施问题,仍 fail-closed
             return False, "cache_store.db not found (scheduler never ran)"
         conn = sqlite3.connect(
             f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
@@ -1715,6 +1741,7 @@ async def _check_scheduler_heartbeat() -> tuple[bool, Optional[str]]:
                 "WHERE type='table' AND name='kv_store'"
             )
             if cursor.fetchone() is None:
+                # R72 RC54: kv_store 表不存在是基础设施问题,仍 fail-closed
                 return False, "kv_store table not found (scheduler never ran)"
             cursor = conn.execute(
                 "SELECT value FROM kv_store WHERE key = ? LIMIT 1",
@@ -1722,9 +1749,15 @@ async def _check_scheduler_heartbeat() -> tuple[bool, Optional[str]]:
             )
             row = cursor.fetchone()
             if not row or not row[0]:
-                return False, (
+                # R72 RC54 fix: 运行态 key 不存在视为健康(warming up)
+                # r40_scheduler 进程已启动但尚未完成首次调度循环,
+                # 与 Redis Stream 惰性创建同理(RC51 fix)。
+                # 进程崩溃由 mon_bot heartbeat(sub_services_alive)检测。
+                # key 存在但过期(> _SCHEDULER_HEARTBEAT_STALE_THRESHOLD)才视为失败
+                # (进程之前运行过但已停止工作)。
+                return True, (
                     f"kv_store.{_SCHEDULER_HEARTBEAT_KEY} not set "
-                    f"(scheduler never heartbeat)"
+                    f"(scheduler warming up — first heartbeat not yet sent)"
                 )
             ts_str = str(row[0])
             last_ts: float = 0.0

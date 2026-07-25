@@ -484,6 +484,120 @@ class TestNewCheckFunctions:
         assert healthy is False
         assert "cache_store.db not found" in error
 
+    def test_check_crdb_sync_lag_warming_up_key_not_set(self, health, monkeypatch):
+        """R72 RC54 fix: _check_crdb_sync_lag 在 key 不存在时视为健康(warming up)。
+
+        根因: crdb_sync 进程启动后需要时间完成首次 CRDB → SQLite 同步,
+        在首次同步完成前 kv_store.crdb_sync_last_success 不会被写入。
+        这与 Redis Stream 惰性创建同理(RC51 fix):进程已就绪待运行,
+        只是尚未产生首次产物。进程崩溃由 mon_bot heartbeat 检测。
+        key 存在但过期(> _CRDB_SYNC_LAG_THRESHOLD)才视为失败。
+        """
+        pytest.importorskip("aiosqlite", reason="aiosqlite 未安装,跳过 DB 相关测试")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        monkeypatch.delenv("READINESS_GATE_PRE_LAUNCH", raising=False)
+
+        # 模拟 cache_store.db 存在,kv_store 表存在,但 key 未设置
+        class FakeCursor:
+            def __init__(self, rows):
+                self._rows = rows
+                self._idx = 0
+
+            def fetchone(self):
+                if self._idx < len(self._rows):
+                    r = self._rows[self._idx]
+                    self._idx += 1
+                    return r
+                return None
+
+        class FakeConn:
+            def __init__(self, has_table=True, has_key=False):
+                self._has_table = has_table
+                self._has_key = has_key
+
+            def execute(self, sql, params=()):
+                if "sqlite_master" in sql:
+                    return FakeCursor([("kv_store",)] if self._has_table else [None])
+                # SELECT value FROM kv_store WHERE key = ?
+                return FakeCursor([("value",)] if self._has_key else [None])
+
+            def close(self):
+                pass
+
+        import sqlite3 as _sqlite3
+
+        mock_db_path = type("MockPath", (), {"exists": lambda self: True})()
+        monkeypatch.setattr(
+            "database.cache_store.DB_PATH", mock_db_path, raising=False
+        )
+        monkeypatch.setattr(
+            _sqlite3, "connect", lambda *a, **kw: FakeConn(has_table=True, has_key=False)
+        )
+
+        healthy, error = asyncio.run(health._check_crdb_sync_lag())
+        assert healthy is True, (
+            "R72 RC54: crdb_sync 进程启动后 key 未写入应视为 warming up 健康"
+        )
+        assert error is not None
+        assert "warming up" in error
+
+    def test_check_scheduler_heartbeat_warming_up_key_not_set(self, health, monkeypatch):
+        """R72 RC54 fix: _check_scheduler_heartbeat 在 key 不存在时视为健康(warming up)。
+
+        根因: r40_scheduler 进程启动后需要时间完成首次调度循环并写入心跳,
+        在首次心跳写入前 kv_store.r40_scheduler_heartbeat 不会被设置。
+        这与 Redis Stream 惰性创建同理(RC51 fix):进程已就绪待运行,
+        只是尚未产生首次产物。进程崩溃由 mon_bot heartbeat 检测。
+        key 存在但过期(> _SCHEDULER_HEARTBEAT_STALE_THRESHOLD)才视为失败。
+        """
+        pytest.importorskip("aiosqlite", reason="aiosqlite 未安装,跳过 DB 相关测试")
+        monkeypatch.delenv("CI", raising=False)
+        monkeypatch.delenv("GITHUB_ACTIONS", raising=False)
+        monkeypatch.delenv("READINESS_GATE_PRE_LAUNCH", raising=False)
+
+        class FakeCursor:
+            def __init__(self, rows):
+                self._rows = rows
+                self._idx = 0
+
+            def fetchone(self):
+                if self._idx < len(self._rows):
+                    r = self._rows[self._idx]
+                    self._idx += 1
+                    return r
+                return None
+
+        class FakeConn:
+            def __init__(self, has_table=True, has_key=False):
+                self._has_table = has_table
+                self._has_key = has_key
+
+            def execute(self, sql, params=()):
+                if "sqlite_master" in sql:
+                    return FakeCursor([("kv_store",)] if self._has_table else [None])
+                return FakeCursor([("value",)] if self._has_key else [None])
+
+            def close(self):
+                pass
+
+        import sqlite3 as _sqlite3
+
+        mock_db_path = type("MockPath", (), {"exists": lambda self: True})()
+        monkeypatch.setattr(
+            "database.cache_store.DB_PATH", mock_db_path, raising=False
+        )
+        monkeypatch.setattr(
+            _sqlite3, "connect", lambda *a, **kw: FakeConn(has_table=True, has_key=False)
+        )
+
+        healthy, error = asyncio.run(health._check_scheduler_heartbeat())
+        assert healthy is True, (
+            "R72 RC54: r40_scheduler 进程启动后 key 未写入应视为 warming up 健康"
+        )
+        assert error is not None
+        assert "warming up" in error
+
     def test_check_backup_dir_writable_fail_closed_no_env(self, health, monkeypatch):
         """_check_backup_dir_writable 在 BACKUP_DIR 未配置时使用默认路径。
         
