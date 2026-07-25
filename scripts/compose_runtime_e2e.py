@@ -1077,12 +1077,17 @@ def phase_start_bots(timeout: int) -> PhaseResult:
     ]
 
     # 轮询等待所有 Bot 服务达到 running + healthy
-    # (healthcheck start_period 最高 90s)
+    # R72 RC52 fix: timeout 从 180s 提升到 300s。
+    # healthcheck 配置为 start_period=90s + interval=30s + retries=3,
+    # 理论最小到 healthy 时间 = 90s + 3*30s = 180s(恰好与旧 timeout 重合,
+    # 边界效应导致 admin_bot/r40_scheduler 等慢启动服务在 180s 时仍为 starting)。
+    # 提升到 300s 给慢启动服务(app import / SQLite 初始化 / Redis 连接建立)
+    # 提供额外 120s 缓冲,避免边界假性失败。
     expected_bots: dict[str, dict[str, str]] = {
         svc: {"state": "running", "health": "healthy"} for svc in BOT_SERVICES
     }
     all_ready, service_info = _wait_for_services(
-        expected=expected_bots, timeout_seconds=180, poll_interval=5,
+        expected=expected_bots, timeout_seconds=300, poll_interval=5,
     )
 
     # 逐服务断言
@@ -1117,21 +1122,73 @@ def phase_start_bots(timeout: int) -> PhaseResult:
     })
 
     if service_failures or not all_ready:
+        # R72 RC52 fix: 失败时捕获容器日志 + 主动运行 health check 获取
+        # 结构化诊断信息(与 start_core 失败路径对齐)。
+        # 1) docker compose logs:看应用启动是否报错(import 失败/连接拒绝/...)
+        # 2) docker compose exec check_readiness --json:看具体哪个检查项失败
+        #    (database_crdb / bot_token_valid / scheduler_heartbeat / ...)
+        container_logs: dict[str, Any] = {}
+        health_check_detail: dict[str, Any] = {}
+        failing_svcs = [
+            svc for svc in BOT_SERVICES
+            if svc in service_info and (
+                service_info[svc].get("state") != "running"
+                or service_info[svc].get("health") != "healthy"
+            )
+        ]
+        for svc in failing_svcs:
+            # 1) 捕获容器日志
+            logs_cmd = _compose_cmd(["logs", "--no-color", "--tail", "300", svc])
+            try:
+                logs_result = _run(logs_cmd, timeout=15, cwd=REPO_ROOT)
+                svc_log = (logs_result.stdout or "") + (logs_result.stderr or "")
+                if svc_log.strip():
+                    container_logs[svc] = svc_log[-6000:]
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+            # 2) 主动运行 health check 获取结构化 JSON
+            #    (healthcheck 命令本身只 exit 1 不打印错误,
+            #     通过 exec 运行 check_readiness --json 可看到具体失败的检查项)
+            health_cmd = _compose_cmd([
+                "exec", "-T", svc, "python", "-c",
+                "import asyncio, os, json; "
+                "from services.health import check_readiness; "
+                "r = asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE', ''))); "
+                "print(json.dumps(r.to_dict(), ensure_ascii=False))",
+            ])
+            try:
+                health_result = _run(health_cmd, timeout=20, cwd=REPO_ROOT)
+                health_stdout = (health_result.stdout or "").strip()
+                if health_stdout:
+                    try:
+                        health_check_detail[svc] = json.loads(health_stdout)
+                    except json.JSONDecodeError:
+                        health_check_detail[svc] = {
+                            "parse_error": "stdout is not JSON",
+                            "raw_stdout": health_stdout[-2000:],
+                            "stderr": (health_result.stderr or "")[-1000:],
+                        }
+            except (subprocess.TimeoutExpired, OSError):
+                health_check_detail[svc] = {"error": "exec timed out or failed"}
+
         return _fail_result(
             phase="start_bots",
             description=description,
             started=started,
             error=(
                 f"R72 P0-07: Bot 服务状态断言失败 — "
-                f"{'; '.join(service_failures) if service_failures else '等待超时(180s)'}"
+                f"{'; '.join(service_failures) if service_failures else '等待超时(300s)'}"
             ),
             stdout=result.stdout,
             stderr=result.stderr,
             evidence={
                 "service_info": service_info,
                 "failures": service_failures,
-                "wait_timeout_seconds": 180,
+                "wait_timeout_seconds": 300,
                 "all_ready": all_ready,
+                "container_logs": container_logs,
+                "health_check_detail": health_check_detail,
             },
             readiness_checks=readiness_checks,
         )
