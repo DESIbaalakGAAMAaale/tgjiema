@@ -794,6 +794,13 @@ jobs:
           echo "R2_BUCKET_NAME=${R2_BUCKET_NAME}" >> .env.shared
           echo "R2_ENDPOINT=${R2_ENDPOINT}" >> .env.shared
           echo "BACKUP_KEK=${BACKUP_KEK}" >> .env.shared
+          # R72 RC69: 注入 BACKUP_SIGNING_KEY(用于 COMPLETE marker HMAC 签名)。
+          # backup 用此密钥签名 COMPLETE marker,restore 用同一密钥验证签名 —
+          # 两者必须使用相同密钥才能完成 round-trip 验证。
+          # db_restore 通过 `compose run db_writer` 执行,env_file 只有 .env.shared,
+          # 所以必须写入 .env.shared 才能被 db_restore 读取。
+          # 密钥来源:GitHub Secrets(32 字节十六进制 HMAC 密钥)。
+          echo "BACKUP_SIGNING_KEY=${BACKUP_SIGNING_KEY}" >> .env.shared
           # db_backup 也通过 .env.secrets.db_backup 加载(冗余但确保可见)
           echo "R2_ACCOUNT_ID=${R2_ACCOUNT_ID}" >> .env.secrets.db_backup
           echo "R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}" >> .env.secrets.db_backup
@@ -801,6 +808,7 @@ jobs:
           echo "R2_BUCKET_NAME=${R2_BUCKET_NAME}" >> .env.secrets.db_backup
           echo "R2_ENDPOINT=${R2_ENDPOINT}" >> .env.secrets.db_backup
           echo "BACKUP_KEK=${BACKUP_KEK}" >> .env.secrets.db_backup
+          echo "BACKUP_SIGNING_KEY=${BACKUP_SIGNING_KEY}" >> .env.secrets.db_backup
           # R71 RC26 fix: CI=true 必须传到容器内,使 services.health 的
           # _check_bot_token_valid() 在 CI 模式下跳过 getMe 调用(只验证 token 格式),
           # 以及 services/prometheus_exporter.collect_dependency_status() 在启动
@@ -814,6 +822,7 @@ jobs:
           R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           BACKUP_KEK: ${{ secrets.BACKUP_KEK }}
+          BACKUP_SIGNING_KEY: ${{ secrets.BACKUP_SIGNING_KEY }}
 
       - name: Create data and logs directories for bind mounts
         run: |
