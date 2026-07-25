@@ -350,15 +350,15 @@ class TestOrchestratorPassesTimeout:
             COMPOSE_RUNTIME_E2E_PATH,
             needle="RC60",
             context_marker="backup_cmd = _compose_cmd(",
-            context_size=800,
+            context_size=3000,
         )
-        # 注释在 backup_cmd 之前,需检查 backup_cmd 之前 800 字符
+        # 注释在 backup_cmd 之前,需检查 backup_cmd 之前 3000 字符
         source = COMPOSE_RUNTIME_E2E_PATH.read_text(encoding="utf-8")
         idx = source.find("backup_cmd = _compose_cmd(")
         assert idx >= 0, "未找到 backup_cmd 定义"
-        # 取 backup_cmd 之前 800 字符(注释区,容纳 RC60/RC62/RC63 多重注释叠加)
-        before = source[max(0, idx - 800):idx]
+        # 取 backup_cmd 之前 3000 字符(注释区,容纳 RC60-RC66 多重注释叠加)
+        before = source[max(0, idx - 3000):idx]
         assert "RC60" in before, (
             "R72 RC60: backup_cmd 上方注释必须提及 RC60 修复, "
-            f"实际前 800 字符: {before[-200:]}"
+            f"实际前 3000 字符: {before[-200:]}"
         )

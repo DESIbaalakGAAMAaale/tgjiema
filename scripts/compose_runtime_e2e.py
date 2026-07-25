@@ -343,19 +343,35 @@ def _run(
 
     失败时返回 CompletedProcess(returncode != 0),由调用方决定如何处理。
     不在此处吞异常或自动重试(fail-closed 原则)。
+
+    R72 RC66: subprocess.run 在 timeout 触发时会抛 TimeoutExpired 并丢失
+    已捕获的 stdout/stderr。本函数在 timeout 时重新抛出带有 partial output
+    的 TimeoutExpired,供调用方提取诊断信息(避免 600s 超时后 stdout/stderr
+    全空,无法定位失败原因)。
     """
     full_env = None
     if env is not None:
         full_env = os.environ.copy()
         full_env.update(env)
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        cwd=str(cwd) if cwd else None,
-        env=full_env,
-    )
+    try:
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(cwd) if cwd else None,
+            env=full_env,
+        )
+    except subprocess.TimeoutExpired as e:
+        # R72 RC66: 重新抛出带有 partial output 的 TimeoutExpired
+        # subprocess.run 在 timeout 时已捕获部分输出(存于 e.stdout/e.stderr),
+        # 但默认 TimeoutExpired 的 stdout/stderr 可能为 None(取决于捕获时机)。
+        # 确保字段非 None,便于调用方安全引用。
+        if e.stdout is None:
+            e.stdout = ""
+        if e.stderr is None:
+            e.stderr = ""
+        raise
 
 
 def _docker_available() -> bool:
@@ -2364,27 +2380,62 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
     # R72 RC63: evidence 文件路径必须使用容器内可写路径(/app/data 映射到宿主机 ./data),
     #           而非宿主机路径 — db_backup 容器 read_only: true,只挂载 ./data:/app/data,
     #           传入宿主机路径会写入失败(OSError),且 evidence 文件无法被编排器读取。
+    # R72 RC65: compose run 必须加 --entrypoint python 覆盖 Dockerfile ENTRYPOINT。
+    #           Dockerfile ENTRYPOINT 是 python /app/docker/entrypoint.py,它会:
+    #             1. 读取 SERVICE_ROLE=db_backup
+    #             2. 构造 cmd = ["python", "run_all.py", "--standalone", "db_backup"]
+    #             3. 把 sys.argv[1:] (即 "python -m services.db_backup backup --once ...")
+    #                作为 extra_args 追加到 cmd
+    #             4. execvp 执行:python run_all.py --standalone db_backup python -m ...
+    #           这导致 db_backup DAEMON 被启动(永不退出),而非一次性 backup --once CLI。
+    #           600s 超时强杀,stdout 为空,无 evidence 输出。
+    #           修复:--entrypoint python 直接覆盖 ENTRYPOINT 为 python,
+    #           COMMAND 变为 "-m services.db_backup backup --once ...",
+    #           实际执行:python -m services.db_backup backup --once ...,
+    #           绕过 entrypoint.py 的角色映射 + readiness gate,直接运行 CLI。
+    #           合理性:backup_restore 阶段在 health_check 之后执行,
+    #           此时 db_backup 服务已通过 readiness gate,无需重复检查。
+    # R72 RC66: compose run 必须加 --no-deps 跳过 depends_on 依赖检查。
+    #           db_backup 服务 depends_on migration(condition: service_completed_successfully),
+    #           但 docker compose run 在某些版本会尝试重新创建/启动已退出的 migration
+    #           容器来满足 depends_on 条件,导致命令无限挂起。
+    #           backup_restore 阶段在 start_bots 之后执行,所有依赖服务(redis/migration)
+    #           已在期望状态,无需 compose run 再次检查。
+    #           --no-deps 跳过依赖管理,直接启动 run 容器。
+    # R72 RC66: 改进 TimeoutExpired 错误处理,提取 partial stdout/stderr。
+    #           subprocess.run 在 timeout 时已捕获部分输出(存于 e.stdout/e.stderr),
+    #           原代码直接 except 后丢弃,导致 600s 超时后 stdout/stderr 全空,
+    #           无法定位是 docker compose run 卡住还是 python 进程卡住。
     backup_evidence_path = REPO_ROOT / "data" / f"backup_evidence_{trace_id}.json"
     backup_evidence_container_path = f"/app/data/backup_evidence_{trace_id}.json"
     backup_cmd = _compose_cmd([
-        "run", "--rm", "-T", "db_backup",
-        "python", "-m", "services.db_backup", "backup",
+        "run", "--rm", "-T",
+        "--no-deps",
+        "--entrypoint", "python",
+        "db_backup",
+        "-m", "services.db_backup", "backup",
         "--once",
         "--timeout", "240",
         "--output-json", backup_evidence_container_path,
     ])
     try:
         backup_result = _run(backup_cmd, timeout=timeout, cwd=REPO_ROOT)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as te:
         cleanup_err = _safe_cleanup_marker(vri_module, trace_id)
         if pre_snapshot_path.exists():
             pre_snapshot_path.unlink(missing_ok=True)
+        partial_stdout = (te.stdout or "")[:2000] if isinstance(te.stdout, str) else ""
+        partial_stderr = (te.stderr or "")[:2000] if isinstance(te.stderr, str) else ""
         return _fail_result(
             phase="backup_restore",
             description=description,
             started=started,
             error=f"R72 P0-10: backup --once 触发超时({timeout}s)"
-                 + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
+                 + (f" | cleanup_err={cleanup_err}" if cleanup_err else "")
+                 + (f" | partial_stdout={partial_stdout[:500]}" if partial_stdout else "")
+                 + (f" | partial_stderr={partial_stderr[:500]}" if partial_stderr else ""),
+            stdout=partial_stdout,
+            stderr=partial_stderr,
             readiness_checks=readiness_checks + [
                 {"check": "backup_triggered", "status": "timeout"},
             ],
@@ -2454,29 +2505,43 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
     # R72 P0-10: 触发 restore --target staging --backup-id(隔离目标,不覆盖生产数据)
     # R72 RC63: compose run 必须加 -T 禁用 TTY 分配(同 backup_cmd 注释)
     # R72 RC63: evidence 文件路径使用容器内 /app/data(同 backup_evidence_path 逻辑)
+    # R72 RC65: compose run 必须加 --entrypoint python 覆盖 Dockerfile ENTRYPOINT
+    #           (同 backup_cmd RC65 注释,否则 entrypoint.py 启动 db_writer daemon
+    #           而非一次性 db_restore CLI,导致 600s 超时强杀)
+    # R72 RC66: compose run 必须加 --no-deps(同 backup_cmd RC66 注释,
+    #           跳过 depends_on 依赖检查,避免 compose run 尝试重启 migration)
+    # R72 RC66: 改进 TimeoutExpired 错误处理,提取 partial stdout/stderr
+    #           (同 backup_cmd RC66 注释)
     restore_evidence_path = REPO_ROOT / "data" / f"restore_evidence_{trace_id}.json"
     restore_evidence_container_path = f"/app/data/restore_evidence_{trace_id}.json"
     restore_cmd = _compose_cmd([
-        "run", "--rm", "-T", "db_writer",
-        "python", "-m", "services.db_restore",
+        "run", "--rm", "-T",
+        "--no-deps",
+        "--entrypoint", "python",
+        "db_writer",
+        "-m", "services.db_restore",
         "--backup-id", backup_id,
         "--target", "staging",
         "--output-json", restore_evidence_container_path,
     ])
     try:
         restore_result = _run(restore_cmd, timeout=timeout, cwd=REPO_ROOT)
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as te:
         cleanup_err = _safe_cleanup_marker(vri_module, trace_id)
         if pre_snapshot_path.exists():
             pre_snapshot_path.unlink(missing_ok=True)
+        partial_stdout = (te.stdout or "")[:2000] if isinstance(te.stdout, str) else ""
+        partial_stderr = (te.stderr or "")[:2000] if isinstance(te.stderr, str) else ""
         return _fail_result(
             phase="backup_restore",
             description=description,
             started=started,
             error=f"restore 触发超时({timeout}s)"
-                 + (f" | cleanup_err={cleanup_err}" if cleanup_err else ""),
-            stdout=backup_result.stdout,
-            stderr=backup_result.stderr,
+                 + (f" | cleanup_err={cleanup_err}" if cleanup_err else "")
+                 + (f" | partial_stdout={partial_stdout[:500]}" if partial_stdout else "")
+                 + (f" | partial_stderr={partial_stderr[:500]}" if partial_stderr else ""),
+            stdout=partial_stdout,
+            stderr=partial_stderr,
             readiness_checks=readiness_checks + [
                 {"check": "restore_triggered", "status": "timeout"},
             ],
