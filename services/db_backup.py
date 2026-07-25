@@ -930,12 +930,15 @@ async def backup_once(
     Raises:
         AppError: R2 凭证缺失 / 加密不可用 / 上传失败
     """
-    # 确保数据库连接池已初始化(init_db 不计入 timeout,因为后续 cleanup 也需要连接)
-    if not db_client.is_connected:
-        from database.session import init_db
-        await init_db()
-
+    # R72 RC62: init_db 移入 _do_backup_inner() 内部,受 asyncio.wait_for 保护
+    # 原实现将 init_db 放在 wait_for 之外,导致 init_db 卡住时 --timeout 完全失效,
+    # 编排器只能等到 600s 超时强杀,无结构化 evidence 输出。
     async def _do_backup_inner() -> dict:
+        # 确保数据库连接池已初始化(init_db 计入 timeout,防止 connect() 卡住)
+        if not db_client.is_connected:
+            from database.session import init_db
+            await init_db()
+
         # R2 凭证动态配置
         await configure_r2_dynamic()
         if not r2_storage._access_key:
@@ -1082,13 +1085,25 @@ async def backup_once(
         )
         return timeout_evidence
     finally:
+        # R72 RC62: cleanup 操作添加独立超时保护,防止 close_db/close 卡住
+        # 导致整个 backup_once 在 timeout 后仍无法返回。
+        # 即使 timeout 已触发,_do_backup_inner 内部已申请的资源仍需释放,
+        # 但释放本身也不能无限等待(否则编排器仍会 600s 超时强杀)。
         try:
             from database.session import close_db
-            await close_db()
+            await asyncio.wait_for(close_db(), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning(
+                _i18n_t('services.db_backup.s10', error="close_db timeout(15s)")
+            )
         except Exception as close_err:
             logger.warning(_i18n_t('services.db_backup.s9', error=close_err))
         try:
-            await r2_storage.close()
+            await asyncio.wait_for(r2_storage.close(), timeout=15)
+        except asyncio.TimeoutError:
+            logger.warning(
+                _i18n_t('services.db_backup.s10', error="r2_storage.close timeout(15s)")
+            )
         except Exception as close_err:
             logger.warning(_i18n_t('services.db_backup.s10', error=close_err))
 
