@@ -403,6 +403,12 @@ class CockroachDBClient:
             "statement_cache_size": 256,
             "init": _init_conn,
             "server_settings": {"application_name": app_name},  # 连接级别也设置
+            # R72 RC60: asyncpg 连接与命令超时,防止 CI/网络异常时无限挂起
+            # 导致 compose-runtime-e2e backup_restore 阶段 600s 超时。
+            # - command_timeout=30: 单条 SQL 语句 30s 硬超时(覆盖查询/写入)
+            # - timeout=15: create_pool 首次建连 15s 超时(避免 DNS/TLS 握手无限重试)
+            "command_timeout": 30,
+            "timeout": 15,
         }
         # asyncpg 0.27+ 支持 max_inactive_connection_lifetime(秒)
         # 旧版本忽略此参数(由 try/except 兜底)

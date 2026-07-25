@@ -2160,7 +2160,11 @@
       "s7": "启动后台循环",
       "s8": "[备份] R72 P0-10: 一次性备份完成 (backup_id={backup_id}, 类型={backup_type})",
       "s9": "[db_backup] close_db 失败: {error}",
-      "s10": "[db_backup] R2 存储关闭失败: {error}"
+      "s10": "[db_backup] R2 存储关闭失败: {error}",
+      "s11": "R72 RC60: backup_once 整体超时({timeout}s)",
+      "s12": "R72 RC60: backup_once 整体超时({timeout}s) — 数据库连接或 R2 上传卡住,需检查 DB 可达性与 R2 配置",
+      "s13": "整体超时秒数(默认 240,覆盖备份全表→加密→上传)",
+      "s14": "错误:超时秒数不能小于 30,实际: {timeout} 秒"
     },
     "migrate": {
       "s1": "数据库版本化迁移命令行(R72 P0-08)",

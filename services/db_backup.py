@@ -902,30 +902,40 @@ def _build_db_backup_decryptor():
 # ═══════════════════════════════════════════════════════════════
 
 
-async def backup_once(output_json_path: str | None = None) -> dict:
-    """R72 P0-10: 执行一次性备份(不进入 daemon 循环)。
+async def backup_once(
+    output_json_path: str | None = None,
+    timeout: int = 240,
+) -> dict:
+    """R72 P0-10 / RC60: 执行一次性备份(不进入 daemon 循环),带整体超时。
 
     用于 RC 门禁中的真实 backup→restore 演练:
-      1. 初始化 DB + R2
+      1. 初始化 DB + R2(不计入 timeout)
       2. 执行单次备份(watermark → backup_all_tables → encrypt → upload → manifest)
       3. 保存 watermark
       4. 输出结构化 JSON evidence
 
+    R72 RC60: 为防止 asyncpg 连接无超时导致 compose-runtime-e2e
+    backup_restore 阶段挂起 600s,在此处添加 asyncio.wait_for 整体超时。
+    timeout 秒未完成则返回 status="timeout" 的 evidence 并由 main() 退出码 1 标记失败。
+    240s 默认值远小于编排器 540s 超时(60s 余量供 init_db / cleanup)。
+
     Args:
         output_json_path: 可选,将 evidence JSON 写入文件
+        timeout: 整体超时秒数(默认 240),覆盖 backup_all_tables → encrypt → upload
 
     Returns:
-        包含 backup_id / manifest / evidence 的字典
+        包含 backup_id / manifest / evidence 的字典。
+        status="success" 表示成功;status="timeout" 表示整体超时(调用方应视为失败)。
 
     Raises:
-        RuntimeError: R2 凭证缺失 / 加密不可用 / 上传失败
+        AppError: R2 凭证缺失 / 加密不可用 / 上传失败
     """
-    # 确保数据库连接池已初始化
+    # 确保数据库连接池已初始化(init_db 不计入 timeout,因为后续 cleanup 也需要连接)
     if not db_client.is_connected:
         from database.session import init_db
         await init_db()
 
-    try:
+    async def _do_backup_inner() -> dict:
         # R2 凭证动态配置
         await configure_r2_dynamic()
         if not r2_storage._access_key:
@@ -1040,6 +1050,37 @@ async def backup_once(output_json_path: str | None = None) -> dict:
         )
         return evidence
 
+    try:
+        # R72 RC60: 整体超时包裹 — 防止 asyncpg 连接无超时挂起导致
+        # compose-runtime-e2e backup_restore 阶段被编排器 600s 超时强杀。
+        # 超时后返回结构化 evidence(status="timeout"),由 main() 退出码 1 标记失败。
+        return await asyncio.wait_for(_do_backup_inner(), timeout=timeout)
+    except asyncio.TimeoutError:
+        # 超时仍写入 evidence 文件,供编排器解析定位失败原因
+        timeout_evidence = {
+            "backup_id": "",
+            "backup_type": "timeout",
+            "manifest": {},
+            "payload_key": "",
+            "manifest_key": "",
+            "status": "timeout",
+            "error": _i18n_t('services.db_backup.s11', timeout=timeout),
+        }
+        if output_json_path:
+            try:
+                from pathlib import Path
+                Path(output_json_path).write_text(
+                    json.dumps(timeout_evidence, ensure_ascii=False, indent=2, default=str),
+                    encoding="utf-8",
+                )
+            except OSError as write_err:
+                logger.warning(
+                    _i18n_t('services.db_backup.s10', error=write_err)
+                )
+        logger.error(
+            _i18n_t('services.db_backup.s12', timeout=timeout)
+        )
+        return timeout_evidence
     finally:
         try:
             from database.session import close_db
@@ -1053,11 +1094,13 @@ async def backup_once(output_json_path: str | None = None) -> dict:
 
 
 def main():
-    """R72 P0-10: db_backup CLI 入口。
+    """R72 P0-10 / RC60: db_backup CLI 入口。
 
     用法:
       # 一次性备份(不进入 daemon 循环)
       python -m services.db_backup backup --once --output-json /tmp/backup_evidence.json
+      # 带自定义超时(秒),用于 compose-runtime-e2e 等 CI 场景
+      python -m services.db_backup backup --once --timeout 240 --output-json /tmp/backup_evidence.json
 
       # daemon 模式(原有行为,通过 run_all.py 调用)
       python -m services.db_backup daemon
@@ -1079,6 +1122,12 @@ def main():
         "--output-json", type=str, default=None,
         help=_i18n_t('services.db_backup.s6'),
     )
+    backup_parser.add_argument(
+        # R72 RC60: backup --once 整体超时(秒),防止 asyncpg 连接卡住导致编排器 600s 超时。
+        # 默认 240s,远小于编排器 540s 超时,留 60s 余量给 init_db/cleanup。
+        "--timeout", type=int, default=240,
+        help=_i18n_t('services.db_backup.s13'),
+    )
 
     # daemon 子命令
     daemon_parser = subparsers.add_parser("daemon", help=_i18n_t('services.db_backup.s7'))
@@ -1086,8 +1135,24 @@ def main():
     args = parser.parse_args()
 
     if args.command == "backup" and args.once:
-        result = asyncio.run(backup_once(output_json_path=args.output_json))
+        # R72 RC60: 校验 timeout 合法性(>=30s 才有意义)
+        if args.timeout < 30:
+            print(
+                _i18n_t('services.db_backup.s14', timeout=args.timeout),
+                file=__import__("sys").stderr,
+            )
+            return 1
+        result = asyncio.run(
+            backup_once(
+                output_json_path=args.output_json,
+                timeout=args.timeout,
+            )
+        )
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        # R72 RC60: status != "success" 视为失败(exit 1),
+        # 让编排器 fail-closed 而非误判成功。
+        if result.get("status") != "success":
+            return 1
     elif args.command == "daemon":
         asyncio.run(run_db_backup())
     else:

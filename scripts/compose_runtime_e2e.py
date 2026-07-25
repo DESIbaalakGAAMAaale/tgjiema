@@ -2356,11 +2356,14 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
     #
     # R72 P0-10: 使用 db_backup backup --once(一次性备份,不进入 daemon 循环)
     #             使用 db_restore --target staging --backup-id(显式恢复目标)
+    # R72 RC60: 传递 --timeout 240 让 db_backup 在 asyncpg 连接卡住时先于编排器
+    #           超时返回结构化 evidence(避免编排器 600s 强杀导致无错误信息)。
     backup_evidence_path = REPO_ROOT / f".tmp_backup_evidence_{trace_id}.json"
     backup_cmd = _compose_cmd([
         "run", "--rm", "db_backup",
         "python", "-m", "services.db_backup", "backup",
         "--once",
+        "--timeout", "240",
         "--output-json", str(backup_evidence_path),
     ])
     try:

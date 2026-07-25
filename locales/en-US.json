@@ -2160,7 +2160,11 @@
       "s7": "start daemon loop",
       "s8": "[Backup] R72 P0-10: one-shot backup completed (backup_id={backup_id}, type={backup_type})",
       "s9": "[db_backup] close_db failed: {error}",
-      "s10": "[db_backup] r2_storage.close failed: {error}"
+      "s10": "[db_backup] r2_storage.close failed: {error}",
+      "s11": "R72 RC60: backup_once overall timeout ({timeout}s)",
+      "s12": "R72 RC60: backup_once overall timeout ({timeout}s) — asyncpg connection or R2 upload hung, check DB reachability and R2 config",
+      "s13": "overall timeout in seconds (default 240, covers backup_all_tables→encrypt→upload)",
+      "s14": "ERROR: --timeout cannot be less than 30s, got: {timeout}s"
     },
     "migrate": {
       "s1": "tgjiema SQLite versioned migration CLI (R72 P0-08)",
