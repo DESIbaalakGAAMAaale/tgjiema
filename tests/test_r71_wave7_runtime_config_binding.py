@@ -426,10 +426,15 @@ class TestR71Wave7BranchProtectionConsistency:
             "branch_protection.expected.json 缺少 bind-runtime-config context"
         )
 
-    def test_br_expected_contains_bind_runtime_config(self):
-        """branch_ruleset.expected.json 必须包含 bind-runtime-config context。
+    def test_br_expected_excludes_bind_runtime_config(self):
+        """branch_ruleset.expected.json 不得包含 bind-runtime-config context。
 
-        R71 fix: Rulesets API 参数名为 required_status_checks(非 required_checks)。
+        R72 RC61: bind-runtime-config 已从 required_status_checks 中移除。
+        原因: 其 if: 条件在 PR 事件下不满足(if: github.event_name == 'workflow_dispatch'
+        || startsWith(github.ref, 'refs/tags/')),导致 strict_required_status_checks_policy=true
+        阻断 PR 合并(合并死锁)。
+        job 本身仍存在于 release-gates.yml 中,只是不在 PR 事件产出 check-run,
+        因此不能列为 required_status_checks。
         """
         if not self.BR_EXPECTED.is_file():
             pytest.skip("branch_ruleset.expected.json 不存在")
@@ -439,8 +444,10 @@ class TestR71Wave7BranchProtectionConsistency:
             if rule.get("type") == "required_status_checks":
                 params = rule.get("parameters", {})
                 checks = [c.get("context", "") for c in params.get("required_status_checks", [])]
-        assert "bind-runtime-config" in checks, (
-            "branch_ruleset.expected.json 缺少 bind-runtime-config context"
+        assert "bind-runtime-config" not in checks, (
+            "R72 RC61: branch_ruleset.expected.json 不得包含 bind-runtime-config context "
+            "(其 if: 条件在 PR 事件下不满足,会导致 strict_required_status_checks_policy=true "
+            "阻断 PR 合并)"
         )
 
     def test_configure_sh_contains_bind_runtime_config(self):
@@ -461,13 +468,20 @@ class TestR71Wave7BranchProtectionConsistency:
             "verify_branch_ruleset.sh 缺少 bind-runtime-config context"
         )
 
-    def test_verify_sh_has_r71_wave7_assertion(self):
-        """verify_branch_ruleset.sh 必须有 R71 Wave 7 专属断言。"""
+    def test_verify_sh_documents_rc61_bind_runtime_config_removal(self):
+        """verify_branch_ruleset.sh 必须记录 RC61 对 bind-runtime-config 的移除。
+
+        R72 RC61: bind-runtime-config 已从 required_status_checks 中移除,
+        verify 脚本应在注释中记录此变更(说明移除原因)。
+        """
         if not self.VERIFY_SH.is_file():
             pytest.skip("verify_branch_ruleset.sh 不存在")
         content = self.VERIFY_SH.read_text(encoding="utf-8")
-        assert "R71 Wave 7" in content, (
-            "verify_branch_ruleset.sh 缺少 R71 Wave 7 专属断言"
+        assert "RC61" in content, (
+            "verify_branch_ruleset.sh 应在注释中记录 RC61 变更"
+        )
+        assert "bind-runtime-config" in content, (
+            "verify_branch_ruleset.sh 应在注释中提及 bind-runtime-config(RC61 移除)"
         )
 
 

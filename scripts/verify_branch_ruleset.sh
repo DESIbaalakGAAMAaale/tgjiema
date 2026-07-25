@@ -39,12 +39,15 @@ set -euo pipefail
 
 RULESET_NAME="${RULESET_NAME:-R71 Solo Founder Branch Ruleset}"
 
-# R71 P1-02 / R72 P1-06: 必需 status checks 列表(31 项,仅 PR/master 事件可产生的 check)
+# R71 P1-02 / R72 P1-06 / RC61: 必需 status checks 列表(27 项,仅 PR/master 事件可产生的 check)
 # 与 .github/branch_ruleset.expected.json / scripts/configure_branch_ruleset.sh 保持一致
 # R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
 # sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
 # migration-binding-gate / verify-rc-identity / production-promotion-gate)
 # R72 RC60: 'test' 拆分为 'test (3.10)'/'test (3.11)'/'test (3.12)' (29→31 项)
+# R72 RC61: 移除 4 个 PR 事件下 skipped 的 check(sign-artifacts / verify-git-source-governance /
+# tag-ruleset-verify / bind-runtime-config — 它们的 if: 条件在 PR 事件下不满足,导致
+# strict_required_status_checks_policy=true 阻断 PR 合并;31→27 项)
 EXPECTED_REQUIRED_CHECKS=(
   "lint"
   "static-gates"
@@ -64,18 +67,14 @@ EXPECTED_REQUIRED_CHECKS=(
   "sbom"
   "pip-audit"
   "trivy"
-  "sign-artifacts"
   "verify-branch-protection"
   "verify-branch-ruleset"
-  "verify-git-source-governance"
   "rc-continuity"
-  "tag-ruleset-verify"
   "crdb-ru-72h-attribution-gate"
   "production-evidence"
   "oci-allowlist-verify"
   "validate-oci-rootfs"
   "runtime-smoke-compose"
-  "bind-runtime-config"
   "release-summary"
 )
 
@@ -314,7 +313,7 @@ assert_contains "pull_request.required_review_thread_resolution == true" \
   "$RULESET_JSON" \
   '[.rules[] | select(.type == "pull_request") | .parameters.required_review_thread_resolution] | add == true'
 
-# R71 P1-02 / R72 P1-06: required_status_checks 必须存在,且包含全部 29 个 context
+# R71 P1-02 / R72 P1-06 / RC61: required_status_checks 必须存在,且包含全部 27 个 context
 assert_contains "rules 含 required_status_checks (R71 P1-02)" \
   "$RULESET_JSON" \
   '[.rules[].type] | any(. == "required_status_checks")'
@@ -335,14 +334,12 @@ for ctx in "${EXPECTED_REQUIRED_CHECKS[@]}"; do
     "c" "$ctx"
 done
 
-# R71 P1-02: 特别验证 R71 Wave 4/7 新增的 context(R72 P1-06 移除 Wave 2/5)
+# R71 P1-02: 特别验证 R71 Wave 4 新增的 context(R72 P1-06 移除 Wave 2/5;RC61 移除 Wave 7)
+# R72 RC61: bind-runtime-config 已从 required_status_checks 中移除(其 if: 条件在
+# PR 事件下不满足,导致 strict_required_status_checks_policy=true 阻断 PR 合并)
 assert_contains "R71 Wave 4: required_status_checks 含 'validate-oci-rootfs'" \
   "$RULESET_JSON" \
   '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "validate-oci-rootfs")'
-
-assert_contains "R71 Wave 7: required_status_checks 含 'bind-runtime-config'" \
-  "$RULESET_JSON" \
-  '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == "bind-runtime-config")'
 
 # bypass_actors 必须为空(禁止任何角色 bypass,包括 admin;紧急情况通过 record_break_glass.py)
 assert_contains "R71 P1-01: bypass_actors 为空 (禁止 admin bypass; 紧急情况用 record_break_glass.py)" \

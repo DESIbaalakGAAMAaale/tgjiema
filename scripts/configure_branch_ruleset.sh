@@ -216,11 +216,11 @@ fi
 #     RC-only job(if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v'))
 #   - verify-rc-identity / production-promotion-gate: environment-only job
 #     (if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/production-v'))
-# 保留 R71 Wave 4 新增的 validate-oci-rootfs 与 R71 Wave 7 新增的 bind-runtime-config
-# (它们在 master push 事件产出 check,满足 PR/master 事件可产生要求)。
+# 保留 R71 Wave 4 新增的 validate-oci-rootfs(RC61 移除 R71 Wave 7 的 bind-runtime-config —
+# 其 if: 条件在 PR 事件下不满足,导致 strict_required_status_checks_policy=true 阻断 PR 合并)。
 REQUIRED_STATUS_CHECKS="${REQUIRED_STATUS_CHECKS:-}"
 if [ -z "$REQUIRED_STATUS_CHECKS" ]; then
-  REQUIRED_STATUS_CHECKS='["lint","static-gates","test (3.10)","test (3.11)","test (3.12)","docker-build","docker-digest-verify","compose-config","redis-acl-matrix","schema-diff","restore-legacy-seal-gate","i18n-strict-export-boundary-gate","migration-manifest-gate","button-flow-real-ux-gate","backup-restore-drill","sbom","pip-audit","trivy","sign-artifacts","verify-branch-protection","verify-branch-ruleset","verify-git-source-governance","rc-continuity","tag-ruleset-verify","crdb-ru-72h-attribution-gate","production-evidence","oci-allowlist-verify","validate-oci-rootfs","runtime-smoke-compose","bind-runtime-config","release-summary"]'
+  REQUIRED_STATUS_CHECKS='["lint","static-gates","test (3.10)","test (3.11)","test (3.12)","docker-build","docker-digest-verify","compose-config","redis-acl-matrix","schema-diff","restore-legacy-seal-gate","i18n-strict-export-boundary-gate","migration-manifest-gate","button-flow-real-ux-gate","backup-restore-drill","sbom","pip-audit","trivy","verify-branch-protection","verify-branch-ruleset","rc-continuity","crdb-ru-72h-attribution-gate","production-evidence","oci-allowlist-verify","validate-oci-rootfs","runtime-smoke-compose","release-summary"]'
 fi
 # 校验是合法 JSON 数组
 if ! echo "$REQUIRED_STATUS_CHECKS" | jq -e 'type == "array" and length >= 1' > /dev/null 2>&1; then
@@ -232,13 +232,15 @@ if ! echo "$REQUIRED_STATUS_CHECKS" | jq -e 'all(.[]; type == "string")' > /dev/
   echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 数组元素必须全部为字符串"
   exit 1
 fi
-# R71 P1-02 / R72 P1-06: 校验至少包含 29 个 context(仅 PR/master 事件可产生的 check,
+# R71 P1-02 / R72 P1-06 / RC61: 校验至少包含 27 个 context(仅 PR/master 事件可产生的 check,
 # 已移除 8 个 tag-only/environment-only 的 check: compose-runtime-e2e / sign-image /
 # publish-attestation / attestation-semantics-verify / verify-only-3x /
-# migration-binding-gate / verify-rc-identity / production-promotion-gate)
+# migration-binding-gate / verify-rc-identity / production-promotion-gate;
+# RC61: 再移除 4 个 PR-skipped 的 check: sign-artifacts / verify-git-source-governance /
+# tag-ruleset-verify / bind-runtime-config)
 REQUIRED_CHECKS_COUNT=$(echo "$REQUIRED_STATUS_CHECKS" | jq 'length')
-if [ "$REQUIRED_CHECKS_COUNT" -lt 29 ]; then
-  echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 至少需要 29 个 context(仅 PR/master 事件可产生的 release-gates.yml job),实际: $REQUIRED_CHECKS_COUNT"
+if [ "$REQUIRED_CHECKS_COUNT" -lt 27 ]; then
+  echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 至少需要 27 个 context(仅 PR/master 事件可产生的 release-gates.yml job),实际: $REQUIRED_CHECKS_COUNT"
   exit 1
 fi
 
@@ -469,16 +471,19 @@ if [ "$ACTUAL_CHECKS" != "$EXPECTED_CHECKS" ]; then
   exit 1
 fi
 
-echo "Assert: required_status_checks 不包含 tag-only / environment-only 的 check (R72 P1-06)"
+echo "Assert: required_status_checks 不包含 tag-only / environment-only / PR-skipped 的 check (R72 P1-06 + RC61)"
 # R72 P1-06: 以下 check 不在 PR/master 事件产出,会造成合并死锁,必须移除
-for ctx in "compose-runtime-e2e" "sign-image" "publish-attestation" "attestation-semantics-verify" "verify-only-3x" "migration-binding-gate" "verify-rc-identity" "production-promotion-gate"; do
+# RC61: 追加 4 个 PR-skipped 的 check(sign-artifacts / verify-git-source-governance /
+# tag-ruleset-verify / bind-runtime-config — 其 if: 条件在 PR 事件下不满足)
+for ctx in "compose-runtime-e2e" "sign-image" "publish-attestation" "attestation-semantics-verify" "verify-only-3x" "migration-binding-gate" "verify-rc-identity" "production-promotion-gate" "sign-artifacts" "verify-git-source-governance" "tag-ruleset-verify" "bind-runtime-config"; do
   echo "$RULESET_JSON" | jq -e --arg c "$ctx" \
     '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == $c)' > /dev/null \
-    && { echo "ERROR: [R72 P1-06] required_status_checks 不应包含 tag-only/environment-only check: $ctx"; exit 1; }
+    && { echo "ERROR: [R72 P1-06/RC61] required_status_checks 不应包含 tag-only/environment-only/PR-skipped check: $ctx"; exit 1; }
 done
 
-echo "Assert: required_status_checks 包含 R71 Wave 4/7 新增 check (PR/master 事件可产生)"
-for ctx in "validate-oci-rootfs" "bind-runtime-config"; do
+echo "Assert: required_status_checks 包含 R71 Wave 4 新增 check (PR/master 事件可产生)"
+# RC61: 移除 R71 Wave 7 的 bind-runtime-config(其 if: 条件在 PR 事件下不满足)
+for ctx in "validate-oci-rootfs"; do
   echo "$RULESET_JSON" | jq -e --arg c "$ctx" \
     '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | any(. == $c)' > /dev/null \
     || { echo "ERROR: [R71 P1-02] required_status_checks 缺少 R71 新增 check: $ctx"; exit 1; }

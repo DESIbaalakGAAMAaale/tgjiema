@@ -17,21 +17,21 @@ R71 Wave 6 整改(P1-01/02/03, Commit 6) + R72 P1-06 修订:
        - required_reviewers=0(solo founder,无审批死锁)
        - require_code_owner_review=false(CODEOWNERS 保留但不阻断)
        - strict_merge=true(current-SHA,不允许 stale parent commit)
-       - required_status_checks 含 29 个 context(仅 PR/master 事件可产生的 check;
+       - required_status_checks 含 27 个 context(仅 PR/master 事件可产生的 check;
          R72 P1-06 移除 8 个 tag-only/environment-only check,从 36 缩减到 29)
        - bypass_actors=[](无 admin bypass;紧急情况通过 record_break_glass.py)
     2. .github/branch_protection.expected.json:
        - required_approving_review_count: 0(solo founder)
        - require_code_owner_reviews: false
        - required_status_checks.strict: true
-       - contexts 覆盖 29 个 release gates(R72 P1-06 移除 tag-only/environment-only)
+       - contexts 覆盖 27 个 release gates(R72 P1-06 移除 8 个 tag-only/environment-only;RC61 移除 4 个 PR-skipped)
     3. scripts/configure_branch_ruleset.sh:
        - 完全重写为单一 R71 Solo Founder Ruleset 配置
        - 保留 --dry-run / --help / 幂等性(PUT/POST)
        - 自检断言更新为 solo-founder 语义
     4. scripts/verify_branch_ruleset.sh:
        - 完全重写为 solo-founder 语义断言
-       - 断言 required_reviewers == 0 / strict_merge == true / 29 contexts
+       - 断言 required_reviewers == 0 / strict_merge == true / 27 contexts
     5. scripts/record_break_glass.py(新文件):
        - Break-glass 紧急手动 override 审计日志(JSONL 格式)
        - 强制 typed_confirmation == "BREAK-GLASS-EMERGENCY"
@@ -83,7 +83,7 @@ CONFIGURE_RULESET_SH = REPO_ROOT / "scripts" / "configure_branch_ruleset.sh"
 VERIFY_RULESET_SH = REPO_ROOT / "scripts" / "verify_branch_ruleset.sh"
 RECORD_BREAK_GLASS_PY = REPO_ROOT / "scripts" / "record_break_glass.py"
 
-# R71 P1-02 / R72 P1-06 / R72 RC60: 31 个必需 status checks(仅 PR/master 事件可产生的 check)
+# R71 P1-02 / R72 P1-06 / R72 RC60 / R72 RC61: 27 个必需 status checks(仅 PR/master 事件可产生的 check)
 # 与 .github/branch_ruleset.expected.json / configure_branch_ruleset.sh / verify_branch_ruleset.sh 保持一致
 # R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
 # sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
@@ -91,6 +91,9 @@ RECORD_BREAK_GLASS_PY = REPO_ROOT / "scripts" / "record_break_glass.py"
 # R72 RC60: 'test' 拆分为 'test (3.10)' / 'test (3.11)' / 'test (3.12)' (matrix 展开,29→31 项)
 # 原因: GitHub Actions check-run name 是矩阵展开形式("test (3.10)"),而非 bare "test"。
 # 实际 GitHub ruleset 中也用矩阵展开形式,因此 expected.json / 脚本 / 测试列表必须同步。
+# R72 RC61: 移除 4 个 PR 事件下 skipped 的 check(sign-artifacts / verify-git-source-governance /
+# tag-ruleset-verify / bind-runtime-config — 其 if: 条件在 PR 事件下不满足,导致
+# strict_required_status_checks_policy=true 阻断 PR 合并;31→27 项)
 EXPECTED_REQUIRED_CHECKS: list[str] = [
     "lint", "static-gates",
     "test (3.10)", "test (3.11)", "test (3.12)",
@@ -99,21 +102,21 @@ EXPECTED_REQUIRED_CHECKS: list[str] = [
     "i18n-strict-export-boundary-gate", "migration-manifest-gate",
     "button-flow-real-ux-gate",
     "backup-restore-drill", "sbom", "pip-audit", "trivy",
-    "sign-artifacts", "verify-branch-protection", "verify-branch-ruleset",
-    "verify-git-source-governance", "rc-continuity",
-    "tag-ruleset-verify",
+    "verify-branch-protection", "verify-branch-ruleset",
+    "rc-continuity",
     "crdb-ru-72h-attribution-gate", "production-evidence",
     "oci-allowlist-verify",
     "validate-oci-rootfs", "runtime-smoke-compose",
-    "bind-runtime-config", "release-summary",
+    "release-summary",
 ]
 
 # R71 Wave 4/7 新增的 context(必须出现在 ruleset 与 BP 中)
 # R72 P1-06: 移除 Wave 2(compose-runtime-e2e)与 Wave 5(verify-rc-identity)—
 #   它们是 tag-only / environment-only 的 check,不在 PR/master 事件产出
+# R72 RC61: 移除 Wave 7(bind-runtime-config)— 其 if: 条件在 PR 事件下不满足,
+#   导致 strict_required_status_checks_policy=true 阻断 PR 合并
 R71_NEW_CONTEXTS: list[str] = [
     "validate-oci-rootfs",  # Wave 4
-    "bind-runtime-config",  # Wave 7
 ]
 
 # BP contexts 使用 GitHub Actions 矩阵展开后的名称(如 "test (3.10)"),
@@ -319,14 +322,17 @@ class TestBranchRulesetExpectedJson:
             "(current-SHA,不允许 stale parent commit)"
         )
 
-    def test_required_status_checks_has_29_contexts(self, expected: dict):
-        """R71 P1-02 / R72 P1-06: required_status_checks 覆盖 29 个 PR/master-event check。
+    def test_required_status_checks_has_27_contexts(self, expected: dict):
+        """R71 P1-02 / R72 P1-06 / RC61: required_status_checks 覆盖 27 个 PR/master-event check。
 
         旧版 R70 只有 5 个 required checks,R71 扩展到 36 个。R72 P1-06 移除 8 个
         tag-only/environment-only 的 check(compose-runtime-e2e / sign-image /
         publish-attestation / attestation-semantics-verify / verify-only-3x /
         migration-binding-gate / verify-rc-identity / production-promotion-gate),
         因为它们不在 PR/master 事件产出 check,会造成合并死锁。
+        R72 RC61 再移除 4 个 PR-skipped 的 check(sign-artifacts /
+        verify-git-source-governance / tag-ruleset-verify / bind-runtime-config),
+        因为它们的 if: 条件在 PR 事件下不满足,同样造成合并死锁。
 
         R71 fix: Ruleset API 参数名为 required_status_checks(非 required_checks)。
         """
@@ -334,13 +340,13 @@ class TestBranchRulesetExpectedJson:
         assert len(rsc_rules) == 1
         params = rsc_rules[0]["parameters"]
         contexts = [c["context"] for c in params["required_status_checks"]]
-        assert len(contexts) >= 29, (
-            f"R71 P1-02 / R72 P1-06: 至少需要 29 个 required_status_checks.contexts, "
+        assert len(contexts) >= 27, (
+            f"R71 P1-02 / R72 P1-06 / RC61: 至少需要 27 个 required_status_checks.contexts, "
             f"实际: {len(contexts)}"
         )
 
     def test_required_status_checks_includes_all_expected_contexts(self, expected: dict):
-        """R71 P1-02: 所有期望的 29 个 context 都必须出现。"""
+        """R71 P1-02: 所有期望的 27 个 context 都必须出现。"""
         rsc_rules = [r for r in expected["rules"] if r["type"] == "required_status_checks"]
         assert len(rsc_rules) == 1
         params = rsc_rules[0]["parameters"]
@@ -578,8 +584,8 @@ class TestConfigureBranchRulesetScript:
             "configure_branch_ruleset.sh 应保留 PUT/POST 幂等性逻辑"
         )
 
-    def test_script_includes_29_required_checks(self, script_content: str):
-        """R71 P1-02 / R72 P1-06: 脚本默认 REQUIRED_STATUS_CHECKS 包含全部 29 个 context。"""
+    def test_script_includes_27_required_checks(self, script_content: str):
+        """R71 P1-02 / R72 P1-06 / RC61: 脚本默认 REQUIRED_STATUS_CHECKS 包含全部 27 个 context。"""
         for ctx in EXPECTED_REQUIRED_CHECKS:
             assert ctx in script_content, (
                 f"configure_branch_ruleset.sh 缺少 REQUIRED_STATUS_CHECKS context: {ctx}"
@@ -592,12 +598,13 @@ class TestConfigureBranchRulesetScript:
                 f"configure_branch_ruleset.sh 缺少 R71 新增 context: {ctx}"
             )
 
-    def test_script_validates_at_least_29_checks(self, script_content: str):
-        """R71 P1-02 / R72 P1-06: 脚本校验 REQUIRED_STATUS_CHECKS 至少含 29 个 context
-        (R72 P1-06 移除 8 个 tag-only/environment-only check,从 36 缩减到 29)。"""
-        # 脚本中应有 "-lt 29" 校验(R72 P1-06 缩减)
-        assert "-lt 29" in script_content, (
-            "configure_branch_ruleset.sh 应校验 REQUIRED_STATUS_CHECKS 至少含 29 个 context"
+    def test_script_validates_at_least_27_checks(self, script_content: str):
+        """R71 P1-02 / R72 P1-06 / RC61: 脚本校验 REQUIRED_STATUS_CHECKS 至少含 27 个 context
+        (R72 P1-06 移除 8 个 tag-only/environment-only check,从 36 缩减到 29;
+        RC61 再移除 4 个 PR-skipped check,从 29 缩减到 27)。"""
+        # 脚本中应有 "-lt 27" 校验(R72 P1-06/RC61 缩减)
+        assert "-lt 27" in script_content, (
+            "configure_branch_ruleset.sh 应校验 REQUIRED_STATUS_CHECKS 至少含 27 个 context"
         )
 
     def test_script_self_asserts_required_approving_review_count_zero(
@@ -775,8 +782,8 @@ class TestVerifyBranchRulesetScript:
             "R71 P1-01: verify_branch_ruleset.sh 应断言 bypass_actors 长度为 0"
         )
 
-    def test_script_includes_29_expected_checks(self, script_content: str):
-        """R71 P1-02 / R72 P1-06: 验证脚本 EXPECTED_REQUIRED_CHECKS 含全部 29 个 context。"""
+    def test_script_includes_27_expected_checks(self, script_content: str):
+        """R71 P1-02 / R72 P1-06 / RC61: 验证脚本 EXPECTED_REQUIRED_CHECKS 含全部 27 个 context。"""
         for ctx in EXPECTED_REQUIRED_CHECKS:
             assert ctx in script_content, (
                 f"verify_branch_ruleset.sh 缺少 EXPECTED_REQUIRED_CHECKS context: {ctx}"

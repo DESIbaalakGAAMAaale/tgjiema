@@ -116,8 +116,11 @@ class TestBranchRulesetExpectedJson:
         # R72 P1-06: compose-runtime-e2e / verify-rc-identity 是 tag-only,
         # 在 PR 场景不产生 check-run,已从 required_status_checks 移除
         # (避免合并死锁)。仅保留 validate-oci-rootfs(PR 场景会运行)。
+        # R72 RC61: bind-runtime-config 在 PR 事件下被 skipped,也已移除
+        # (其 if: 条件在 PR 事件下不满足,导致 strict_required_status_checks_policy=true
+        # 阻断 PR 合并)。
         contexts = [c["context"] for c in params.get("required_status_checks", [])]
-        for ctx in ("validate-oci-rootfs", "bind-runtime-config"):
+        for ctx in ("validate-oci-rootfs",):
             assert ctx in contexts, (
                 f"R71 P1-02: required_status_checks 必须包含 R71 新增 context: {ctx}"
             )
