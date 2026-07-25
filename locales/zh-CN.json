@@ -2346,7 +2346,11 @@
       "s48": "服务暂不可用,请稍后再试"
     },
     "migration_runner": {
-      "s1": "schema 验证失败: information_schema 中未找到关键表/列,禁止写 ddl_version"
+      "s1": "schema 验证失败: information_schema 中未找到关键表/列,禁止写 ddl_version",
+      "rc57_sqlite_start": "R72 P0-08/RC57: 开始应用 SQLite 版本化迁移",
+      "rc57_sqlite_done": "SQLite 迁移完成: 已应用={applied}, 已跳过={skipped}, 失败={failed}",
+      "rc57_sqlite_failed": "SQLite 迁移有失败: {failed}",
+      "rc57_sqlite_error": "SQLite 迁移异常(不阻断 CRDB 迁移): {error}"
     },
     "notifications": {
       "s1": "{icon} 通知\n类型: {ntype}\n内容: {payload_str}",

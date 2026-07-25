@@ -1017,7 +1017,11 @@ async def _apply_single_migration(db: Any, migration_file: Path) -> bool:
     return True
 
 
-async def apply_migrations(db: Any = None) -> dict[str, list[str]]:
+async def apply_migrations(
+    db: Any = None,
+    *,
+    check_mode: bool = False,
+) -> dict[str, list[str]]:
     """R59 P1: 应用所有未执行的 SQLite migration。
 
     本函数是迁移框架的主入口,执行流程:
@@ -1033,6 +1037,17 @@ async def apply_migrations(db: Any = None) -> dict[str, list[str]]:
          d. 成功后(同一事务)写入 _migrations_applied 表(含 sha256 / duration_ms)
       6. 返回应用结果汇总;若 failed 非空则 raise(fail-closed,禁止继续服务)
 
+    R72 P0-08 / RC57 fix: ``check_mode=True`` 时本函数为纯只读检查:
+      - 仍执行步骤 1-4(连接数据库、创建版本表、读取已应用版本、SHA-256 校验)
+        注:步骤 2 创建 ``_migrations_applied`` 表是幂等的(CREATE TABLE IF NOT
+        EXISTS),不修改已存在表结构,仅确保版本表存在以便 SELECT。若库为全新且
+        版本表不存在,CREATE TABLE 是必要的最小写操作,否则无法检查。
+      - 跳过步骤 5(不调用 ``_apply_single_migration``,不执行 DDL,不写版本记录)
+      - 未应用的 migration 记录到 ``pending`` 字段(由 _build_migration_evidence
+        从 applied/skipped 集合差集计算,无需在此显式填充)
+      - SHA-256 校验仍执行(篡改/删除已应用 migration 必须阻断,即使 check 模式)
+      - 用于 ``python -m database.migrate --check --json`` 干运行验证
+
     幂等性保证:
       - 已应用的 migration 不会重复执行(_migrations_applied 主键去重)
       - SQL 语句使用 IF NOT EXISTS / 白名单错误处理,重复执行无副作用
@@ -1043,6 +1058,8 @@ async def apply_migrations(db: Any = None) -> dict[str, list[str]]:
     Args:
         db: 可选的 aiosqlite.Connection。若为 None,从 CacheStore 获取连接。
             测试中可传入自定义连接以隔离测试。
+        check_mode: R72 P0-08: True 时只读检查(不应用 pending migration),
+            用于 ``--check`` CLI 子命令。默认 False(应用 pending migration)。
 
     Returns:
         {
@@ -1050,6 +1067,7 @@ async def apply_migrations(db: Any = None) -> dict[str, list[str]]:
             "skipped": [str],  — 已应用跳过的 migration 文件名列表
             "failed":  [str],  — 执行失败的 migration 文件名列表(非幂等错误)
         }
+        check_mode=True 时 applied 永远为 [](未应用任何 migration)。
     """
     # 获取数据库连接
     own_connection = False
@@ -1148,6 +1166,29 @@ async def apply_migrations(db: Any = None) -> dict[str, list[str]]:
             )
 
     # 逐个应用未执行的 migration
+    # R72 P0-08 / RC57 fix: check_mode=True 时不应用 pending migration,
+    # 仅记录为 skipped(applied_versions 中已有)或留空(由 _build_migration_evidence
+    # 计算 pending 列表)。这是 --check 子命令的只读语义。
+    #
+    # 根因(RC56 compose-runtime-e2e migration_check 600s 超时):
+    #   旧实现 --check 参数被 main() 解析但从未传给 apply_migrations()。--check
+    #   模式仍执行 _apply_single_migration → BEGIN IMMEDIATE 写锁,与运行中的
+    #   db_writer 进程争抢 SQLite WAL 写锁,导致 600s 超时。
+    #   修复:check_mode=True 时跳过 _apply_single_migration 调用,纯只读。
+    if check_mode:
+        logger.info(
+            f"[migrate] R72 P0-08: check_mode=True,跳过 pending migration 应用 "
+            f"(只读检查 — 已应用 {len(applied_versions)} 个, "
+            f"待应用 {len(migration_files) - len(applied_versions)} 个)"
+        )
+        for mf in migration_files:
+            version = mf.name
+            if version in applied_versions:
+                result["skipped"].append(version)
+            # 未应用的 migration 不加入 applied/skipped/failed,
+            # 由 _build_migration_evidence 从 expected_versions 差集计算 pending 列表
+        return result
+
     for mf in migration_files:
         version = mf.name
         if version in applied_versions:
@@ -1292,7 +1333,10 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        result = asyncio.run(apply_migrations())
+        # R72 P0-08 / RC57 fix: 将 --check 传递给 apply_migrations()。
+        # 旧实现此处未传 check_mode,导致 --check 模式仍执行 DDL 应用,
+        # 与运行中的 db_writer 进程争抢 SQLite WAL 写锁,导致 600s 超时。
+        result = asyncio.run(apply_migrations(check_mode=args.check))
     except Exception as e:
         if args.json:
             evidence = {

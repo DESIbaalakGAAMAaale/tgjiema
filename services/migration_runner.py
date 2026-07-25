@@ -654,6 +654,14 @@ async def main() -> int:
     关闭,跳过 asyncio 清理是安全的(它只是 cancel pending tasks +
     shutdown executor,不会丢失已写数据)。
 
+    R72 P0-08 / RC57 fix: 在 CRDB 迁移前先应用 SQLite 版本化迁移
+    (database.migrate.apply_migrations)。compose-runtime-e2e 的 migration_check
+    阶段通过 `python -m database.migrate --check --json` 验证 SQLite schema 状态。
+    旧实现 migration 服务仅应用 CRDB DDL_STATEMENTS,未应用 SQLite migrations,
+    导致 migration_check 始终发现 pending migration → compose-runtime-e2e 失败。
+    现版本:SQLite migrations 在 migration 服务中先于 CRDB 应用,确保 db_writer
+    启动前 SQLite schema 已就绪。
+
     Returns:
         0 — 迁移成功(无严重错误)
         1 — 迁移完成但有严重错误(DDL 已执行但 schema 验证/版本写入失败)
@@ -661,6 +669,47 @@ async def main() -> int:
     """
     from database.session import close_db
     exit_code = 0
+
+    # R72 P0-08 / RC57 fix: 先应用 SQLite 版本化迁移(本地 schema)
+    # 必须在 CRDB 迁移前完成,因为 CRDB 迁移可能因网络/凭证问题失败,
+    # 但 SQLite 迁移是本地的,不依赖外部服务。确保 SQLite schema 就绪后
+    # migration_check --check 才能通过(无 pending migration)。
+    try:
+        from database.migrate import apply_migrations
+        from database.cache_store import get_cache_store
+        logger.info(
+            _i18n_t('services.migration_runner.rc57_sqlite_start')
+        )
+        store = get_cache_store()
+        if not store._db:
+            await store.init()
+        sqlite_result = await apply_migrations(db=store._db)
+        logger.info(
+            _i18n_t(
+                'services.migration_runner.rc57_sqlite_done',
+                applied=len(sqlite_result['applied']),
+                skipped=len(sqlite_result['skipped']),
+                failed=len(sqlite_result['failed']),
+            )
+        )
+        if sqlite_result["failed"]:
+            logger.error(
+                _i18n_t(
+                    'services.migration_runner.rc57_sqlite_failed',
+                    failed=sqlite_result['failed'],
+                )
+            )
+            # SQLite 迁移失败是严重问题(可能影响业务逻辑),但不应阻断 CRDB 迁移
+            # (两者独立)。记录错误但不 raise,让 CRDB 迁移继续执行。
+            # SQLite 迁移失败会在后续 migration_check --check 中被检测到。
+    except Exception as sqlite_err:
+        logger.exception(
+            _i18n_t(
+                'services.migration_runner.rc57_sqlite_error',
+                error=str(sqlite_err),
+            )
+        )
+
     try:
         result = await run_migration()
         if result["errors"]:
