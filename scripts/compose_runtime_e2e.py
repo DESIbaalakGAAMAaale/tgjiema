@@ -1249,6 +1249,10 @@ def phase_start_bots(timeout: int) -> PhaseResult:
         # R72 P1-02: 验证容器实际使用的 RepoDigest(不是环境变量请求的 digest)
         # R72 RC55 fix: 使用 docker compose ps 返回的真实容器名,
         # 不再硬编码 "tgjiema-{svc}" 前缀(可能因 docker compose 版本/配置差异)
+        # R72 RC56 fix: 用 {{json .}} 输出完整 container JSON,在 Python 中解析。
+        # 旧模板 {{json .RepoDigests}} 在某些 docker 版本上会因 .RepoDigests 字段
+        # 缺失而报 "map has no entry for key RepoDigests" 模板解析错误
+        # (locally-built / OCI-only 镜像不携带 RepoDigests 字段)。
         svc_info_entry = service_info.get(svc, {})
         container_name = (
             svc_info_entry.get("container_name")
@@ -1257,7 +1261,7 @@ def phase_start_bots(timeout: int) -> PhaseResult:
         )
         inspect_cmd = [
             "docker", "inspect",
-            "--format", "{{.Image}}|{{json .RepoDigests}}|{{.Config.Image}}",
+            "--format", "{{json .}}",
             container_name,
         ]
         inspect_result = _run(inspect_cmd, timeout=10)
@@ -1281,29 +1285,74 @@ def phase_start_bots(timeout: int) -> PhaseResult:
                 "container_name": container_name,
             })
         else:
-            inspect_output = inspect_result.stdout.strip()
-            parts = inspect_output.split("|")
-            container_image_id = parts[0] if len(parts) > 0 else ""
-            repo_digests_json = parts[1] if len(parts) > 1 else "[]"
-            config_image = parts[2] if len(parts) > 2 else ""
-            # 检查 RepoDigest 是否包含期望的 digest
-            if expected_digest and expected_digest not in repo_digests_json:
+            # R72 RC56 fix: 解析完整 container JSON,避免 .RepoDigests 字段缺失导致
+            # 的模板解析错误。locally-built / OCI-only 镜像不携带 RepoDigests 字段时,
+            # 视为 RepoDigests=[] (P1-02 验证:仅在 expected_digest 非空时才需要匹配)。
+            try:
+                container_info = json.loads(inspect_result.stdout.strip())
+            except json.JSONDecodeError as exc:
                 digest_failures.append(
-                    f"{svc}: RepoDigest 不匹配 "
-                    f"(expected contains {expected_digest[:24]}..., "
-                    f"actual={repo_digests_json[:60]}...)"
+                    f"{svc}: docker inspect 输出非 JSON "
+                    f"(container_name={container_name!r}, err={exc!r})"
                 )
                 readiness_checks.append({
                     "check": f"repo_digest_{svc}",
                     "status": "fail",
-                    "expected_digest": expected_digest[:24] + "...",
-                    "actual_repo_digests": repo_digests_json[:60] + "...",
+                    "reason": "inspect_output_not_json",
+                    "stdout_snippet": inspect_result.stdout.strip()[:200],
+                    "container_name": container_name,
                 })
             else:
-                readiness_checks.append({
-                    "check": f"repo_digest_{svc}",
-                    "status": "pass",
-                })
+                container_image_id = container_info.get("Image", "")
+                repo_digests = container_info.get("RepoDigests", []) or []
+                config_image = (
+                    container_info.get("Config", {}).get("Image", "")
+                    if isinstance(container_info.get("Config"), dict)
+                    else ""
+                )
+                repo_digests_json = (
+                    repo_digests if isinstance(repo_digests, str)
+                    else json.dumps(repo_digests)
+                )
+                # 检查 RepoDigest 是否包含期望的 digest
+                # R72 RC56 fix: RepoDigests 在某些 docker 版本上可能为空 []。
+                # 此时回退到 .Config.Image(创建容器时使用的镜像引用字符串),
+                # 其中可能直接包含 @sha256:<digest>。
+                # 这与 P1-02 验证目的一致:验证容器实际使用的镜像就是 expected_digest。
+                digest_match = (
+                    not expected_digest
+                    or expected_digest in repo_digests_json
+                    or (config_image and expected_digest in config_image)
+                )
+                if not digest_match:
+                    digest_failures.append(
+                        f"{svc}: RepoDigest 不匹配 "
+                        f"(expected contains {expected_digest[:24]}..., "
+                        f"actual_repo_digests={repo_digests_json[:60]}..., "
+                        f"config_image={config_image[:120]!r})"
+                    )
+                    readiness_checks.append({
+                        "check": f"repo_digest_{svc}",
+                        "status": "fail",
+                        "expected_digest": expected_digest[:24] + "...",
+                        "actual_repo_digests": repo_digests_json[:60] + "...",
+                        "config_image": config_image[:120],
+                    })
+                else:
+                    matched_via = (
+                        "repo_digests" if expected_digest and expected_digest in repo_digests_json
+                        else ("config_image" if expected_digest and expected_digest in config_image else "no_expected")
+                    )
+                    readiness_checks.append({
+                        "check": f"repo_digest_{svc}",
+                        "status": "pass",
+                        "container_image_id": container_image_id,
+                        "config_image": config_image,
+                        "repo_digests_count": (
+                            len(repo_digests) if isinstance(repo_digests, list) else 0
+                        ),
+                        "matched_via": matched_via,
+                    })
 
     readiness_checks.append({
         "check": "service_roles_verified",
