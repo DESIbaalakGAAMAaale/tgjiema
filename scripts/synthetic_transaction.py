@@ -247,7 +247,12 @@ def _build_heartbeat_message(trace_id: str) -> dict[str, Any]:
             "total_errors": 0,
         },
         "redis_key": "cache:all_bot_heartbeats",
-        "message_id": trace_id,  # 用 trace_id 作为幂等键
+        # RC59 fix: message_id 必须跨步骤唯一,否则 writer_inbox 幂等检查
+        # 会把不同业务方法的相同 message_id 误判为重复(例如 heartbeat 和
+        # upload_session 共用 trace_id 作 message_id 时,后者会被跳过)。
+        # data 字段仍用 trace_id 作为业务主键(name/upload_id/file_code),
+        # 仅 message_id 追加方法后缀以实现跨步骤唯一性。
+        "message_id": f"{trace_id}:heartbeat",  # 跨步骤唯一,幂等键
         "created_at": time.time(),
         "attempts": 0,
     }
@@ -284,7 +289,8 @@ def _build_upload_session_message(trace_id: str) -> dict[str, Any]:
             "trace_id": trace_id,
         },
         "redis_key": "",
-        "message_id": trace_id,  # 用 trace_id 作为幂等键
+        # RC59 fix: message_id 跨步骤唯一(参见 _build_heartbeat_message 注释)
+        "message_id": f"{trace_id}:upload_session",  # 跨步骤唯一,幂等键
         "created_at": time.time(),
         "attempts": 0,
     }
@@ -341,7 +347,8 @@ def _build_file_index_message(trace_id: str) -> dict[str, Any]:
             "_batch": False,
         },
         "redis_key": f"cache:file_record:{trace_id}",
-        "message_id": trace_id,  # 用 trace_id 作为幂等键
+        # RC59 fix: message_id 跨步骤唯一(参见 _build_heartbeat_message 注释)
+        "message_id": f"{trace_id}:file_index",  # 跨步骤唯一,幂等键
         "created_at": time.time(),
         "attempts": 0,
     }

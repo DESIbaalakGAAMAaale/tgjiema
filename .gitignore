@@ -82,3 +82,14 @@ check_output.txt
 classify.txt
 *_review_output.txt
 *_classify_output.txt
+
+# R72 RC59: 本地临时调试文件（不推送）
+.tmp/
+.tmp_*
+.tmp_jobs.json
+.tmp_rc57_jobs.json
+.tmp_parse_e2e.py
+.tmp_verify_git_log.txt
+
+# R72: break-glass 流程审计日志（敏感操作记录，禁止公开）
+break-glass-audit-*.jsonl
