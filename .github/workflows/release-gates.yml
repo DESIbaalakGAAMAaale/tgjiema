@@ -781,12 +781,39 @@ jobs:
           # 文件),且 health.py _check_database_crdb 现已回退到 COCKROACHDB_URL。
           # 将 COCKROACHDB_URL 写入 .env.shared 使 db_writer 也能通过 readiness gate。
           echo "COCKROACHDB_URL=${CRDB_URL}" > .env.shared
+          # R72 P0-10: compose-runtime-e2e backup_restore 阶段需要真实 R2 凭证
+          # 和 BACKUP_KEK。backup_once() 严格 fail-closed:R2 凭证缺失抛 AppError。
+          # db_restore 通过 `compose run db_writer` 执行,env_file 只有 .env.shared,
+          # 所以 R2 凭证必须写入 .env.shared 才能被 db_restore 读取。
+          # 凭证来源:GitHub Secrets(rc-candidate environment 配置)。
+          # 安全说明:CI 环境是隔离的临时 VM,凭证不会持久化;GitHub Actions 日志
+          # 会自动 mask secrets 值,不会暴露在日志输出中。
+          echo "R2_ACCOUNT_ID=${R2_ACCOUNT_ID}" >> .env.shared
+          echo "R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}" >> .env.shared
+          echo "R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}" >> .env.shared
+          echo "R2_BUCKET_NAME=${R2_BUCKET_NAME}" >> .env.shared
+          echo "R2_ENDPOINT=${R2_ENDPOINT}" >> .env.shared
+          echo "BACKUP_KEK=${BACKUP_KEK}" >> .env.shared
+          # db_backup 也通过 .env.secrets.db_backup 加载(冗余但确保可见)
+          echo "R2_ACCOUNT_ID=${R2_ACCOUNT_ID}" >> .env.secrets.db_backup
+          echo "R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}" >> .env.secrets.db_backup
+          echo "R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}" >> .env.secrets.db_backup
+          echo "R2_BUCKET_NAME=${R2_BUCKET_NAME}" >> .env.secrets.db_backup
+          echo "R2_ENDPOINT=${R2_ENDPOINT}" >> .env.secrets.db_backup
+          echo "BACKUP_KEK=${BACKUP_KEK}" >> .env.secrets.db_backup
           # R71 RC26 fix: CI=true 必须传到容器内,使 services.health 的
           # _check_bot_token_valid() 在 CI 模式下跳过 getMe 调用(只验证 token 格式),
           # 以及 services/prometheus_exporter.collect_dependency_status() 在启动
           # grace period 内放宽 freshness 检查。.env.shared 被 docker-compose.prod.yml
           # 的 env_file 加载,所有服务容器都会继承此变量。
           echo "CI=true" >> .env.shared
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          BACKUP_KEK: ${{ secrets.BACKUP_KEK }}
 
       - name: Create data and logs directories for bind mounts
         run: |

@@ -2358,13 +2358,20 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
     #             使用 db_restore --target staging --backup-id(显式恢复目标)
     # R72 RC60: 传递 --timeout 240 让 db_backup 在 asyncpg 连接卡住时先于编排器
     #           超时返回结构化 evidence(避免编排器 600s 强杀导致无错误信息)。
-    backup_evidence_path = REPO_ROOT / f".tmp_backup_evidence_{trace_id}.json"
+    # R72 RC63: compose run 必须加 -T 禁用 TTY 分配,否则在 GitHub Actions 非 TTY
+    #           环境下会因等待 TTY 输入而无限挂起,导致编排器 600s 超时强杀,
+    #           且 stdout/stderr 为空(无法定位失败原因)。与 compose exec -T 一致。
+    # R72 RC63: evidence 文件路径必须使用容器内可写路径(/app/data 映射到宿主机 ./data),
+    #           而非宿主机路径 — db_backup 容器 read_only: true,只挂载 ./data:/app/data,
+    #           传入宿主机路径会写入失败(OSError),且 evidence 文件无法被编排器读取。
+    backup_evidence_path = REPO_ROOT / "data" / f"backup_evidence_{trace_id}.json"
+    backup_evidence_container_path = f"/app/data/backup_evidence_{trace_id}.json"
     backup_cmd = _compose_cmd([
-        "run", "--rm", "db_backup",
+        "run", "--rm", "-T", "db_backup",
         "python", "-m", "services.db_backup", "backup",
         "--once",
         "--timeout", "240",
-        "--output-json", str(backup_evidence_path),
+        "--output-json", backup_evidence_container_path,
     ])
     try:
         backup_result = _run(backup_cmd, timeout=timeout, cwd=REPO_ROOT)
@@ -2445,13 +2452,16 @@ def phase_backup_restore(timeout: int) -> PhaseResult:
     readiness_checks.append({"check": "backup_id_parsed", "status": "pass"})
 
     # R72 P0-10: 触发 restore --target staging --backup-id(隔离目标,不覆盖生产数据)
-    restore_evidence_path = REPO_ROOT / f".tmp_restore_evidence_{trace_id}.json"
+    # R72 RC63: compose run 必须加 -T 禁用 TTY 分配(同 backup_cmd 注释)
+    # R72 RC63: evidence 文件路径使用容器内 /app/data(同 backup_evidence_path 逻辑)
+    restore_evidence_path = REPO_ROOT / "data" / f"restore_evidence_{trace_id}.json"
+    restore_evidence_container_path = f"/app/data/restore_evidence_{trace_id}.json"
     restore_cmd = _compose_cmd([
-        "run", "--rm", "db_writer",
+        "run", "--rm", "-T", "db_writer",
         "python", "-m", "services.db_restore",
         "--backup-id", backup_id,
         "--target", "staging",
-        "--output-json", str(restore_evidence_path),
+        "--output-json", restore_evidence_container_path,
     ])
     try:
         restore_result = _run(restore_cmd, timeout=timeout, cwd=REPO_ROOT)
