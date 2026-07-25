@@ -52,7 +52,9 @@
         "required_status_checks": [
           {"context": "lint"},
           {"context": "static-gates"},
-          {"context": "test"},
+          {"context": "test (3.10)"},
+          {"context": "test (3.11)"},
+          {"context": "test (3.12)"},
           {"context": "docker-build"},
           {"context": "docker-digest-verify"},
           {"context": "compose-config"},

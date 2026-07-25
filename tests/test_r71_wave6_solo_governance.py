@@ -83,13 +83,17 @@ CONFIGURE_RULESET_SH = REPO_ROOT / "scripts" / "configure_branch_ruleset.sh"
 VERIFY_RULESET_SH = REPO_ROOT / "scripts" / "verify_branch_ruleset.sh"
 RECORD_BREAK_GLASS_PY = REPO_ROOT / "scripts" / "record_break_glass.py"
 
-# R71 P1-02 / R72 P1-06: 29 个必需 status checks(仅 PR/master 事件可产生的 check)
-# 与 .github/branch_ruleset.expected.json / configure_branch_ruleset.sh 保持一致
+# R71 P1-02 / R72 P1-06 / R72 RC60: 31 个必需 status checks(仅 PR/master 事件可产生的 check)
+# 与 .github/branch_ruleset.expected.json / configure_branch_ruleset.sh / verify_branch_ruleset.sh 保持一致
 # R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
 # sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
 # migration-binding-gate / verify-rc-identity / production-promotion-gate)
+# R72 RC60: 'test' 拆分为 'test (3.10)' / 'test (3.11)' / 'test (3.12)' (matrix 展开,29→31 项)
+# 原因: GitHub Actions check-run name 是矩阵展开形式("test (3.10)"),而非 bare "test"。
+# 实际 GitHub ruleset 中也用矩阵展开形式,因此 expected.json / 脚本 / 测试列表必须同步。
 EXPECTED_REQUIRED_CHECKS: list[str] = [
-    "lint", "static-gates", "test",
+    "lint", "static-gates",
+    "test (3.10)", "test (3.11)", "test (3.12)",
     "docker-build", "docker-digest-verify", "compose-config",
     "redis-acl-matrix", "schema-diff", "restore-legacy-seal-gate",
     "i18n-strict-export-boundary-gate", "migration-manifest-gate",

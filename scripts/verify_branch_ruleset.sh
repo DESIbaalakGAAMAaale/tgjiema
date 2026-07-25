@@ -39,15 +39,18 @@ set -euo pipefail
 
 RULESET_NAME="${RULESET_NAME:-R71 Solo Founder Branch Ruleset}"
 
-# R71 P1-02 / R72 P1-06: 必需 status checks 列表(29 项,仅 PR/master 事件可产生的 check)
+# R71 P1-02 / R72 P1-06: 必需 status checks 列表(31 项,仅 PR/master 事件可产生的 check)
 # 与 .github/branch_ruleset.expected.json / scripts/configure_branch_ruleset.sh 保持一致
 # R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
 # sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
 # migration-binding-gate / verify-rc-identity / production-promotion-gate)
+# R72 RC60: 'test' 拆分为 'test (3.10)'/'test (3.11)'/'test (3.12)' (29→31 项)
 EXPECTED_REQUIRED_CHECKS=(
   "lint"
   "static-gates"
-  "test"
+  "test (3.10)"
+  "test (3.11)"
+  "test (3.12)"
   "docker-build"
   "docker-digest-verify"
   "compose-config"

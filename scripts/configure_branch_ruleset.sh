@@ -220,7 +220,7 @@ fi
 # (它们在 master push 事件产出 check,满足 PR/master 事件可产生要求)。
 REQUIRED_STATUS_CHECKS="${REQUIRED_STATUS_CHECKS:-}"
 if [ -z "$REQUIRED_STATUS_CHECKS" ]; then
-  REQUIRED_STATUS_CHECKS='["lint","static-gates","test","docker-build","docker-digest-verify","compose-config","redis-acl-matrix","schema-diff","restore-legacy-seal-gate","i18n-strict-export-boundary-gate","migration-manifest-gate","button-flow-real-ux-gate","backup-restore-drill","sbom","pip-audit","trivy","sign-artifacts","verify-branch-protection","verify-branch-ruleset","verify-git-source-governance","rc-continuity","tag-ruleset-verify","crdb-ru-72h-attribution-gate","production-evidence","oci-allowlist-verify","validate-oci-rootfs","runtime-smoke-compose","bind-runtime-config","release-summary"]'
+  REQUIRED_STATUS_CHECKS='["lint","static-gates","test (3.10)","test (3.11)","test (3.12)","docker-build","docker-digest-verify","compose-config","redis-acl-matrix","schema-diff","restore-legacy-seal-gate","i18n-strict-export-boundary-gate","migration-manifest-gate","button-flow-real-ux-gate","backup-restore-drill","sbom","pip-audit","trivy","sign-artifacts","verify-branch-protection","verify-branch-ruleset","verify-git-source-governance","rc-continuity","tag-ruleset-verify","crdb-ru-72h-attribution-gate","production-evidence","oci-allowlist-verify","validate-oci-rootfs","runtime-smoke-compose","bind-runtime-config","release-summary"]'
 fi
 # 校验是合法 JSON 数组
 if ! echo "$REQUIRED_STATUS_CHECKS" | jq -e 'type == "array" and length >= 1' > /dev/null 2>&1; then
