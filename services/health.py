@@ -330,9 +330,13 @@ ROLE_REQUIREMENTS: dict[str, dict[str, bool]] = {
         "database": True, "redis": True, "bot_token_valid": True,
         "sub_services_alive": False, "required_tables": True,
     },
+    # R72 RC53 fix: admin_bot 是 Telegram Bot,不监听 8080 端口。
+    # 8080 是 `admin` 服务(管理面板/UVicorn)监听的。
+    # admin_bot 不应检查 admin_web_port(配置错误,导致 CI compose-runtime-e2e
+    # start_bots 阶段 admin_bot healthcheck 失败)。
     "admin_bot": {
         "database": True, "redis": True, "bot_token_valid": True,
-        "admin_web_port": True, "required_tables": True,
+        "required_tables": True,
     },
     "db_writer": {
         "database": True, "redis": True,
@@ -358,15 +362,20 @@ ROLE_REQUIREMENTS: dict[str, dict[str, bool]] = {
         "database": True, "redis": True,
         "scheduler_heartbeat": True, "required_tables": True,
     },
-    "admin": {  # 全部检查
+    # R72 RC53 fix: admin 角色(全部检查)不再包含跨服务检查项
+    # (crdb_sync_lag / scheduler_heartbeat / metrics_endpoint)。
+    # 这些是其他角色(crdb_sync / r40_scheduler / prometheus_exporter)的专属检查,
+    # admin 服务无法访问它们的 kv_store / 端口 / 心跳状态。
+    # admin 角色应只检查 admin 自身的依赖(database / redis / admin_web_port 等)。
+    # 跨服务健康监控由 mon_bot 的 sub_services_alive 检查负责。
+    "admin": {  # admin 自身 + 共享依赖检查
         "database": True, "database_crdb": True, "redis": True,
         "bot_token_valid": True, "upload_session_status": False,
         "bot_polling_status": True, "index_queue_depth": False,
         "redis_stream_consumer": True, "send_queue_depth": False,
         "sub_services_alive": False, "admin_web_port": True,
         "redis_stream_consumer_group": True, "writer_inbox_lag": True,
-        "crdb_sync_lag": True, "backup_dir_writable": True,
-        "metrics_endpoint": True, "scheduler_heartbeat": True,
+        "backup_dir_writable": True,
         "required_tables": True,
     },
 }

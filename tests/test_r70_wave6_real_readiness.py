@@ -466,14 +466,20 @@ class TestRoleCheckMapping:
 
     @pytest.mark.asyncio
     async def test_admin_bot_checks(self, health, mock_all_checks_pass):
-        """admin_bot 检查项:database + redis + bot_token_valid +
-        admin_web_port。"""
+        """admin_bot 检查项:database + redis + bot_token_valid。
+
+        R72 RC53 fix: admin_bot 是 Telegram Bot,不监听 8080 端口。
+        8080 是 admin 服务(管理面板/UVicorn)监听的。
+        admin_bot 不应检查 admin_web_port(配置错误,导致 CI compose-runtime-e2e
+        start_bots 阶段 admin_bot healthcheck 失败)。
+        """
         result = await health.check_readiness("admin_bot")
         names = [c.name for c in result.checks]
         assert "database" in names
         assert "redis" in names
         assert "bot_token_valid" in names
-        assert "admin_web_port" in names
+        # R72 RC53: admin_bot 不应检查 admin_web_port(Telegram Bot 不监听 8080)
+        assert "admin_web_port" not in names
         # 不应有其他角色的专属检查
         assert "upload_session_status" not in names
         assert "bot_polling_status" not in names
@@ -777,19 +783,23 @@ class TestNonCriticalCheckFailure:
     async def test_admin_web_port_failure_makes_unhealthy(
         self, health, monkeypatch, mock_all_checks_pass
     ):
-        """R71 Wave 1: admin_web_port 失败(critical)对 admin_bot → 整体 healthy=false。
+        """R71 Wave 1: admin_web_port 失败(critical)对 admin 角色 → 整体 healthy=false。
 
         R70 Wave 6 行为:admin_web_port 为 non-critical。
-        R71 Wave 1 行为:ROLE_REQUIREMENTS["admin_bot"]["admin_web_port"] = True
+        R71 Wave 1 行为:ROLE_REQUIREMENTS["admin"]["admin_web_port"] = True
         (admin web 端口不可用时管理后台不可达,应为 critical)。
+
+        R72 RC53 fix: admin_bot 不再检查 admin_web_port(Telegram Bot 不监听 8080)。
+        此测试改为对 admin 角色(管理面板/UVicorn 服务)进行验证,
+        admin 服务自身监听 8080,admin_web_port 失败应使整体 unhealthy。
         """
         monkeypatch.setattr(
             health, "_check_admin_web_port",
             _async_return_factory((False, "Port 8080 not listening"))
         )
-        result = await health.check_readiness("admin_bot")
+        result = await health.check_readiness("admin")
         assert result.healthy is False, (
-            "R71 Wave 1: admin_bot 的 admin_web_port(critical)失败时整体 healthy 必须为 False"
+            "R71 Wave 1: admin 的 admin_web_port(critical)失败时整体 healthy 必须为 False"
         )
         port_check = next(
             c for c in result.checks if c.name == "admin_web_port"
