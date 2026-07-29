@@ -24,7 +24,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -266,7 +265,7 @@ class TestSecretlessCredentialsInjectionStep:
         """
         source = _read_workflow()
         job_block = _extract_compose_runtime_e2e_block(source)
-        probe_start = job_block.index("CRDB_VERSION_OUTPUT=$(docker compose")
+        probe_start = job_block.index("if ! CRDB_VERSION_OUTPUT=$(docker compose")
         probe_end = job_block.index('echo "=== Secretless infrastructure ready ==="')
         probe = job_block[probe_start:probe_end]
 
@@ -275,7 +274,10 @@ class TestSecretlessCredentialsInjectionStep:
         assert " -t " not in probe
         assert "| head" not in probe
         assert 'if [ -z "${CRDB_VERSION_OUTPUT//[[:space:]]/}" ]; then' in probe
+        assert 'if ! CRDB_VERSION_OUTPUT=$(docker compose' in probe
         assert 'echo "::error::CockroachDB version probe failed"' in probe
+        assert 'echo "::error::CockroachDB version probe returned empty output"' in probe
+        assert probe.count("exit 1") >= 2
 
     def test_secretless_mode_flag_enabled(self):
         """SECRETLESS_MODE=true 必须写入 .env.shared。
