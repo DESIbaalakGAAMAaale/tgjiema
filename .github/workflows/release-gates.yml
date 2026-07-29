@@ -5041,14 +5041,14 @@ jobs:
         set -euo pipefail
         echo "=== R60 P0-06: Release Gate Aggregate Summary ==="
         echo "Aggregating release gate conclusions..."
-        # R60 §ci-fix: 区分 PR 与 release target(push to master/main)。
-        # sign-image / publish-attestation 的 if: 仅在 push 到 master/main 时运行,
-        # 在 PR 上必然 skipped。若一律要求 success 会让所有 PR 永久失败(过度阻断)。
-        # 正确语义:
-        #   - release target(master/main push): 全部 14 个 job 必须 success
-        #     (sign-image/publish-attestation 此时必须运行且成功,这正是 P0-06 要兜的底)
-        #   - PR: 12 个常驻 job 必须 success;sign-image/publish-attestation
-        #     允许 skipped(其 if: 未满足),但 failure 仍阻断
+        # R60 §ci-fix / R83 merge-SHA fix: 区分 master build-validation 与
+        # RC/production 发布路径。master/main push 设置 should_push=false，只执行
+        # 真实 build+load 验证；依赖已推送 RepoDigest 的 OCI/runtime/config jobs 必然
+        # skipped。release-summary 必须与各 job 的 if 合同一致：
+        #   - master/main push: 常驻门禁与 Secretless closed-loop 必须 success；
+        #     should_push-only 和 RC/production-only jobs 允许 skipped
+        #   - rc-v* tag: 完整 OCI、签名、attestation、runtime-config 链必须 success
+        #   - PR: 常驻门禁必须 success；tag-only jobs 允许 skipped
         RELEASE_TARGET=false
         if [ "${GITHUB_EVENT_NAME}" = "push" ] && { [ "${GITHUB_REF}" = "refs/heads/master" ] || [ "${GITHUB_REF}" = "refs/heads/main" ]; }; then
           RELEASE_TARGET=true
@@ -5126,7 +5126,24 @@ jobs:
           # R66 P1-10: attestation-semantics-verify 同 RC-only 模式
           # R67 P0-01: verify-git-source-governance 在 master push + RC/production tag 都运行
           # R67 P0-04: verify-only-3x 同 RC-only 模式
-          if [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ] || [ "${job}" = "migration-binding-gate" ] || [ "${job}" = "attestation-semantics-verify" ] || [ "${job}" = "verify-only-3x" ]; then
+          if [ "${job}" = "oci-allowlist-verify" ] || [ "${job}" = "validate-oci-rootfs" ] || [ "${job}" = "runtime-smoke-compose" ]; then
+            # R73 P1-04 / R83: these jobs consume the immutable image by RepoDigest
+            # and therefore run only when docker-build.should_push=true (PR/RC).
+            # Master/main is an intentional build+load-only validation path, so
+            # skipped is the only valid non-success state there; failure/cancelled
+            # remains blocking, and RC/PR publication paths still require success.
+            if [ "${RELEASE_TARGET}" = "true" ]; then
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' failed on master build-validation path (got: ${conclusion})"
+                FAIL=1
+              fi
+            else
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on published image path (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
+          elif [ "${job}" = "sign-image" ] || [ "${job}" = "publish-attestation" ] || [ "${job}" = "migration-binding-gate" ] || [ "${job}" = "attestation-semantics-verify" ] || [ "${job}" = "verify-only-3x" ]; then
             # R70 P0-10: RC-only jobs — 仅 RC_TAG=true 时必须 success
             # - master push: skipped (允许,master 不再触发签名)
             # - production-v* tag: skipped (允许,签名已在 RC 阶段完成)
@@ -5273,14 +5290,11 @@ jobs:
               fi
             fi
           elif [ "${job}" = "bind-runtime-config" ]; then
-            # R71 Wave 7: bind-runtime-config 在 master/main push + rc-v* tag +
-            #   production-v* tag + workflow_dispatch 时运行,PR 场景 skipped
-            # - master/main push (RELEASE_TARGET=true): 必须 success
-            # - rc-v* tag (RC_TAG=true): 必须 success(RC candidate 必须有身份绑定)
-            # - production-v* tag (PRODUCTION_TAG=true): 必须 success
-            # - workflow_dispatch: 必须 success
-            # - PR: 允许 skipped,failure/cancelled 仍阻断
-            if [ "${RELEASE_TARGET}" = "true" ] || [ "${RC_TAG}" = "true" ] || [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            # R71 Wave 7 / R73 P1-04: bind-runtime-config requires an immutable
+            # pushed RepoDigest. Master/main uses should_push=false, so it is an
+            # intentional skipped build-validation path. RC/production/dispatch
+            # must still succeed and bind the exact image/config/current SHA.
+            if [ "${RC_TAG}" = "true" ] || [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
               if [ "${conclusion}" != "success" ]; then
                 echo "::error::Job '${job}' did not succeed on release target/tag/dispatch (got: ${conclusion})"
                 echo "  R71 P1-04/P1-05/P0-13: 运行配置 + artifacts 身份绑定校验失败"

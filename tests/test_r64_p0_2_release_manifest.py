@@ -810,6 +810,36 @@ class TestR66P0_02BuildOnceManifestFrozen:
         assert should_push in str(with_config["provenance"])
         assert should_push in str(with_config["sbom"])
 
+    def test_release_summary_accepts_only_expected_master_load_only_skips(
+        self,
+        workflow_yaml,
+    ):
+        """Master build-validation 的汇总语义必须匹配 should_push job 合同。
+
+        Master/main 不推送镜像，因此 RepoDigest 消费者和 runtime-config 绑定会
+        按 job-level if 精确跳过。release-summary 只能允许这些预期 skipped，仍须
+        阻断 failure/cancelled；PR/RC 发布路径仍必须要求这些 job 成功。
+        """
+        summary_script = workflow_yaml["jobs"]["release-summary"]["steps"][0]["run"]
+        for job_name in (
+            "oci-allowlist-verify",
+            "validate-oci-rootfs",
+            "runtime-smoke-compose",
+        ):
+            assert f'[ "${{job}}" = "{job_name}" ]' in summary_script
+        assert 'if [ "${RELEASE_TARGET}" = "true" ]; then' in summary_script
+        assert (
+            '[ "${conclusion}" != "success" ] && '
+            '[ "${conclusion}" != "skipped" ]'
+        ) in summary_script
+        bind_block = summary_script.split(
+            'elif [ "${job}" = "bind-runtime-config" ]; then',
+            maxsplit=1,
+        )[1].split("else", maxsplit=1)[0]
+        assert '"${RELEASE_TARGET}" = "true"' not in bind_block
+        assert '"${RC_TAG}" = "true"' in bind_block
+        assert '"${PRODUCTION_TAG}" = "true"' in bind_block
+
     def test_sign_image_does_not_regenerate_manifest(self, workflow_yaml):
         """sign-image job 不得包含 'Regenerate migration manifest' 步骤。
 
