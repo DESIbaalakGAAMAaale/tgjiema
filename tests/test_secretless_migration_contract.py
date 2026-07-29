@@ -21,7 +21,8 @@ import json
 from pathlib import Path
 
 import pytest
-import yaml
+
+from scripts.compose_yaml import load_compose_yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -57,7 +58,7 @@ def parse_env_list(env_list):
 
 
 def _load_yaml(path: Path) -> dict:
-    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    return load_compose_yaml(path) or {}
 
 
 def _load_resolved() -> dict | None:

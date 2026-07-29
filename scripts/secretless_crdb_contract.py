@@ -19,7 +19,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-import yaml
+from scripts.compose_yaml import load_compose_yaml
 
 
 # R79 §10.2: 单 CRDB 拓扑 — 服务名即基础 compose 的 cockroachdb
@@ -67,7 +67,7 @@ def _environment_values(service: dict[str, Any]) -> list[str]:
 
 def validate_compose_contract(compose_path: Path) -> list[str]:
     """Return all contract violations in *compose_path* without using Docker."""
-    document = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
+    document = load_compose_yaml(compose_path)
     services = document.get("services", {}) if isinstance(document, dict) else {}
     violations: list[str] = []
 
