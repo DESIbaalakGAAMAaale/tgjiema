@@ -257,6 +257,26 @@ class TestSecretlessCredentialsInjectionStep:
             "R83 RC runtime: SECRETLESS_CRDB_* 必须在 merged Compose graph 渲染前导出"
         )
 
+    def test_crdb_version_probe_uses_native_cli_contract(self):
+        """CRDB 就绪后的版本探针不得混用 psql 选项或截断管道。
+
+        CockroachDB CLI 不支持 PostgreSQL psql 的 ``-t``；在
+        ``set -o pipefail`` 下使用 ``head`` 截断输出也可能以 SIGPIPE/rc=4
+        将健康基础设施误判失败。探针必须完整捕获输出并验证非空。
+        """
+        source = _read_workflow()
+        job_block = _extract_compose_runtime_e2e_block(source)
+        probe_start = job_block.index("CRDB_VERSION_OUTPUT=$(docker compose")
+        probe_end = job_block.index('echo "=== Secretless infrastructure ready ==="')
+        probe = job_block[probe_start:probe_end]
+
+        assert 'cockroach sql --insecure --host=localhost:26258' in probe
+        assert '-e "SELECT version();"' in probe
+        assert " -t " not in probe
+        assert "| head" not in probe
+        assert 'if [ -z "${CRDB_VERSION_OUTPUT//[[:space:]]/}" ]; then' in probe
+        assert 'echo "::error::CockroachDB version probe failed"' in probe
+
     def test_secretless_mode_flag_enabled(self):
         """SECRETLESS_MODE=true 必须写入 .env.shared。
 

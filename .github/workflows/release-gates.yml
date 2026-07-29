@@ -1019,10 +1019,21 @@ jobs:
             fi
             sleep 2
           done
-          # 验证 CRDB 版本和 tgjiema 数据库(显式 --host=localhost:26258)
-          CRDB_VERSION=$(docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T \
-            cockroachdb cockroach sql --insecure --host=localhost:26258 -e "SELECT version();" -t 2>/dev/null | head -1 | xargs)
-          echo "CockroachDB version: ${CRDB_VERSION}"
+          # 验证 CRDB 版本和 tgjiema 数据库(显式 --host=localhost:26258)。
+          # CockroachDB CLI 不支持 PostgreSQL psql 的 `-t` 选项；同时禁止在
+          # set -o pipefail 下用 head 截断 CLI 输出，否则 SIGPIPE/解析差异会让
+          # 已就绪的基础设施以 rc=4 误判失败。完整捕获并验证非空输出。
+          if ! CRDB_VERSION_OUTPUT=$(docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T \
+            cockroachdb cockroach sql --insecure --host=localhost:26258 -e "SELECT version();" 2>&1); then
+            echo "::error::CockroachDB version probe failed"
+            printf '%s\n' "${CRDB_VERSION_OUTPUT}"
+            exit 1
+          fi
+          if [ -z "${CRDB_VERSION_OUTPUT//[[:space:]]/}" ]; then
+            echo "::error::CockroachDB version probe returned empty output"
+            exit 1
+          fi
+          printf 'CockroachDB version probe:\n%s\n' "${CRDB_VERSION_OUTPUT}"
           echo "=== Secretless infrastructure ready ==="
 
       - name: Run Compose Runtime E2E (11 phases, fail-closed)
