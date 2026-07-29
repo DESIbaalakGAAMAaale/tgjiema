@@ -345,8 +345,11 @@ jobs:
         tags: ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.tag }}
         build-args: |
           PYTHON_IMAGE=${{ steps.parse.outputs.image_ref }}
-        provenance: true
-        sbom: true
+        # BuildKit's docker exporter cannot load the attestation manifest list
+        # produced by provenance/SBOM. Master/main uses load-only validation, so
+        # disable attestations there; rc-v* and PR pushes still publish both.
+        provenance: ${{ steps.meta.outputs.should_push == 'true' }}
+        sbom: ${{ steps.meta.outputs.should_push == 'true' }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
 

@@ -791,6 +791,25 @@ class TestR66P0_02BuildOnceManifestFrozen:
             "(build 前冻结的 catalog sha256, 供 sign-image job 校验镜像内 catalog)"
         )
 
+    def test_load_only_build_disables_attestation_manifest_lists(self, workflow_yaml):
+        """Master load-only build 不得向 docker exporter 输出 attestation manifest list。
+
+        BuildKit 的 docker exporter 无法加载 provenance/SBOM 产生的 manifest list。
+        Attestations 仅在 should_push=true 的 PR/RC 发布路径启用；master/main 仍执行
+        完整 OCI build + load 验证，但不伪造或丢弃发布证据。
+        """
+        build_step = next(
+            step
+            for step in workflow_yaml["jobs"]["docker-build"]["steps"]
+            if "Build and push OCI image" in step.get("name", "")
+        )
+        with_config = build_step["with"]
+        should_push = "steps.meta.outputs.should_push == 'true'"
+        assert should_push in str(with_config["push"])
+        assert "steps.meta.outputs.should_push == 'false'" in str(with_config["load"])
+        assert should_push in str(with_config["provenance"])
+        assert should_push in str(with_config["sbom"])
+
     def test_sign_image_does_not_regenerate_manifest(self, workflow_yaml):
         """sign-image job 不得包含 'Regenerate migration manifest' 步骤。
 

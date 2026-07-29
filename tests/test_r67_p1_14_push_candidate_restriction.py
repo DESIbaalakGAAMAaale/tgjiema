@@ -35,7 +35,7 @@ WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
 @pytest.fixture(scope="module")
 def workflow_yaml() -> dict:
     """加载 release-gates.yml 工作流 YAML。"""
-    with open(WORKFLOW_PATH) as f:
+    with open(WORKFLOW_PATH, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -290,7 +290,7 @@ class TestP1_14AuditCoverage:
 
     def test_p1_14_comment_in_workflow_file(self):
         """P1-14 整改标记存在于 workflow 文件中。"""
-        content = WORKFLOW_PATH.read_text()
+        content = WORKFLOW_PATH.read_text(encoding="utf-8")
         assert "R67 P1-14" in content
 
     def test_image_tag_still_uses_ci_prefix(self, compute_image_tag_script: str):
