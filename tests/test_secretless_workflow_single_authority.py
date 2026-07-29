@@ -76,6 +76,26 @@ class TestSingleAuthorityTriggerModel:
             f"got {automatic_triggers}"
         )
 
+    def test_push_covers_every_pr_head_branch(self, workflow: dict):
+        """Every same-repository PR head must receive an authoritative push run.
+
+        Release Gates requires a successful event=push run for the exact current
+        SHA. A remediation-only branch filter leaves ordinary fix branches with
+        no possible evidence and forces the gate to time out fail-closed.
+        """
+        triggers = _get_on_block(workflow)
+        push = triggers.get("push")
+        assert isinstance(push, dict), "push trigger must declare branch coverage"
+
+        branches = push.get("branches")
+        assert branches == ["**"], (
+            "push trigger must cover every branch so each PR candidate SHA has "
+            f"one authoritative run, got: {branches!r}"
+        )
+        assert "branches-ignore" not in push, (
+            "push trigger must not exclude PR head branches from authoritative runs"
+        )
+
     def test_concurrency_uses_github_sha(self, workflow: dict):
         """Concurrency group must use github.sha for identity.
 

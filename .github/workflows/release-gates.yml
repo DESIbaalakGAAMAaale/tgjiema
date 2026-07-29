@@ -898,6 +898,14 @@ jobs:
           echo "CI_PROVIDER_CONTRACT_TOKEN=${CI_PROVIDER_CONTRACT_TOKEN}" >> "$GITHUB_ENV"
           echo "CI_PROVIDER_RECEIPT_KEY=${CI_PROVIDER_RECEIPT_KEY}" >> "$GITHUB_ENV"
           echo "CI_BACKUP_SIGNING_KEY=${CI_BACKUP_SIGNING_KEY}" >> "$GITHUB_ENV"
+          # R83 RC runtime: docker compose config interpolates every service in the
+          # merged graph before selecting infrastructure targets. Export the exact
+          # isolated CRDB identity required by docker-compose.secretless.yml.
+          # These are fixed CI-local endpoints, not production credentials.
+          echo "SECRETLESS_CRDB_HOST=cockroachdb" >> "$GITHUB_ENV"
+          echo "SECRETLESS_CRDB_SQL_PORT=26258" >> "$GITHUB_ENV"
+          echo "SECRETLESS_CRDB_DATABASE=tgjiema" >> "$GITHUB_ENV"
+          echo "SECRETLESS_CRDB_URL=postgresql://root@cockroachdb:26258/tgjiema?sslmode=disable" >> "$GITHUB_ENV"
 
           # 生成 .env.secrets.<service> 占位(secretless 模式下 bot token 为固定 ci-local-token)
           for svc in db_writer up idx dsp mon admin_bot admin prometheus_exporter; do

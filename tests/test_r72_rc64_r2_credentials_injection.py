@@ -227,6 +227,36 @@ class TestSecretlessCredentialsInjectionStep:
             "单 CRDB 拓扑使用基础服务键 cockroachdb"
         )
 
+    def test_secretless_crdb_identity_exported_before_compose_render(self):
+        """完整 Compose 图渲染前必须导出 isolated CRDB identity。
+
+        Docker Compose 会先插值 merged graph 的全部服务，再选择要启动的
+        infrastructure targets；因此只写 .env.shared 中的 COCKROACHDB_URL 不够。
+        """
+        source = _read_workflow()
+        job_block = _extract_compose_runtime_e2e_block(source)
+        required_exports = {
+            "SECRETLESS_CRDB_HOST": "cockroachdb",
+            "SECRETLESS_CRDB_SQL_PORT": "26258",
+            "SECRETLESS_CRDB_DATABASE": "tgjiema",
+            "SECRETLESS_CRDB_URL": (
+                "postgresql://root@cockroachdb:26258/tgjiema?sslmode=disable"
+            ),
+        }
+        for name, value in required_exports.items():
+            expected = f'echo "{name}={value}" >> "$GITHUB_ENV"'
+            assert expected in job_block, (
+                f"R83 RC runtime: compose-runtime-e2e 必须在 compose config 前导出 {name}"
+            )
+
+        export_pos = job_block.index('echo "SECRETLESS_CRDB_HOST=cockroachdb"')
+        render_pos = job_block.index(
+            "docker compose -f docker-compose.yml -f docker-compose.secretless.yml"
+        )
+        assert export_pos < render_pos, (
+            "R83 RC runtime: SECRETLESS_CRDB_* 必须在 merged Compose graph 渲染前导出"
+        )
+
     def test_secretless_mode_flag_enabled(self):
         """SECRETLESS_MODE=true 必须写入 .env.shared。
 
