@@ -714,6 +714,15 @@ class TestDockerfileAndWorkflowStructure:
             "R64 P0-02: release-gates.yml 必须有 extract_release_manifest_identity 步骤"
         )
 
+    def test_rc_tag_ssh_signature_configures_trusted_signers(self):
+        """RC tag 的 SSH 签名必须在 CI 中以 owner signing key 严格验证。"""
+        content = WORKFLOW_PATH.read_text(encoding="utf-8")
+        assert 'gh api "/users/${GITHUB_REPOSITORY_OWNER}/ssh_signing_keys"' in content
+        assert 'gpg.ssh.allowedSignersFile="${RUNNER_TEMP}/allowed_signers"' in content
+        assert 'verify-tag "${TAG_NAME}"' in content
+        assert 'SIGNING_KEY_COUNT' in content
+        assert 'No SSH signing keys published' in content
+
 
 # ════════════════════════════════════════════════════════════════
 # G2. R66 P0-02: build-once 后才重生 manifest 整改校验

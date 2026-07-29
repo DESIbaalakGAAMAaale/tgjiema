@@ -773,6 +773,8 @@ jobs:
 
       - name: Compute RC identity outputs (tag_object_sha, source_sha, tree_sha, runtime_config_digest)
         id: identity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # R76 10.F / P0-07: 严格 annotated signed tag 身份校验
@@ -788,7 +790,24 @@ jobs:
           # 2. 获取 tag object SHA (annotated tag 对象本身,不等于 commit SHA)
           TAG_OBJECT_SHA=$(git rev-parse "refs/tags/${TAG_NAME}^{tag}")
           # 3. 验证 tag 签名 (必须为 signed annotated tag)
-          git verify-tag "${TAG_NAME}"
+          # SSH signatures require an explicit allowedSignersFile. Bind the
+          # trusted signer to the repository owner's GitHub SSH signing key;
+          # never downgrade to a warning or skip verification.
+          SIGNING_KEYS_JSON=$(gh api "/users/${GITHUB_REPOSITORY_OWNER}/ssh_signing_keys")
+          SIGNING_KEY_COUNT=$(printf '%s' "${SIGNING_KEYS_JSON}" | jq 'length')
+          if [ "${SIGNING_KEY_COUNT}" -lt 1 ]; then
+            echo "::error::No SSH signing keys published for ${GITHUB_REPOSITORY_OWNER}"
+            exit 1
+          fi
+          printf '%s' "${SIGNING_KEYS_JSON}" | jq -r \
+            --arg principal "${GITHUB_REPOSITORY_OWNER}" \
+            '.[] | "\($principal) \(.key)"' > "${RUNNER_TEMP}/allowed_signers"
+          if [ ! -s "${RUNNER_TEMP}/allowed_signers" ]; then
+            echo "::error::Failed to construct non-empty SSH allowed signers file"
+            exit 1
+          fi
+          git -c gpg.ssh.allowedSignersFile="${RUNNER_TEMP}/allowed_signers" \
+            verify-tag "${TAG_NAME}"
           # 4. 获取 peeled commit SHA (tag 指向的 commit)
           SOURCE_SHA=$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")
           # 5. tag object SHA 必须不等于 peeled commit SHA (annotated tag 的本质特征)
