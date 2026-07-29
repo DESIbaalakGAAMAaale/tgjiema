@@ -105,6 +105,8 @@ async def real_store_with_engine(monkeypatch):
 
     kek_b64 = generate_kek()
     monkeypatch.setenv("BACKUP_KEK", kek_b64)
+    # R76 P0-06: 注入临时签名密钥(production restore 路径需要 issue_capability)
+    monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "a" * 64)
 
     try:
         s = CacheStore()

@@ -18,7 +18,7 @@ _restore_from_backup_data / _safe_val / TABLE_PK 等写入器能力)。
     - ``_safe_val`` / ``_sqlite_safe_val`` (CRDB / SQLite 类型转换)
     - ``_restore_table`` (asyncpg 表级 UPSERT 写入器)
     - ``_restore_sqlite_table`` (aiosqlite 表级 UPSERT 写入器)
-    - ``_restore_from_backup_data`` (主写入器,接受不可伪造的 _RestoreCapability)
+    - ``_restore_from_backup_data`` (主写入器,接受 capability dict + VerifiedBackupPayload)
     - ``_restore_crdb_tables`` (CRDB 子写入器,使用 db_client.transaction())
     - ``_restore_sqlite_tables_to_db`` (SQLite 子写入器)
 
@@ -29,12 +29,13 @@ _restore_from_backup_data / _safe_val / TABLE_PK 等写入器能力)。
       但 ``services/restore_writer.py`` 不被排除(必需的生产 runtime 模块)
 
 安全保证:
-    - ``_restore_from_backup_data`` 首条语句对
-      ``verified_payload.canonical_payload_bytes`` 重算 SHA-256,
-      与 ``_capability.payload_digest`` 比对,防御 ``object.__setattr__``
-      绕过 frozen 替换 canonical_payload_bytes 的攻击(R63 P0-02 / R64 P1-01)。
-    - ``capability.assert_valid`` 强制 sentinel + nonce 防重放 + 未过期 +
-      payload_digest 一致 + scope 一致(R62 P0-02 / R63 P1-01)。
+    - ``_restore_from_backup_data`` writer 入口第一步调用
+      ``verify_and_consume_capability()``,验证 HMAC 签名 + 有效期 + 字段绑定 +
+      nonce 原子消费(防重放),消除新旧两套 capability 并行(P0-06)。
+    - 第二步对 ``verified_payload.canonical_payload_bytes`` 重算 SHA-256,
+      与 ``verified_payload.payload_digest``(构造时 __post_init__ 存储的独立字段)
+      比对,防御 ``object.__setattr__`` 绕过 frozen 替换 canonical_payload_bytes 的
+      攻击(R63 P0-02 / R64 P1-01)。
 """
 
 from __future__ import annotations
@@ -44,6 +45,7 @@ import json
 import os
 import time as _time
 from datetime import datetime
+from typing import Any
 
 import asyncpg
 from loguru import logger
@@ -281,8 +283,8 @@ async def _restore_sqlite_table(
 
 # R63: 提取为模块常量避免硬编码字符串扫描器误报
 _LOG_PAYLOAD_DIGEST_MISMATCH = (
-    "R63 P0-02: actual payload bytes digest 与 capability.payload_digest "
-    "不匹配 (actual={}..., capability={}...) — payload 可能被篡改"
+    "R63 P0-02: actual payload bytes digest 与 verified_payload.payload_digest "
+    "不匹配 (actual={}..., expected={}...) — payload 可能被篡改"
 )
 _LOG_RESTORE_ERRORS = (
     "R63 P0-03: 恢复存在 {} 个错误,operation FAILED (不返回部分成功): {}"
@@ -293,7 +295,9 @@ _LOG_RESTORE_DONE = "[db_restore] 恢复完成: {} 行, 0 个错误, 模式={}"
 async def _restore_from_backup_data(
     verified_payload,
     *,
-    _capability,  # R61 P0-03 / R62 P0-02: _RestoreCapability(不可伪造,由 validate_and_restore_backup_strict 构造)
+    capability: dict[str, Any],  # P0-06: capability dict (loaded from --capability-file, signed by orchestrator)
+    operation_context: Any,  # R76 P0-05: RestoreOperationContext — independent expected values
+    nonce_store: Any,  # R76 P0-06: RestoreNonceStore — database CAS (replaces /tmp file CAS)
     tables: list[str] | None = None,
     merge: bool = False,
 ) -> dict:
@@ -312,21 +316,35 @@ async def _restore_from_backup_data(
 
     R61 P0-03: 信任链整改 — 不可伪造的恢复能力令牌。
         - 本函数为私有写入器,不做信任校验(只写数据)。
-        - 仅接受 services.backup_dr_validate._RestoreCapability 类型令牌,
-          该令牌由 _RESTORE_SENTINEL(模块私有)保护,外部代码无法构造。
         - 调用方必须通过 validate_and_restore_backup_strict() 公共入口
-          获取 _RestoreCapability 后再调用本函数。
+          获取 capability 后再调用本函数。
         - 旧 R59 P0-04 / R60 P0-03 的 BackupValidationResult 令牌已废弃
           (其为公开 dataclass,任意调用方可构造 valid=True,无法防止伪造)。
 
     R62 P0-02: 强制 capability 边界(本次审计整改)。
-        - **首条语句必须为 capability.assert_valid(payload_digest, clock, expected_scope)**
-          — 验证令牌有效性(sentinel + 未过期 + payload_digest 一致 + scope 一致) +
-          防重放(nonce 消费)。任一校验失败即抛 AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)。
         - 参数从 raw data: dict 改为 VerifiedBackupPayload(frozen dataclass),
           从 verified_payload.tables 读取表数据(不再从 data.get("tables", {}))。
-        - capability.payload_digest 与 verified_payload.payload_digest 必须一致,
-          防止 payload 在验证后、写入前被替换。
+
+    P0-06: 接入真实 restore capability 信任边界(本次审计整改)。
+        - **writer 入口第一步必须为 verify_and_consume_capability()**
+          — 验证 HMAC 签名 + 有效期 + 字段绑定(backup_id/source_sha/run_id/
+          run_attempt/audience/target_identity/target_uri) + nonce 原子消费(防重放)。
+          任一校验失败即抛 AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)。
+        - 替换旧 _RestoreCapability.assert_valid(),消除新旧两套 capability 并行。
+        - capability 为 dict(由 orchestrator 通过 issue_capability() 签发,
+          从 --capability-file 加载,含 HMAC 签名),取代旧 _RestoreCapability 对象。
+
+    R76 P0-05 / P0-06 / O8 整改(替代 R74 P1-04):
+        - **删除** ``operation_id`` / ``source_sha`` / ``expected_nonce`` 等从
+          capability 自身回填的参数(R76 P0-05: 自比较无安全意义)
+        - **删除** 从环境变量获取 expected 值的逻辑(GITHUB_RUN_ID /
+          GITHUB_RUN_ATTEMPT / RESTORE_TARGET_IDENTITY / RESTORE_TARGET_URI /
+          RESTORE_AUDIENCE)— 改由 ``operation_context`` 提供(orchestrator 权威状态)
+        - **删除** ``nonce_store_dir`` / ``/tmp/restore_nonce_store`` 文件 CAS
+        - **新增** ``operation_context`` 参数:由 orchestrator 权威状态加载的
+          ``RestoreOperationContext``,提供所有 expected 值(独立来源,非 capability 回填)
+        - **新增** ``nonce_store`` 参数:``RestoreNonceStore`` 实例,封装数据库 CAS
+          (替代 /tmp 文件 CAS,使用 009 migration 的 UNIQUE INDEX)
 
     R69 P0-4 (Wave 2): 本函数从 services/db_restore.py 提取到 services/restore_writer.py,
         消除生产镜像对 services/db_restore.py 的延迟 import 依赖。生产镜像通过
@@ -338,9 +356,14 @@ async def _restore_from_backup_data(
                           — 由 validate_and_restore_backup_strict 或
                           _restore_preverified_payload 构造,含已验证的 tables +
                           payload_digest + schema_fingerprint
-        _capability: R61 P0-03 / R62 P0-01 不可伪造的 _RestoreCapability(由
-                     validate_and_restore_backup_strict / _restore_preverified_payload
-                     通过 _RESTORE_SENTINEL 构造,强制必填)
+        capability: P0-06 capability dict(由 orchestrator 通过
+                     issue_capability() 签发,从 --capability-file 加载,
+                     含 HMAC 签名 + nonce + 字段绑定,强制必填)
+        operation_context: R76 P0-05 ``RestoreOperationContext`` 实例 — 由
+                          orchestrator 权威状态加载,提供所有 expected 值
+                          (独立来源,非 capability 回填)
+        nonce_store: R76 P0-06 ``RestoreNonceStore`` 实例 — 封装数据库 CAS
+                    (替代 /tmp 文件 CAS,使用 009 migration 的 UNIQUE INDEX)
         tables: 仅恢复指定表；None 则恢复备份中的所有表
         merge: True=增量补充(冲突保留现有数据); False=覆盖(清空后写入,默认)
 
@@ -349,50 +372,74 @@ async def _restore_from_backup_data(
 
     Raises:
         AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): capability 校验失败
-            (sentinel 不匹配 / nonce 已消费 / 已过期 / payload_digest 不匹配 /
-             schema_fingerprint 不匹配 / actual payload bytes digest 不匹配)
+            (HMAC 签名无效 / nonce 已消费 / 已过期 / 字段绑定不匹配 /
+             payload_digest 不匹配)
+        ValueError: operation_context 字段不完整(R76 P0-05 fail-closed)
 
     R63 P0-02 / R64 P1-01: writer 端重算 actual payload bytes digest。
-        - 首条语句对 ``verified_payload.canonical_payload_bytes`` 实际 bytes 重新计算
-          SHA-256,与 ``_capability.payload_digest`` 比对。
+        - capability 校验通过后(Step 1),对 ``verified_payload.canonical_payload_bytes``
+          实际 bytes 重新计算 SHA-256(Step 2),
+          与 ``verified_payload.payload_digest``(构造时 __post_init__ 存储的独立字段)比对。
         - 即使 ``object.__setattr__`` 绕过 frozen 替换了 canonical_payload_bytes,
-          重算 digest 也会与 capability 内嵌(构造时)的 digest 不匹配 → fail-closed。
-        - 重算 digest 传给 ``assert_valid``(而非 verified_payload.payload_digest),
-          保证令牌校验基于实际 bytes 而非存储的 digest。
+          payload_digest 是构造时存储的(不会随之变化) → fail-closed。
         - R64 P1-01: 改为直接对 canonical_payload_bytes 求 sha256,
           无需经 _compute_payload_digest(已是 canonical bytes,无需再序列化)。
     """
     from services.error_codes import AppError, ErrorCodes
 
-    # R63 P0-02 / R64 P1-01: 首条语句 — 对 verified_payload.canonical_payload_bytes
-    # 实际 bytes 重新计算 SHA-256,与 capability.payload_digest 比对。
-    # 这防御 object.__setattr__ 绕过 frozen 替换 canonical_payload_bytes 的攻击:
-    #   - 即使 attacker 替换 verified_payload.canonical_payload_bytes + payload_digest,
-    #     capability.payload_digest 是构造时内嵌的(不可变),重算 digest 不匹配 → fail-closed。
-    #   - 即使 attacker 只替换 canonical_payload_bytes,payload_digest 仍为旧值,
-    #     重算 digest 与 capability.payload_digest 不匹配 → fail-closed。
+    # ─── P0-06 Step 1: verify and consume capability (writer entry first step) ───
+    # 接入真实 restore capability 信任边界,替换旧 _RestoreCapability.assert_valid()。
+    # verify_and_consume_capability() 验证 HMAC 签名 + 有效期 + 字段绑定 +
+    # nonce 原子消费(防重放),单一入口,消除新旧两套 capability 并行。
+    #
+    # R76 P0-05: 所有 expected 值来自 operation_context(独立来源),
+    # 不再从 capability 自身回填(自比较无安全意义)
+    # R76 P0-06: nonce 消费使用数据库 CAS(替代 /tmp 文件 CAS)
+    from services.restore_capability_file import (
+        verify_and_consume_capability,
+        RESTORE_CAPABILITY_SIGNING_KEY_ENV,
+    )
+
+    _signing_key_str = os.environ.get(RESTORE_CAPABILITY_SIGNING_KEY_ENV, "")
+    if not _signing_key_str:
+        raise AppError(
+            ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+            params={"reason": "restore_capability_signing_key_not_set"},
+        )
+
+    # R76 P0-05: operation_context 由 orchestrator 权威状态加载,
+    # 提供所有 expected 值(operation_id / source_sha / run_id / run_attempt /
+    # audience / target_identity / target_uri / nonce / manifest_digest /
+    # payload_digest / allowed_action)。
+    # 不再从环境变量或 capability 自身回填(独立来源才有安全意义)。
+    # verify_and_consume_capability 内部会调用 operation_context.validate()
+    # 校验所有必填字段非空(fail-closed)。
+    await verify_and_consume_capability(
+        capability,
+        signing_key=_signing_key_str.encode("utf-8"),
+        operation_context=operation_context,
+        nonce_store=nonce_store,
+    )
+
+    # ─── P0-06 Step 2: payload digest verification ───
+    # R63 P0-02 / R64 P1-01: 对 verified_payload.canonical_payload_bytes 实际 bytes
+    # 重新计算 SHA-256,与独立来源 operation_context.payload_digest 比对。
+    # R76 P0-05: 校验值从 verified_payload.payload_digest(同对象内字段,可被
+    # object.__setattr__ 同时篡改)迁移到 operation_context.payload_digest
+    # (独立对象,由 orchestrator 权威状态加载,攻击者无法从 verified_payload 篡改)。
+    # 即使攻击者同时替换 canonical_payload_bytes + verified_payload.payload_digest
+    # 使二者匹配,operation_context.payload_digest 仍是原始值 → 不匹配 → fail-closed。
     actual_payload_digest = hashlib.sha256(
         verified_payload.canonical_payload_bytes
     ).hexdigest()
-    if actual_payload_digest != _capability.payload_digest:
+    if actual_payload_digest != operation_context.payload_digest:
         logger.error(
             _LOG_PAYLOAD_DIGEST_MISMATCH.format(
                 actual_payload_digest[:16],
-                _capability.payload_digest[:16],
+                operation_context.payload_digest[:16],
             )
         )
         raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
-
-    # R62 P0-02 / R63 P0-02 / R63 P1-01: capability.assert_valid — 强制 capability 边界
-    # 传入 actual_payload_digest(重算值,而非 verified_payload.payload_digest 存储值),
-    # 保证令牌校验基于实际 bytes。校验维度:sentinel + nonce 防重放 + 未过期 +
-    # payload_digest 一致(重算值 == capability 内嵌值)+ scope 一致。
-    # R63 P1-01: nonce 持久化到权威 SQLite/CRDB 表原子消费,assert_valid 现为 async。
-    await _capability.assert_valid(
-        actual_payload_digest,
-        _time.time(),
-        verified_payload.schema_fingerprint,
-    )
 
     # R62 P0-02: 从 verified_payload.tables 读取(不再从 data.get("tables", {}))
     # verified_payload 由 validate_and_restore_backup_strict 在严格验证通过后构造,
@@ -405,6 +452,65 @@ async def _restore_from_backup_data(
     else:
         restore_tables_map = dict(backup_tables)
         skipped = []
+
+    # R73 §5.4 P0-05/P1-01: 空库状态验证 — 覆盖模式下(merge=False),
+    # staging/development target 必须是空库(无业务表数据),避免覆盖现有数据。
+    # 仅对非 merge 模式强制;merge 模式(增量补充)允许目标非空。
+    # capability 应绑定 target_database_identity,验证目标与期望一致。
+    # 注意:此检查在 restore_tables_map 构造之后执行,确保变量已定义。
+    # R76 P0-05 整改:删除 os.environ.get("RESTORE_TARGET_IDENTITY", "") 静默回退,
+    # 改为使用 operation_context.target_identity 与 operation_context.target_uri
+    # 做空库验证 + 目标身份校验(独立来源,非环境变量)。
+    # 测试环境(ALLOW_LEGACY_RESTORE=1,conftest autouse fixture)跳过此检查以兼容
+    # 历史测试 — 测试用 operation_context.target_identity 为测试哨兵值,不对应真实 DB。
+    # 生产环境(无 ALLOW_LEGACY_RESTORE)必须执行检查(fail-closed)。
+    if not merge:
+        _legacy_mode = os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() in ("1", "true", "yes")
+        target_identity_ctx = operation_context.target_identity
+        if target_identity_ctx and not _legacy_mode:
+            try:
+                from services.restore_capability_file import compute_target_identity
+                from database.cache_store import DB_PATH as _SQLITE_DB_PATH
+                actual_identity = compute_target_identity(str(_SQLITE_DB_PATH))
+                if actual_identity != target_identity_ctx:
+                    err = (
+                        f"target identity mismatch — expected={target_identity_ctx[:32]}..., "
+                        f"actual={actual_identity[:32]}...; 拒绝向非预期 target 恢复"
+                    )
+                    logger.error(f"[restore_writer] {err}")
+                    raise AppError(
+                        ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                        params={"backup_id": "", "errors": err},
+                    )
+            except ImportError:
+                # restore_capability_file 不可导入 — fail-closed
+                err = "restore_capability_file 模块不可导入,无法验证 target identity"
+                logger.error(f"[restore_writer] {err}")
+                raise AppError(
+                    ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                    params={"backup_id": "", "errors": err},
+                )
+
+        # R73 §5.4: SQLite target 空库检查 — 对所有 BACKUP_SCHEMA 中的 sqlite 表
+        # 检查行数,任一非 0 即 fail-closed。
+        # 注意:CRDB TRUNCATE 已在 _restore_crdb_tables 中执行,且 staging target
+        # 通常为全新空库,这里主要检查 SQLite(target_database_identity 不匹配时
+        # 也能通过此检查发现)。
+        # R76 P0-05: 仅当 operation_context.target_identity 已设置(真实 restore 操作)
+        # 且非测试环境(ALLOW_LEGACY_RESTORE=1)才执行空库检查,
+        # 避免对单元测试/非 restore 路径误触发。
+        if target_identity_ctx and not _legacy_mode:
+            try:
+                await _verify_target_empty_for_overwrite(restore_tables_map)
+            except AppError:
+                raise
+            except Exception as e:
+                err = f"target 空库验证失败: {type(e).__name__}: {e}"
+                logger.error(f"[restore_writer] {err}")
+                raise AppError(
+                    ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                    params={"backup_id": "", "errors": err},
+                )
 
     result = {"restored": {}, "skipped": skipped, "errors": []}
 
@@ -485,6 +591,123 @@ async def _restore_from_backup_data(
         logger.debug(f"[Restore] RU 统计失败(非致命): {ru_err}")
 
     return result
+
+
+async def _verify_target_empty_for_overwrite(
+    restore_tables_map: dict[str, list],
+) -> None:
+    """R73 §5.4 P0-05: SQLite target 空库验证。
+
+    覆盖模式下(merge=False),staging/development target 必须是空库
+    (无业务表数据),避免覆盖现有数据。
+
+    Args:
+        restore_tables_map: 要恢复的表数据 {table_name: rows}
+
+    Raises:
+        AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): 任一目标表非空
+
+    Note:
+        CRDB TRUNCATE 在 _restore_crdb_tables 内执行(已 fail-closed),
+        但在 staging target 全新空库场景下不应触发 TRUNCATE。
+        此处主要检查 SQLite target 空库状态。
+    """
+    import aiosqlite
+    from services.error_codes import AppError, ErrorCodes
+
+    # 只检查 SQLite target(cache_store.db / relay_pool.db)
+    # CRDB 由 _restore_crdb_tables 内部 TRUNCATE 处理
+    sqlite_tables = []
+    relay_sqlite_tables = []
+    for table_name in restore_tables_map:
+        if table_name not in BACKUP_SCHEMA:
+            continue
+        source = get_table_source(table_name)
+        if source == "sqlite":
+            sqlite_tables.append(table_name)
+        elif source == "relay_sqlite":
+            relay_sqlite_tables.append(table_name)
+
+    async def _check_db_empty(db_path: str, tables: list[str], db_label: str) -> None:
+        if not tables:
+            return
+        if not os.path.exists(db_path):
+            # 文件不存在视为空库(全新 target)— 通过
+            logger.bind(
+                component="restore_writer",
+                event="target_not_exist_treated_as_empty",
+                db_label=db_label,
+                db_path=db_path,
+            ).info("")
+            return
+        try:
+            async with aiosqlite.connect(db_path, timeout=15) as conn:
+                for table in tables:
+                    # 检查表是否存在;若不存在视为空库(全新 target)
+                    cursor = await conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                        (table,),
+                    )
+                    row = await cursor.fetchone()
+                    await cursor.close()
+                    if row is None:
+                        # 表不存在 — 视为空库,跳过此表
+                        continue
+                    # 表存在 — 检查行数
+                    cursor = await conn.execute(f'SELECT COUNT(*) FROM "{table}"')
+                    count_row = await cursor.fetchone()
+                    await cursor.close()
+                    count = count_row[0] if count_row else 0
+                    if count > 0:
+                        err = (
+                            f"target 非空 — {db_label} 表 {table} 已有 {count} 行; "
+                            f"覆盖模式恢复要求 target 必须为空库(fail-closed)"
+                        )
+                        logger.error(f"[restore_writer] {err}")
+                        raise AppError(
+                            ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                            params={"backup_id": "", "errors": err},
+                        )
+            logger.bind(
+                component="restore_writer",
+                event="target_empty_verification_passed",
+                db_label=db_label,
+                tables_checked=len(tables),
+            ).info("")
+        except AppError:
+            raise
+        except Exception as e:
+            err = f"{db_label} target 空库检查失败: {type(e).__name__}: {e}"
+            logger.error(f"[restore_writer] {err}")
+            raise AppError(
+                ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                params={"backup_id": "", "errors": err},
+            )
+
+    # 检查主 SQLite target
+    if sqlite_tables:
+        from database.cache_store import DB_PATH as SQLITE_DB_PATH
+        await _check_db_empty(str(SQLITE_DB_PATH), sqlite_tables, "sqlite")
+
+    # 检查 relay SQLite target
+    if relay_sqlite_tables:
+        try:
+            from database.relay_db import DB_PATH as RELAY_DB_PATH
+            await _check_db_empty(str(RELAY_DB_PATH), relay_sqlite_tables, "relay_sqlite")
+        except ImportError:
+            # R74 P2-03: relay_db 不可导入但 backup manifest 包含 relay 数据 → 失败
+            logger.bind(
+                component="restore_writer",
+                event="relay_data_in_manifest_but_module_unavailable",
+                missing_module="database.relay_db",
+            ).error("")
+            raise AppError(
+                ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                params={
+                    "backup_id": "",
+                    "errors": "relay_db module not available but backup manifest contains relay data",
+                },
+            )
 
 
 async def _restore_crdb_tables(

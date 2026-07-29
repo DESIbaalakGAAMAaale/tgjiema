@@ -56,6 +56,8 @@ if _APP_ROOT not in sys.path:
 #   up / idx / dsp / mon / admin / admin_bot / db_writer / crdb_sync
 #   / db_backup / migration / prometheus_exporter
 # 额外允许:r40_scheduler(已在 run_all.py BOT_RUNNERS 中)
+# R76 O6: 新增 provider_sim(secretless CI Provider 协议模拟器,
+# 仅在 APP_ENV=test/development 下允许,生产环境禁止启动)
 SERVICE_ROLE_RUN_ALL = frozenset({
     "up", "idx", "dsp", "mon", "admin", "admin_bot",
     "db_writer", "crdb_sync", "db_backup", "r40_scheduler",
@@ -65,6 +67,9 @@ SERVICE_ROLE_RUN_ALL = frozenset({
 SERVICE_ROLE_MODULE = {
     "migration": "services.migration_runner",
     "prometheus_exporter": "services.prometheus_exporter",
+    # R76 O6: secretless CI Provider 模拟器入口
+    # 仅在 SECRETLESS_MODE=true 下可用,生产环境 fail-closed
+    "provider_sim": "tests.support.provider_simulator",
 }
 
 # 全部允许的 SERVICE_ROLE
@@ -151,16 +156,24 @@ def _assert_no_test_escape_hatches() -> None:
 
 
 def _run_readiness_gate(app_env: str, service_role: str) -> None:
-    """R71 Wave 1: 启动前 readiness gate — production/staging 强制。
+    """R71 Wave 1 / R73 §5.10 (P1-06): 启动前 readiness gate — production/staging 强制。
 
-    在 exec 业务进程前,调用 services.health.check_readiness(role) 执行
-    真实依赖检查。任一 critical 检查失败 → sys.exit(4)(fail-closed)。
+    在 exec 业务进程前,依次执行两道门禁:
+      1. **startup gate**(R73 §5.10):调用 services.health.check_startup(role)
+         验证必需初始化步骤(settings_loaded / bot_token_configured /
+         redis_connected / writer_group_created / schema_migrated 等)已完成。
+         未通过 → sys.exit(4)(fail-closed)。
+      2. **readiness gate**(R71 Wave 1):调用 services.health.check_readiness(role)
+         执行真实依赖检查。任一 critical 检查失败 → sys.exit(4)(fail-closed)。
+
+    R73 §5.10 整改:启动前必须先验证 startup,再验证 readiness。
+    顺序:startup gate → readiness gate(前者失败立即 exit,不进入 readiness)。
 
     production/staging 强制执行;development/test 跳过(本地开发兼容)。
 
     退出码:
         0: 通过(隐式,函数返回)
-        4: 未通过(critical 检查失败或 readiness 模块崩溃)
+        4: 未通过(startup gate 失败 / readiness gate 失败 / 模块崩溃)
 
     Args:
         app_env: 已解析的 APP_ENV(production/staging/development/test)
@@ -174,7 +187,7 @@ def _run_readiness_gate(app_env: str, service_role: str) -> None:
         return
 
     _log_info(
-        f"R71 Wave 1: 启动前 readiness gate(app_env={app_env}, "
+        f"R71 Wave 1 / R73 §5.10: 启动前 gate(app_env={app_env}, "
         f"role={service_role})"
     )
 
@@ -182,12 +195,14 @@ def _run_readiness_gate(app_env: str, service_role: str) -> None:
     # services.health 中的 _check_admin_web_port() 和 _check_metrics_endpoint()
     # 检测此环境变量,在启动前跳过自身端口检查(进程还没 exec,端口自然没监听 —
     # 先有鸡还是先有蛋)。运行时 healthcheck 不设置此变量,正常执行端口检查。
+    # R73 §5.10: 同样用于 check_startup 的 in_startup_grace 判定(启动宽限期内
+    # started=True,避免容器编排 kill 尚未完成启动的进程)。
     os.environ["READINESS_GATE_PRE_LAUNCH"] = "1"
 
     try:
         import asyncio
 
-        from services.health import check_readiness
+        from services.health import check_readiness, check_startup
     except ImportError as e:
         # readiness 模块本身不可用 → fail-closed
         # 不允许跳过(pretend healthy),否则容器会以不健康状态启动
@@ -196,6 +211,38 @@ def _run_readiness_gate(app_env: str, service_role: str) -> None:
         )
         sys.exit(4)
 
+    # ── R73 §5.10: 第一道门禁 — startup gate ──
+    # 验证必需初始化步骤已完成(settings_loaded / bot_token_configured 等)。
+    # 启动宽限期内(READINESS_GATE_PRE_LAUNCH=1)check_startup 总是 started=True,
+    # 此门禁等价于"声明所有启动步骤的预期状态",便于审计 pending_initializations。
+    # 运行态下若 startup_completed_at 未记录或有 pending 步骤,直接 fail-closed。
+    try:
+        startup_result = check_startup(service_role)
+    except Exception as e:
+        # check_startup 崩溃 → fail-closed(不允许跳过)
+        _log_error(
+            f"R73 §5.10 startup gate 崩溃: {type(e).__name__}: {e}"
+        )
+        sys.exit(4)
+
+    if not startup_result["started"]:
+        # startup 未完成 → fail-closed(R73 §5.10 / §5.17)
+        # 记录详细 pending_initializations,便于运维排查
+        pending = startup_result.get("pending_initializations", [])
+        _log_error(
+            f"R73 §5.10 startup gate 未通过: role={startup_result.get('role')} "
+            f"started=False, pending_initializations={pending}"
+        )
+        sys.exit(4)
+
+    _log_info(
+        f"R73 §5.10 startup gate 通过: role={startup_result['role']} "
+        f"in_startup_grace={startup_result['in_startup_grace']} "
+        f"pending={startup_result.get('pending_initializations', [])}"
+    )
+
+    # ── R73 §5.10: 第二道门禁 — readiness gate ──
+    # 验证依赖健康(critical 检查全通过)。
     try:
         result = asyncio.run(check_readiness(service_role))
     except Exception as e:
@@ -269,6 +316,17 @@ def main() -> None:
         _log_error(
             f"未知 SERVICE_ROLE: {service_role!r}。"
             f"允许值: {sorted(ALLOWED_SERVICE_ROLES)}"
+        )
+        sys.exit(1)
+
+    # 3b. R76 O6: provider_sim 角色边界守卫 — 仅允许在 test/development 下启动
+    # 生产环境(staging/production)严禁启动 secretless Provider 模拟器,
+    # 否则会导致生产流量被拦截到测试服务,造成数据泄露/服务不可用。
+    if service_role == "provider_sim" and app_env in ("production", "staging"):
+        _log_error(
+            f"R76 O6 边界守卫: SERVICE_ROLE=provider_sim 仅允许在 "
+            f"APP_ENV=test/development 下启动,当前 APP_ENV={app_env!r}。"
+            "生产环境严禁运行 secretless Provider 模拟器。"
         )
         sys.exit(1)
 

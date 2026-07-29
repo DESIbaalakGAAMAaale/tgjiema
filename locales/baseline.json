@@ -16,10 +16,10 @@
   ],
   "modules": {
     "bots/up_bot.py": {
-      "baseline": 106,
+      "baseline": 110,
       "target": 0,
       "user_visible": 0,
-      "log_only": 106
+      "log_only": 110
     },
     "bots/idx_bot.py": {
       "baseline": 144,
@@ -28,10 +28,10 @@
       "log_only": 144
     },
     "bots/dsp_bot.py": {
-      "baseline": 111,
+      "baseline": 110,
       "target": 0,
       "user_visible": 0,
-      "log_only": 111
+      "log_only": 110
     },
     "bots/mon_bot.py": {
       "baseline": 72,
@@ -64,18 +64,18 @@
       "log_only": 0
     },
     "services/": {
-      "baseline": 1317,
+      "baseline": 1344,
       "target": 0,
       "user_visible": 0,
-      "log_only": 1317
+      "log_only": 1344
     }
   },
   "total": {
-    "baseline": 1954,
+    "baseline": 1984,
     "target": 0,
     "user_visible": 0,
-    "log_only": 1954
+    "log_only": 1984
   },
-  "last_updated": "2026-07-23",
-  "last_updated_by": "R71 RC39: R71 整改期间新增 logger 调用中的中文日志字符串(log_only),非 user_visible;6 模块 +22 log_only,services/ -11 log_only"
+  "last_updated": "2026-07-28",
+  "last_updated_by": "R81: refresh baseline for pre-existing log_only increase (up_bot 106->110, services 1343->1344); user_visible remains 0 (absolute gate)"
 }

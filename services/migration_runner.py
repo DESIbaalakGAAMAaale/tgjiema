@@ -125,7 +125,9 @@ async def run_migration(
     # 1. 创建独立连接池(migration 专用,不污染 runtime pool)
     client = CockroachDBClient()
     client.configure(_settings.COCKROACHDB_URL)
-    await client.connect_runtime_only()
+    # R80 P0-01: migration 容器 read_only=true,/app/data 不可写;
+    # DDL 迁移不需要 SQLite 缓存层 — 跳过 CacheStore 初始化。
+    await client.connect_runtime_only(skip_cache_store=True)
 
     try:
         # 2. 检查 DDL 版本(优先 SQLite,CRDB 兜底)
@@ -640,40 +642,76 @@ async def _check_ddl_version(client) -> tuple[bool, str]:
 async def main() -> int:
     """CLI 入口: python -m services.migration_runner
 
+    R80 P0-01 整改: 结构化退出码与 /tmp/migration-result.json。
+
+    退出码协议(R80 §10.3):
+        0  — 迁移成功
+        20 — MIGRATION_CONNECT_FAILED: DSN 解析/连接失败
+        21 — MIGRATION_DDL_FAILED: DDL/MIGRATION 语句执行失败(非白名单)
+        22 — MIGRATION_SCHEMA_DRIFT: schema 验证失败(漂移)
+        23 — MIGRATION_VERSION_WRITE_FAILED: ddl_version 写入失败
+        24 — MIGRATION_RESULT_WRITE_FAILED: result.json 写入失败
+
+    /tmp/migration-result.json 在所有退出路径生成,包含:
+        schema_version, status, error_code, exit_code, ddl_version,
+        before_version, statements_total, statements_succeeded,
+        statements_failed, first_failed_statement_sha256, sqlstate,
+        schema_fingerprint
+
+    禁止泄露完整 DSN、密码或完整 SQL 到 artifact。
+
     R71 RC21/RC22 fix: 显式清理 + 强制退出。
-
-    R71 RC21 引入 close_db() 关闭 cache_store SQLite + _client asyncpg pool,
-    但 asyncio.run() 的清理阶段(loop.shutdown_default_executor)仍可能因
-    pending background tasks(asyncpg heartbeat / async generator / aiosqlite
-    thread 残留)卡住,导致 migration 进程永不退出 → docker compose up 等待
-    service_completed_successfully 永不满足 → start_core 600s 超时。
-
-    R71 RC22 fix: 在 main 协程内部完成 close_db 后直接 os._exit() 绕过
-    asyncio.run() 的清理阶段。所有显式资源(cache_store, _client,
-    migration 本地 client)已通过 close_db / run_migration finally 块
-    关闭,跳过 asyncio 清理是安全的(它只是 cancel pending tasks +
-    shutdown executor,不会丢失已写数据)。
-
-    R72 P0-08 / RC57 fix: 在 CRDB 迁移前先应用 SQLite 版本化迁移
-    (database.migrate.apply_migrations)。compose-runtime-e2e 的 migration_check
-    阶段通过 `python -m database.migrate --check --json` 验证 SQLite schema 状态。
-    旧实现 migration 服务仅应用 CRDB DDL_STATEMENTS,未应用 SQLite migrations,
-    导致 migration_check 始终发现 pending migration → compose-runtime-e2e 失败。
-    现版本:SQLite migrations 在 migration 服务中先于 CRDB 应用,确保 db_writer
-    启动前 SQLite schema 已就绪。
+    R72 P0-08 / RC57 fix: SQLite 版本化迁移先于 CRDB。
 
     Returns:
-        0 — 迁移成功(无严重错误)
-        1 — 迁移完成但有严重错误(DDL 已执行但 schema 验证/版本写入失败)
-        2 — 迁移过程抛出异常
+        结构化退出码(见上)
     """
-    from database.session import close_db
+    from database.session import close_db, DDL_VERSION
+    import hashlib
+    import json as _json
+
     exit_code = 0
+    error_code: str | None = None
+    result_data: dict[str, Any] = {
+        "schema_version": "migration-result/v1",
+        "status": "success",
+        "error_code": None,
+        "exit_code": 0,
+        "ddl_version": DDL_VERSION,
+        "before_version": "unknown",
+        "statements_total": 0,
+        "statements_succeeded": 0,
+        "statements_failed": 0,
+        "first_failed_statement_sha256": None,
+        "sqlstate": None,
+        "schema_fingerprint": None,
+    }
+
+    def _write_migration_result() -> None:
+        """写入 /tmp/migration-result.json(所有退出路径必须调用)。"""
+        # R81 §10.9: 移除不必要的 nonlocal — result_data 是 dict,
+        # 只做 key 赋值(mutation)不做 rebinding,nonlocal 无意义且触发 F824。
+        result_data["exit_code"] = exit_code
+        result_data["error_code"] = error_code
+        result_data["status"] = "success" if exit_code == 0 else "failure"
+        try:
+            import pathlib
+            pathlib.Path("/tmp/migration-result.json").write_text(
+                _json.dumps(result_data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception as write_err:
+            # R80: result 写入失败是严重问题,但如果 exit_code 已经是非零
+            # 则保留原始错误码;只有原本成功时才改为 24
+            logger.error(f"[migration_runner] /tmp/migration-result.json 写入失败: {write_err}")
+            if exit_code == 0:
+                nonlocal_hack[0] = 24
+                result_data["error_code"] = "MIGRATION_RESULT_WRITE_FAILED"
+
+    # 使用列表包装以允许嵌套函数修改
+    nonlocal_hack = [0]
 
     # R72 P0-08 / RC57 fix: 先应用 SQLite 版本化迁移(本地 schema)
-    # 必须在 CRDB 迁移前完成,因为 CRDB 迁移可能因网络/凭证问题失败,
-    # 但 SQLite 迁移是本地的,不依赖外部服务。确保 SQLite schema 就绪后
-    # migration_check --check 才能通过(无 pending migration)。
     try:
         from database.migrate import apply_migrations
         from database.cache_store import get_cache_store
@@ -699,9 +737,6 @@ async def main() -> int:
                     failed=sqlite_result['failed'],
                 )
             )
-            # SQLite 迁移失败是严重问题(可能影响业务逻辑),但不应阻断 CRDB 迁移
-            # (两者独立)。记录错误但不 raise,让 CRDB 迁移继续执行。
-            # SQLite 迁移失败会在后续 migration_check --check 中被检测到。
     except Exception as sqlite_err:
         logger.exception(
             _i18n_t(
@@ -712,21 +747,73 @@ async def main() -> int:
 
     try:
         result = await run_migration()
+        # 从 run_migration 结果填充 result_data
+        result_data["before_version"] = result.get("before_version", "unknown")
+        result_data["statements_total"] = result.get("statements_total", 0)
+        result_data["statements_succeeded"] = (
+            result.get("statements_total", 0) - result.get("statements_failed", 0)
+        )
+        result_data["statements_failed"] = result.get("statements_failed", 0)
+
         if result["errors"]:
             logger.error(
                 f"[migration_runner] 迁移完成但有 {len(result['errors'])} 严重错误: "
                 f"{result['errors'][:3]}"
             )
-            exit_code = 1
+            # R80: 区分错误类型
+            first_err = result["errors"][0] if result["errors"] else ""
+            if "schema 验证失败" in first_err or "schema 漂移" in first_err:
+                exit_code = 22
+                error_code = "MIGRATION_SCHEMA_DRIFT"
+            elif "写入 ddl_version 失败" in first_err:
+                exit_code = 23
+                error_code = "MIGRATION_VERSION_WRITE_FAILED"
+            else:
+                exit_code = 21
+                error_code = "MIGRATION_DDL_FAILED"
         else:
             logger.info("[migration_runner] 迁移成功完成,退出码 0")
     except Exception as e:
-        logger.exception(f"[migration_runner] 迁移失败: {e}")
-        exit_code = 2
+        err_str = str(e).lower()
+        # R80: 结构化异常分类
+        if any(kw in err_str for kw in (
+            "connection refused", "connect", "could not connect",
+            "name or service not known", "no route to host",
+            "timeout", "ssl", "authentication", "password",
+            "asyncpg.cannotconnectnowerror", "oserror",
+            "connectionreseterror", "broken pipe",
+        )):
+            exit_code = 20
+            error_code = "MIGRATION_CONNECT_FAILED"
+        elif any(kw in err_str for kw in (
+            "schema 验证失败", "schema 漂移", "drift",
+            "information_schema",
+        )):
+            exit_code = 22
+            error_code = "MIGRATION_SCHEMA_DRIFT"
+        else:
+            exit_code = 21
+            error_code = "MIGRATION_DDL_FAILED"
+
+        # 尝试提取 SQLSTATE(如有)
+        sqlstate = getattr(e, "sqlstate", None)
+        if sqlstate:
+            result_data["sqlstate"] = sqlstate
+
+        # 不泄露 DSN/密码,只记录异常类型和截断消息
+        safe_msg = str(e)[:200]
+        # 移除可能的 DSN 片段
+        import re as _re
+        safe_msg = _re.sub(r"postgresql://[^@]+@", "postgresql://***@", safe_msg)
+        safe_msg = _re.sub(r"password=[^\s&]+", "password=***", safe_msg)
+        logger.exception(f"[migration_runner] 迁移失败 ({error_code}): {safe_msg}")
+
+    # 写入 /tmp/migration-result.json(所有路径)
+    _write_migration_result()
+    if nonlocal_hack[0] != 0:
+        exit_code = nonlocal_hack[0]
 
     # R71 RC21/RC22: 显式关闭全局资源,然后绕过 asyncio 清理直接退出。
-    # 所有显式资源(cache_store aiosqlite + _client asyncpg pool + migration
-    # 本地 client)在这里关闭;asyncio 内部 pending tasks 不持有外部资源。
     try:
         await close_db()
         logger.info("[migration_runner] close_db 完成,所有显式资源已释放")
@@ -737,9 +824,8 @@ async def main() -> int:
 
     # 给 loguru sink 一点时间 flush 到 stdout/stderr
     await asyncio.sleep(0.3)
-    logger.info(f"[migration_runner] 准备强制退出(exit_code={exit_code})")
+    logger.info(f"[migration_runner] 准备强制退出(exit_code={exit_code}, error_code={error_code})")
     # R71 RC22: 显式 flush stdout/stderr + loguru sinks,然后 os._exit
-    # 绕过 asyncio.run() 的 shutdown_default_executor(可能卡住)
     import sys as _sys
     import os as _os
     try:

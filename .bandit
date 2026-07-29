@@ -1,0 +1,28 @@
+# R76 §10.M: bandit 安全扫描配置
+#
+# 本文件配置 bandit 扫描器,排除已知安全无害的 false positive。
+# CI: bandit -r . -x ./tests,./docs,./.git,./venv,./.venv -ll -c .bandit
+#
+# 跳过的规则(均有审计理由):
+#   B608 (hardcoded_sql_expressions): 81 处 false positive
+#     所有 SQL 均使用参数化查询($1/? 占位符),f-string 仅用于内部常量
+#     (表名/列名),不来自用户输入。CockroachDB/SQLite 均不支持表名参数化。
+#
+#   B104 (hardcoded_bind_all_interfaces): 11 处
+#     服务在 Docker 容器内运行,必须绑定 0.0.0.0 才能被宿主机访问。
+#     容器网络隔离提供安全边界,bind 地址不构成安全风险。
+#
+#   B310 (urllib_urlopen): 4 处
+#     用于访问受信任的内部端点(健康检查/回调),URL 不来自用户输入。
+#
+#   B108 (hardcoded_tmp_directory): 2 处
+#     /tmp 路径用于 Docker 容器内的临时文件,容器隔离提供安全边界。
+
+skips:
+  - B608  # hardcoded_sql_expressions — 参数化查询 f-string 误报(表名/列名为内部常量)
+  - B104  # hardcoded_bind_all_interfaces — Docker 容器内必须 bind 0.0.0.0
+  - B310  # urllib_urlopen — 访问受信任内部端点,URL 不来自用户输入
+  - B108  # hardcoded_tmp_directory — Docker 容器内 /tmp 临时文件
+
+# 不排除任何目录(由 CI -x 参数控制)
+exclude_dirs: []

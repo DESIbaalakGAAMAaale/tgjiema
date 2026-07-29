@@ -64,10 +64,11 @@ SELF_EXCLUDED_CONTEXTS: frozenset[str] = frozenset({
 
 # R65 P1-12: 非阻断 context 列表 — 这些 job 在 workflow 中运行,但**设计上**
 # 不作为 BP required context(失败不阻断 PR 合并)。
-# - production-evidence: 证据生成 job(R64 P1-12: 完整证据是 release 晋级条件,
-#   而非 PR 条件;PR 上仅做快速 dry-run 验证,失败不阻断 PR 合并)。
+# - generate-evidence-envelope: 证据信封生成 job(R73 §5.7: 完整证据是 release
+#   晋级条件,而非 PR 条件;PR 上仅做 dry-run 验证,失败不阻断 PR 合并。
+#   R64 P1-12 旧名 production-evidence;R73 P1-05 强类型分级后改名)。
 NON_BLOCKING_CONTEXTS: frozenset[str] = frozenset({
-    "production-evidence",
+    "generate-evidence-envelope",
 })
 
 
@@ -334,11 +335,16 @@ def parse_workflow_file(
             jobs.append(str(job_id))
             continue
         expanded = _expand_matrix_jobs(str(job_id), job_def)
-        # R71 P1-02 模式 (include_all_jobs=True): 跳过所有过滤,
-        # 所有 workflow job 都加入 jobs 集合(用于校验 BP 包含全部
-        # release-gates.yml job 名)。
+        # R71 P1-02 模式 (include_all_jobs=True): 跳过 push-only/tag-only/
+        # self-excluded 过滤,所有 workflow job 都加入 jobs 集合(用于校验
+        # BP 包含全部 release-gates.yml job 名)。
+        # 但 R73 §5.7 non-blocking 仍需跟踪(不作为 missing_in_bp 失败),
+        # 因为 non-blocking job 设计上不应作为 BP required context(失败
+        # 不阻断 PR 合并,如 generate-evidence-envelope)。
         if include_all_jobs:
             jobs.extend(expanded)
+            if any(e in NON_BLOCKING_CONTEXTS for e in expanded):
+                non_blocking_jobs.extend(expanded)
             continue
         # R72: workflow 级排除 — workflow 不在 PR 产生 check-run 时,
         # 所有 job 排除(不作为 BP required context,否则 PR 永久阻塞)。
@@ -455,10 +461,18 @@ def compare_contexts(
     规则:
       - 每个 BP context 归一化后必须能在 workflow jobs 中找到(否则为孤儿)
       - 每个 workflow job 必须在 BP contexts 中出现(直接或带前缀)(否则为缺失)
+      - R73 §5.7: non-blocking job(如 generate-evidence-envelope)设计上
+        不作为 BP required context,即使 with --include-all-jobs 也不算缺失。
+        non-blocking job 失败不阻断 PR 合并,故不应在 BP required_status_checks。
     """
     all_workflow_prefixes: set[str] = set()
     for wf in workflows:
         all_workflow_prefixes.update(wf.known_workflow_prefixes)
+
+    # 收集 non-blocking job 名集合(用于跳过 missing_in_bp 检查)
+    non_blocking_jobs: set[str] = set()
+    for wf in workflows:
+        non_blocking_jobs.update(wf.non_blocking_jobs)
 
     expected_jobs = collect_expected_jobs(workflows)
 
@@ -483,9 +497,12 @@ def compare_contexts(
             report.orphan_in_bp.add(ctx_raw)
 
     # 缺失: workflow 中有,BP 中无(无论以哪种格式)
+    # R73 §5.7: non-blocking job 跳过(设计上不在 BP required_status_checks)
     for job in expected_jobs:
         if job in normalized_bp:
             continue  # 直接匹配
+        if job in non_blocking_jobs:
+            continue  # R73 §5.7: non-blocking job 不要求在 BP
         # 检查是否有 BP context 归一化后等于此 job(已在上面覆盖)
         # 若仍找不到,标记为缺失
         report.missing_in_bp.add(job)

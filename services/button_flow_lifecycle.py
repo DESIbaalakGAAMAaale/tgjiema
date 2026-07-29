@@ -170,7 +170,8 @@ class InMemoryButtonTokenStore:
             expires_dt = _dt.datetime.fromisoformat(
                 token.expires_at.replace("Z", "")
             )
-        except Exception:
+        except (ValueError, TypeError):
+            # fromisoformat 解析失败或 token.expires_at 类型异常 → 视为无效 token
             return None
         if expires_dt <= _dt.datetime.utcnow():
             return None

@@ -13,7 +13,7 @@ R71 Wave 3 整改(P0-08, Commit 3):
        - 迁移版本兼容性检查(current vs backup schema_version)
        - 恢复目标隔离验证(--target-db staging)
        - 应用启动/读写验证(python -m services.health + INSERT/SELECT/DELETE)
-       - 恢复环境合成交易(synthetic_transaction.run_full_transaction)
+       - 恢复环境合成交易(synthetic_transaction.run_dbwriter_component_test)
        - 切换/回滚证据(RestoreOrchestrator import check + 结构化 JSON)
        - 机器可读恢复证据(增强 IntegrityEvidence dataclass)
        - 新增 CLI 子命令 full-check

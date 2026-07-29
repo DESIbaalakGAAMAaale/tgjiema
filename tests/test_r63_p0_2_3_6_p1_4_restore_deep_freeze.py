@@ -103,6 +103,8 @@ def _ensure_restore_module_importable():
         mock_r2_obj._access_key = ""
         mock_r2._r2 = mock_r2_obj
         mock_r2.configure_r2_dynamic = AsyncMock()
+        # R76 O7: configure_r2_dynamic 已重构为 configure_storage_from_settings
+        mock_r2.configure_storage_from_settings = AsyncMock()
         sys.modules["storage.r2"] = mock_r2
         setattr(sys.modules.get("storage", types.ModuleType("storage")), "r2", mock_r2)
 
@@ -139,6 +141,37 @@ def _build_valid_capability(
         payload_digest=payload_digest,
         ttl_seconds=ttl_seconds,
     )
+
+
+def _build_operation_context(
+    *,
+    payload_digest: str,
+    backup_id: str = "backup_test_001",
+    schema_fingerprint: str = "R63-P0-02-test-fingerprint",
+    nonce: str = "test_nonce_0123456789abcdef0123456789abcdef",
+):
+    """R76 P0-05: 构造合法的 RestoreOperationContext(独立 expected 值来源)。
+
+    writer 用 operation_context.payload_digest 校验 actual bytes digest,
+    替代旧 R63 的 verified_payload.payload_digest(同对象内字段,可被同时篡改)。
+    """
+    from services.restore_operation_context import RestoreOperationContext
+    ctx = RestoreOperationContext(
+        operation_id="op_test_001",
+        backup_id=backup_id,
+        source_sha="test_source_sha",
+        run_id=0,
+        run_attempt=1,
+        audience="test_audience",
+        target_identity=schema_fingerprint,
+        target_uri="sqlite:///tmp/test_restore.db",
+        manifest_digest="a" * 64,
+        payload_digest=payload_digest,
+        allowed_action="restore_to_blank_target",
+        nonce=nonce,
+    )
+    ctx.validate()  # fail-closed
+    return ctx
 
 
 def _build_verified_payload(
@@ -469,6 +502,18 @@ class TestWriterDigestRecompute:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         # 2. 模拟攻击:用 object.__setattr__ 绕过 frozen,替换 canonical_payload_bytes
         # R64 P1-01: payload/tables 是 property(从 canonical_payload_bytes 解码),
         # 攻击向量改为替换 canonical_payload_bytes(底层 bytes 字段)。
@@ -489,7 +534,9 @@ class TestWriterDigestRecompute:
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
-                    _capability=cap,
+                    capability=cap,
+                    operation_context=operation_context,
+                    nonce_store=MagicMock(),
                     tables=None,
                     merge=False,
                 )
@@ -533,6 +580,18 @@ class TestWriterDigestRecompute:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         # 攻击者同时替换 canonical_payload_bytes 与 payload_digest(试图绕过)
         # R64 P1-01: 攻击向量改为替换 canonical_payload_bytes(底层 bytes 字段)
         tampered_payload = {"tables": {"evil": True}}
@@ -551,7 +610,9 @@ class TestWriterDigestRecompute:
             with pytest.raises(AppError):
                 await _restore_from_backup_data(
                     verified_payload,
-                    _capability=cap,
+                    capability=cap,
+                    operation_context=operation_context,
+                    nonce_store=MagicMock(),
                     tables=None,
                     merge=False,
                 )
@@ -574,12 +635,26 @@ class TestWriterDigestRecompute:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         # mock 恢复函数(返回空结果,无错误)
         with patch("services.restore_writer._restore_crdb_tables", AsyncMock()), \
              patch("services.restore_writer._restore_sqlite_tables_to_db", AsyncMock()):
             result = await _restore_from_backup_data(
                 verified_payload,
-                _capability=cap,
+                capability=cap,
+                operation_context=operation_context,
+                nonce_store=MagicMock(),
                 tables=None,
                 merge=False,
             )
@@ -616,13 +691,27 @@ class TestWriterDigestRecompute:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         # writer 应重算 digest(与 capability 一致)→ 成功
         # (不使用 verified_payload.payload_digest = "0"*64)
         with patch("services.restore_writer._restore_crdb_tables", AsyncMock()), \
              patch("services.restore_writer._restore_sqlite_tables_to_db", AsyncMock()):
             result = await _restore_from_backup_data(
                 verified_payload,
-                _capability=cap,
+                capability=cap,
+                operation_context=operation_context,
+                nonce_store=MagicMock(),
                 tables=None,
                 merge=False,
             )
@@ -660,6 +749,18 @@ class TestFailClosedOnDataSourceFailure:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         # mock _restore_crdb_tables 抛出异常(模拟 CRDB 写入失败)
         async def _failing_crdb(tables_data, merge, result):
             result["errors"].append("CRDB connection refused")
@@ -670,7 +771,9 @@ class TestFailClosedOnDataSourceFailure:
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
-                    _capability=cap,
+                    capability=cap,
+                    operation_context=operation_context,
+                    nonce_store=MagicMock(),
                     tables=None,
                     merge=False,
                 )
@@ -707,6 +810,18 @@ class TestFailClosedOnDataSourceFailure:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         # mock get_table_source 返回 "sqlite" → 走 SQLite 恢复路径
         monkeypatch.setattr(
             "services.restore_writer.get_table_source",
@@ -727,7 +842,9 @@ class TestFailClosedOnDataSourceFailure:
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
-                    _capability=cap,
+                    capability=cap,
+                    operation_context=operation_context,
+                    nonce_store=MagicMock(),
                     tables=None,
                     merge=False,
                 )
@@ -763,6 +880,18 @@ class TestFailClosedOnDataSourceFailure:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         monkeypatch.setattr(
             "services.restore_writer.get_table_source",
             lambda t: "relay_sqlite" if t == "relay_table" else "crdb",
@@ -780,7 +909,9 @@ class TestFailClosedOnDataSourceFailure:
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
-                    _capability=cap,
+                    capability=cap,
+                    operation_context=operation_context,
+                    nonce_store=MagicMock(),
                     tables=None,
                     merge=False,
                 )
@@ -806,6 +937,18 @@ class TestFailClosedOnDataSourceFailure:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         # mock _restore_crdb_tables 只 append error,不 raise
         # (模拟旧代码行为 — 新代码会 raise,但 belt-and-suspenders 仍需兜底)
         async def _crdb_with_error(tables_data, merge, result):
@@ -816,7 +959,9 @@ class TestFailClosedOnDataSourceFailure:
             with pytest.raises(AppError) as exc_info:
                 await _restore_from_backup_data(
                     verified_payload,
-                    _capability=cap,
+                    capability=cap,
+                    operation_context=operation_context,
+                    nonce_store=MagicMock(),
                     tables=None,
                     merge=False,
                 )
@@ -841,6 +986,18 @@ class TestFailClosedOnDataSourceFailure:
             schema_fingerprint="R63-P0-02-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R63-P0-02-test-fingerprint",
+        )
+
         async def _failing_crdb(tables_data, merge, result):
             result["errors"].append("fail")
             raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
@@ -851,7 +1008,9 @@ class TestFailClosedOnDataSourceFailure:
             with pytest.raises(AppError):
                 returned = await _restore_from_backup_data(
                     verified_payload,
-                    _capability=cap,
+                    capability=cap,
+                    operation_context=operation_context,
+                    nonce_store=MagicMock(),
                     tables=None,
                     merge=False,
                 )

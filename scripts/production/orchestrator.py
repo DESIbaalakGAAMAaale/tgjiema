@@ -78,8 +78,8 @@ def _get_commit_sha() -> str:
             sha = result.stdout.strip()
             if sha and len(sha) >= 7:
                 return sha
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _get_commit_sha: git rev-parse failed: {_e}", file=sys.stderr)
     import os
     return os.environ.get("GITHUB_SHA", "unknown")
 

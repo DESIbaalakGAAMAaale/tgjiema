@@ -1601,14 +1601,30 @@ async def health_check(response: Response):
     角色级 fail-closed readiness 检查,取代旧版 prometheus_exporter.check_readiness
     (旧版仅检查 SQLite 文件存在性,不区分角色,不验证 Redis/CRDB 真实连接)。
 
+    R73 §5.10 (P1-06): 同时调用 check_liveness("admin") 验证进程存活,
+    liveness 失败(死锁)→ 立即 503(应触发容器重启);readiness 失败 → 503。
+
     新版行为:
+      - 调用 services.health.check_liveness("admin") 验证进程存活
       - 调用 services.health.check_readiness("admin") 执行全部检查项
-      - 任一 critical 检查失败 → 503 Service Unavailable
+      - liveness fail 或任一 critical 检查失败 → 503 Service Unavailable
       - 响应包含 HealthResult.to_dict() 结构(healthy/role/checks/timestamp/version)
       - 保留 Bot 心跳字段(向后兼容运维监控)
 
     任一关键检查失败时返回 503 Service Unavailable。
     """
+    # R73 §5.10: 先调用 check_liveness 验证进程存活(同步,极快)
+    liveness_alive = True
+    liveness_info: dict = {}
+    try:
+        from services.health import check_liveness as _check_live
+        liveness_info = _check_live("admin")
+        liveness_alive = bool(liveness_info.get("alive", False))
+    except Exception as e:
+        # liveness 模块崩溃 → 视为不存活(fail-closed)
+        liveness_alive = False
+        liveness_info = {"alive": False, "error": str(e)}
+
     # R71 Wave 1: 使用 services.health.check_readiness 获取角色化依赖状态
     try:
         from services.health import check_readiness as _check_dep
@@ -1658,10 +1674,20 @@ async def health_check(response: Response):
         # 整体就绪 = Bot 心跳 + 角色化依赖检查(critical 全通过)
         ready = bots_healthy and deps_ready
 
+    # R73 §5.10: liveness fail → 立即 503(应触发容器重启)
+    if not liveness_alive:
+        ready = False
+
     if not ready:
         response.status_code = 503
     return {
         "status": "ok" if ready else "degraded",
+        "liveness": {
+            "alive": liveness_alive,
+            "role": liveness_info.get("role", "admin"),
+            "pid": liveness_info.get("pid"),
+            "checked_at": liveness_info.get("checked_at"),
+        },
         "bots": bot_status,
         "dependencies": {
             "checks": dep_checks,

@@ -227,6 +227,8 @@ def _build_engine_with_kek(monkeypatch, kek_b64: str | None = None):
     monkeypatch.setenv("BACKUP_KEK", kek_b64)
     monkeypatch.delenv("BACKUP_KEK_PREVIOUS", raising=False)
     monkeypatch.delenv("BACKUP_KEK_PREVIOUS_FILE", raising=False)
+    # R76 P0-06: 注入临时签名密钥(production restore 路径需要 issue_capability)
+    monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "a" * 64)
 
     fake_storage = _FakeR2Storage()
     fake_cache = _FakeCacheStore()
@@ -676,6 +678,10 @@ class TestP13ProductionRestoreApproval:
             "services.restore_writer._restore_from_backup_data",
             _fake_restore_from_backup_data,
         )
+
+        # R76 P0-06: mock get_cache_store 返回 None,跳过 nonce 持久化
+        # (单元测试无初始化 DB store,nonce 消费由集成测试覆盖)
+        monkeypatch.setattr("database.cache_store.get_cache_store", lambda: None)
 
         # R52 P0-5: mock claim_execution_approved 通过(CAS approved→executing)
         # _FakeDB 不支持 cursor.rowcount 和 execute_fetchall,需 mock CAS 绕过

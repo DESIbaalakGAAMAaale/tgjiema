@@ -65,6 +65,9 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+# R73 §5.7: 确保 scripts 包可导入(lazy import scripts.evidence_envelope)
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # R67 P0-04: 3 次验证必须全部首次成功
 REQUIRED_VERIFICATIONS = 3
@@ -872,25 +875,181 @@ def run_3x_verification(
     return summary
 
 
+def verify_evidence_envelopes(
+    artifact_paths: list[Path],
+    *,
+    expected_gate_level: str = "rc",
+) -> dict[str, Any]:
+    """R73 §5.7: 验证 evidence artifacts 的 typed envelope.
+
+    对每个 artifact 文件:
+        1. 加载文件并检查是否含 envelope(schema_version 字段)
+        2. validate_envelope() 校验结构/类型/枚举
+        3. 对 RC artifacts:拒绝 gate_level="development" 或
+           promotion_eligible=false 的 envelope
+        4. is_promotion_eligible() 提供权威审计(不信任 envelope 自身
+           的 promotion_eligible 字段,defense in depth)
+
+    Args:
+        artifact_paths: evidence artifact 文件路径列表。
+        expected_gate_level: 期望的 gate_level(默认 "rc")。
+            当期望 "rc" 时,development-level envelope 被拒绝。
+
+    Returns:
+        结构化 verdict:
+        {
+            "passed": bool,
+            "checked": int,
+            "passed_count": int,
+            "failed_count": int,
+            "rejected_count": int,
+            "expected_gate_level": str,
+            "results": [per-artifact verdict, ...],
+        }
+    """
+    # lazy import: 避免在模块加载阶段触发 scripts 包初始化
+    from scripts.evidence_envelope import (
+        is_promotion_eligible,
+        load_envelope,
+        validate_envelope,
+    )
+
+    results: list[dict[str, Any]] = []
+    passed_count = 0
+    failed_count = 0
+    rejected_count = 0
+
+    for path in artifact_paths:
+        verdict: dict[str, Any] = {
+            "path": str(path),
+            "exists": Path(path).exists(),
+            "has_envelope": False,
+            "valid": False,
+            "errors": [],
+            "gate_level": None,
+            "promotion_eligible": None,
+            "audit_promotion_eligible": False,
+            "rejected": False,
+            "rejected_reason": None,
+        }
+
+        if not verdict["exists"]:
+            verdict["errors"].append(f"file not found: {path}")
+            failed_count += 1
+            results.append(verdict)
+            continue
+
+        try:
+            envelope = load_envelope(path)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            verdict["errors"].append(f"failed to load envelope: {e}")
+            failed_count += 1
+            results.append(verdict)
+            continue
+
+        # R73 §5.7: envelope 必须含 schema_version 字段才算 typed envelope
+        verdict["has_envelope"] = (
+            isinstance(envelope, dict)
+            and "schema_version" in envelope
+        )
+        if not verdict["has_envelope"]:
+            verdict["errors"].append(
+                "missing schema_version field (not a typed envelope)"
+            )
+            failed_count += 1
+            results.append(verdict)
+            continue
+
+        valid, errors = validate_envelope(envelope)
+        verdict["valid"] = valid
+        verdict["errors"].extend(errors)
+
+        if not valid:
+            failed_count += 1
+            results.append(verdict)
+            continue
+
+        verdict["gate_level"] = envelope["gate_level"]
+        verdict["promotion_eligible"] = envelope["promotion_eligible"]
+        verdict["audit_promotion_eligible"] = is_promotion_eligible(envelope)
+
+        # R73 §5.7: reject development-level artifacts when expecting rc
+        if expected_gate_level == "rc":
+            if envelope["gate_level"] == "development":
+                verdict["rejected"] = True
+                verdict["rejected_reason"] = (
+                    "gate_level=development is not promotable "
+                    "(R73 §5.7: master runs never produce promotable evidence)"
+                )
+                rejected_count += 1
+            elif not envelope["promotion_eligible"]:
+                verdict["rejected"] = True
+                verdict["rejected_reason"] = (
+                    "promotion_eligible=false (R73 §5.7: failed/cancelled/"
+                    "skipped runs never produce promotable evidence)"
+                )
+                rejected_count += 1
+            elif not verdict["audit_promotion_eligible"]:
+                verdict["rejected"] = True
+                verdict["rejected_reason"] = (
+                    "audit is_promotion_eligible=false (missing digest or "
+                    "inconsistent fields — defense in depth)"
+                )
+                rejected_count += 1
+            else:
+                passed_count += 1
+        else:
+            # 非 RC 期望:仅检查 gate_level 匹配
+            if envelope["gate_level"] != expected_gate_level:
+                verdict["rejected"] = True
+                verdict["rejected_reason"] = (
+                    f"gate_level={envelope['gate_level']!r} != "
+                    f"expected {expected_gate_level!r}"
+                )
+                rejected_count += 1
+            else:
+                passed_count += 1
+
+        results.append(verdict)
+
+    overall_passed = (
+        failed_count == 0
+        and rejected_count == 0
+        and passed_count == len(artifact_paths)
+        and passed_count > 0
+    )
+
+    return {
+        "passed": overall_passed,
+        "checked": len(artifact_paths),
+        "passed_count": passed_count,
+        "failed_count": failed_count,
+        "rejected_count": rejected_count,
+        "expected_gate_level": expected_gate_level,
+        "results": results,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="R67 P0-04: 3x verify-only verification for same image digest",
     )
     parser.add_argument(
-        "--image-name", required=True,
-        help="OCI image name (e.g. ghcr.io/maxiuquan/tgjiema)",
+        "--image-name", default=None,
+        help="OCI image name (e.g. ghcr.io/maxiuquan/tgjiema) — "
+             "required for 3x mode, optional for --verify-envelopes mode",
     )
     parser.add_argument(
-        "--image-digest", required=True,
-        help="OCI image digest (sha256:...)",
+        "--image-digest", default=None,
+        help="OCI image digest (sha256:...) — required for 3x mode",
     )
     parser.add_argument(
-        "--expected-commit", required=True,
-        help="Expected git commit SHA",
+        "--expected-commit", default=None,
+        help="Expected git commit SHA — required for 3x mode",
     )
     parser.add_argument(
-        "--expected-tree", required=True,
-        help="Expected git tree SHA",
+        "--expected-tree", default=None,
+        help="Expected git tree SHA — required for 3x mode",
     )
     parser.add_argument(
         "--expected-catalog-digest", default=None,
@@ -916,17 +1075,78 @@ def parse_args() -> argparse.Namespace:
         "--json", action="store_true",
         help="Output summary as JSON to stdout",
     )
+    # R73 §5.7: typed evidence envelope 验证模式(envelope-only)
+    parser.add_argument(
+        "--verify-envelopes", nargs="+", default=None, metavar="PATH",
+        help="R73 §5.7: verify typed evidence envelopes in given artifact "
+             "files (envelope-only mode; skips 3x image verification)",
+    )
+    parser.add_argument(
+        "--expected-gate-level", default="rc",
+        choices=["development", "rc", "production"],
+        help="Expected gate_level for envelope verification (default: rc)",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    output_dir = Path(args.output_dir) if args.output_dir else None
 
     # R71 RC54: 当 --json 模式启用时,人类可读输出发送到 stderr,
     # stdout 仅输出纯 JSON,使 shell 重定向(`--json > result.json`)
     # 捕获合法 JSON 文件,避免下游 `json.load()` 因混合内容失败。
     human_stream = sys.stderr if args.json else sys.stdout
+
+    # R73 §5.7: typed evidence envelope 验证模式(envelope-only)
+    if args.verify_envelopes:
+        verdict = verify_evidence_envelopes(
+            [Path(p) for p in args.verify_envelopes],
+            expected_gate_level=args.expected_gate_level,
+        )
+        if args.json:
+            print(json.dumps(verdict, ensure_ascii=False, indent=2))
+        else:
+            print(f"R73 §5.7: typed evidence envelope verification", file=human_stream)
+            print(f"  expected_gate_level: {verdict['expected_gate_level']}", file=human_stream)
+            print(f"  checked: {verdict['checked']}", file=human_stream)
+            print(f"  passed: {verdict['passed_count']}", file=human_stream)
+            print(f"  failed: {verdict['failed_count']}", file=human_stream)
+            print(f"  rejected: {verdict['rejected_count']}", file=human_stream)
+            for r in verdict["results"]:
+                if r["rejected"]:
+                    status = "REJECT"
+                elif r["valid"]:
+                    status = "PASS"
+                else:
+                    status = "FAIL"
+                reason = r.get("rejected_reason") or (
+                    "; ".join(r["errors"]) if r["errors"] else "OK"
+                )
+                print(f"  [{status}] {r['path']}: {reason[:120]}", file=human_stream)
+        return 0 if verdict["passed"] else 1
+
+    # 3x 模式:校验必填参数(envelope 模式不需要这些)
+    missing: list[str] = []
+    if not args.image_name:
+        missing.append("--image-name")
+    if not args.image_digest:
+        missing.append("--image-digest")
+    if not args.expected_commit:
+        missing.append("--expected-commit")
+    if not args.expected_tree:
+        missing.append("--expected-tree")
+    if missing:
+        print(
+            f"ERROR: 3x mode missing required args: {' '.join(missing)}",
+            file=human_stream,
+        )
+        print(
+            "Use --verify-envelopes for envelope-only mode.",
+            file=human_stream,
+        )
+        return 2
+
+    output_dir = Path(args.output_dir) if args.output_dir else None
 
     summary = run_3x_verification(
         image_name=args.image_name,

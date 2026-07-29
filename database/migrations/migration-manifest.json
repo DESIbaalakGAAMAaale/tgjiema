@@ -121,6 +121,20 @@
       "schema_fingerprint_before": "DDL_VERSION=11",
       "schema_fingerprint_after": "DDL_VERSION=11",
       "r67_p1_06_note": "R67 P1-06: 新增 restore_switch_intents (prepare intent + fencing token + 状态机) + restore_backend_receipts (每个 backend 的 switch receipt, 独立提交) 两表 — 解决 SQLite rename / CRDB routing switch / DB UoW 不是同一原子事务导致的崩溃恢复状态丢失问题. reconciler 启动时扫描未完成 intent, 根据 backend receipts 决策完成/回滚. DDL_VERSION unchanged (新表,无 schema 版本 bump)."
+    },
+    {
+      "order": 9,
+      "migration_id": "009",
+      "version": "009_restore_capability_nonce_binding.sql",
+      "filename": "009_restore_capability_nonce_binding.sql",
+      "sha256": "f1a9f9d9bc17bfbda133205b144d77913f387e4e44d08902035f1449106865a0",
+      "predecessor": "008",
+      "predecessor_filename": "008_restore_switch_reconciler.sql",
+      "ddl_version": 11,
+      "rollback_strategy": "DROP INDEX idx_restore_nonces_nonce_digest, idx_restore_nonces_capability_digest, idx_restore_nonces_target_identity, idx_restore_nonces_run_id; ALTER TABLE restore_capability_nonces DROP COLUMN nonce_digest, DROP COLUMN capability_digest, DROP COLUMN target_identity, DROP COLUMN run_id, DROP COLUMN run_attempt (reverts R76 P0-06 independent binding fields; capability nonce verification reverts to R74 P1-04 file-based CAS)",
+      "schema_fingerprint_before": "DDL_VERSION=11",
+      "schema_fingerprint_after": "DDL_VERSION=11",
+      "r76_p0_06_note": "R76 P0-06 / O8: 为 restore_capability_nonces 表增加 nonce_digest / capability_digest / target_identity / run_id / run_attempt 五个独立绑定字段 + UNIQUE INDEX on nonce_digest. 替代 R74 P1-04 /tmp/restore_nonce_store 文件 CAS,使用数据库 UNIQUE 约束实现跨进程/重启/容器重建的防重放. 配合 RestoreOperationContext(orchestrator 权威状态加载)实现 expected 值独立来源,消除 capability 自比较 (R76 P0-05). DDL_VERSION unchanged (列扩展,无 schema 版本 bump)."
     }
   ]
 }

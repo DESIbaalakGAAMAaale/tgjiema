@@ -119,10 +119,12 @@ def test_service_role_enum_completeness(entry_module):
 def test_service_role_no_unknown(entry_module):
     """ALLOWED_SERVICE_ROLES 不应包含未声明的角色。"""
     # 显式列出所有允许的角色
+    # R76 O6: 新增 provider_sim(secretless CI Provider 协议模拟器,
+    # 仅在 test/development 环境下启动,生产环境禁止)
     expected = {
         "up", "idx", "dsp", "mon", "admin", "admin_bot",
         "db_writer", "crdb_sync", "db_backup", "migration",
-        "prometheus_exporter", "r40_scheduler",
+        "prometheus_exporter", "r40_scheduler", "provider_sim",
     }
     assert entry_module.ALLOWED_SERVICE_ROLES == expected
 

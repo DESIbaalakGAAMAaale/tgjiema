@@ -150,6 +150,80 @@ services:
           cpus: '1.0'
           memory: 512M
 
+  # ── CockroachDB (基础设施,CI/开发环境单节点) ──
+  # R75 P0-03: 使用真实 CockroachDB 替代 PostgreSQL — CockroachDB 有不同的事务语义、
+  # UPSERT、TTL、retry 行为,不能用 PostgreSQL 作为 RC 验证的替代品。
+  # R75 P0-02: 不使用 GitHub Actions service container(不支持 entrypoint/command 参数),
+  # 改为在 compose 中定义 CRDB 服务,与应用容器在同一网络。
+  # R75 P2-02: 固定 image digest(multi-arch manifest list digest),
+  # 禁止使用浮动 tag(如 latest-v24.1)或仅版本 tag。
+  # Digest 来源: docker hub manifest list (amd64+arm64)
+  # 生产环境使用外部 CockroachDB Cloud/独立部署,不使用此服务。
+  cockroachdb:
+    image: cockroachdb/cockroach:v24.1.0@sha256:cc4e3ee67104d6f6434c81b555d69d4eb319f8aa0c5495931ffbe9273adfc4b5
+    container_name: tgjiema-cockroachdb
+    restart: unless-stopped
+    # R79 §10.1: 修复 R78 引入的 listen/sql 端口冲突 —
+    #   listen-addr=127.0.0.1:26257 与 sql-addr=0.0.0.0:26257 同端口,
+    #   0.0.0.0 包含 127.0.0.1,SQL bind 与 RPC bind 冲突(EADDRINUSE),
+    #   容器启动即崩溃,表现为 "CockroachDB (production) did not become healthy"。
+    # v24.1 insecure 约束: listen-addr 必须 loopback:26257;
+    # SQL listener 因此移到显式 --sql-addr=0.0.0.0:26258(与 secretless 拓扑一致)。
+    command: start-single-node --insecure --listen-addr=localhost:26257 --sql-addr=0.0.0.0:26258 --http-addr=0.0.0.0:8080 --store=type=mem,size=256MiB
+    ports:
+      # R79 §10.1: SQL 端口随 --sql-addr 迁移到 26258(loopback 绑定不变)
+      - "127.0.0.1:26258:26258"
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - cockroach_data:/cockroach/cockroach-data
+    # R79 §10.1 / P0-02 / P1-06: 生产 CRDB 文件系统显式契约(最小写集合)
+    # R78 曾以 "v24.1 需要可写 workdir/FIFO" 为由删除 read_only,扩大为整个
+    # rootfs 可写 — 属于生产安全回退。此处恢复 read_only 并以最小写集合替代:
+    #   只读: 整个 rootfs(含 /cockroach 下二进制与全部系统目录)
+    #   tmpfs: /tmp            — Go runtime / CLI 临时文件
+    #          /cockroach/run  — 工作目录(server_fifo 等运行时文件;working_dir)
+    #          /cockroach/certs — v24.1 启动时创建/探测的证书目录(insecure 也会 touch)
+    #   named volume: /cockroach/cockroach-data — 数据目录(唯一持久化写路径)
+    # 契约由 scripts/verify_crdb_filesystem_contract.py(docker diff 断言)与
+    # tests/test_crdb_filesystem_contract.py(写负测/持久化/tmpfs 易失)回归验证。
+    read_only: true
+    working_dir: /cockroach/run
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
+      - /cockroach/run:rw,nosuid,nodev,size=16m
+      - /cockroach/certs:rw,nosuid,nodev,noexec,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # R76 10.E: healthcheck 增加 tgjiema 数据库存在和版本查询
+    # 1. SELECT 1 — 基础连通性
+    # 2. CREATE DATABASE IF NOT EXISTS tgjiema — 幂等确保 tgjiema 数据库存在
+    #    (避免 chicken-and-egg: migration 依赖 cockroachdb healthy 才能启动,
+    #     但 migration 创建 tgjiema 数据库;此处 healthcheck 幂等创建,
+    #     让 depends_on.cockroachdb.condition: service_healthy 可用)
+    # 3. SELECT version() — CockroachDB 版本可读(cluster identity)
+    healthcheck:
+      # R79 §10.1: SQL listener 已迁移到显式 26258,healthcheck 必须连接
+      # SQL 端口而非 RPC listen 端口 26257(显式 --sql-addr 后 26257 不再讲 pgwire)。
+      test:
+        - CMD-SHELL
+        - >-
+          cockroach sql --insecure --host=localhost:26258
+          -e 'SELECT 1 AS ping'
+          -e 'CREATE DATABASE IF NOT EXISTS tgjiema'
+          -e 'SELECT version() AS crdb_version'
+          || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+
   # ── migration (oneshot,DDL 执行) ──
   # R37 P0-1: migration 必须加载 .env.secrets.migration(含 COCKROACHDB_URL)
   migration:
@@ -170,6 +244,9 @@ services:
     # 映射到 `python -m services.migration_runner`
     depends_on:
       redis:
+        condition: service_healthy
+      # R76 10.E: migration 必须等待 cockroachdb healthy(含 tgjiema 数据库幂等创建)
+      cockroachdb:
         condition: service_healthy
     # R37 P2-4: 镜像安全加固
     read_only: true
@@ -251,6 +328,9 @@ services:
     depends_on:
       migration:
         condition: service_completed_successfully
+      # R76 10.E: crdb_sync 显式依赖 cockroachdb healthy
+      cockroachdb:
+        condition: service_healthy
     # R37 P2-4: 镜像安全加固
     read_only: true
     tmpfs:
@@ -644,3 +724,4 @@ services:
 
 volumes:
   redis_data:
+  cockroach_data:

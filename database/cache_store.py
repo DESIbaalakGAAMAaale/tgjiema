@@ -1977,7 +1977,12 @@ class CacheStore:
                 reserved_at     TEXT,
                 reserved_by     TEXT,
                 failed_at       TEXT,
-                failure_reason  TEXT
+                failure_reason  TEXT,
+                nonce_digest       TEXT,
+                capability_digest  TEXT,
+                target_identity    TEXT,
+                run_id             INTEGER,
+                run_attempt        INTEGER
             )"""
         )
         # R64 P1-02: 旧表(无 operation_id/status/reserved_at/reserved_by/failed_at/failure_reason 列)
@@ -1996,7 +2001,17 @@ class CacheStore:
                 "failed_at": "TEXT",
                 "failure_reason": "TEXT",
             }
-            for col_name, col_type in _new_cols.items():
+            # R76 P0-06 / O8: 009 migration 新增的 5 个独立绑定字段
+            # (nonce_digest / capability_digest / target_identity / run_id / run_attempt)
+            # 此处与 009 migration 同步,确保新库 / 旧库均含这些字段。
+            _r76_new_cols = {
+                "nonce_digest": "TEXT",
+                "capability_digest": "TEXT",
+                "target_identity": "TEXT",
+                "run_id": "INTEGER",
+                "run_attempt": "INTEGER",
+            }
+            for col_name, col_type in {**_new_cols, **_r76_new_cols}.items():
                 if col_name not in existing_cols:
                     await self._db.execute(
                         f"ALTER TABLE restore_capability_nonces "
@@ -2022,6 +2037,33 @@ class CacheStore:
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_restore_nonces_status "
             "ON restore_capability_nonces(status)"
+        )
+        # R76 P0-06 / O8: 009 migration 核心约束 — UNIQUE INDEX on nonce_digest
+        # 数据库层 CAS:同一 nonce_digest 只能被预留一次(替代 /tmp 文件 CAS)。
+        # Partial UNIQUE INDEX(WHERE nonce_digest IS NOT NULL)允许老记录(NULL)共存。
+        await self._db.execute(
+            "DROP INDEX IF EXISTS idx_restore_nonces_nonce_digest"
+        )
+        await self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_restore_nonces_nonce_digest "
+            "ON restore_capability_nonces(nonce_digest) "
+            "WHERE nonce_digest IS NOT NULL"
+        )
+        # R76 P0-06: capability_digest / target_identity / run_id 索引(支持审计查询)
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_restore_nonces_capability_digest "
+            "ON restore_capability_nonces(capability_digest) "
+            "WHERE capability_digest IS NOT NULL"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_restore_nonces_target_identity "
+            "ON restore_capability_nonces(target_identity) "
+            "WHERE target_identity IS NOT NULL"
+        )
+        await self._db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_restore_nonces_run_id "
+            "ON restore_capability_nonces(run_id) "
+            "WHERE run_id IS NOT NULL"
         )
 
         await self._db.commit()
@@ -8810,10 +8852,18 @@ class CacheStore:
         return None
 
     async def _ensure_crdb_restore_capability_nonces(self) -> None:
-        """R64 P1-02: 在 CRDB 创建 security schema + security.restore_capability_nonces 表。
+        """R64 P1-02 / R76 P0-06: 在 CRDB 创建 security schema + security.restore_capability_nonces 表。
 
         幂等:CREATE SCHEMA IF NOT EXISTS + CREATE TABLE IF NOT EXISTS + CREATE INDEX IF NOT EXISTS。
         在首次 reserve/consume/fail 调用时按需触发(惰性创建)。
+
+        R76 P0-06 / O8: 表结构同步 009 migration — 增加 5 个独立绑定字段:
+            - nonce_digest       TEXT  — sha256(nonce),用于 UNIQUE INDEX 双重 CAS
+            - capability_digest  TEXT  — sha256(canonical_json(capability_without_signature))
+            - target_identity    TEXT  — 恢复目标数据库 identity hash(独立来源)
+            - run_id             INTEGER — GitHub Actions run ID(独立来源)
+            - run_attempt        INTEGER — GitHub Actions run attempt(独立来源)
+        并创建 UNIQUE INDEX idx_restore_nonces_nonce_digest(替代 /tmp 文件 CAS)。
         """
         client = self._get_crdb_client()
         if client is None:
@@ -8835,8 +8885,19 @@ class CacheStore:
                         consumed_at      TEXT,
                         failed_at        TEXT,
                         consumed_by      TEXT,
-                        failure_reason   TEXT
+                        failure_reason   TEXT,
+                        nonce_digest       TEXT,
+                        capability_digest  TEXT,
+                        target_identity    TEXT,
+                        run_id             INTEGER,
+                        run_attempt        INTEGER
                     )"""
+                )
+                # R76 P0-06: UNIQUE INDEX on nonce_digest — 数据库层 CAS 核心约束
+                await conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_restore_nonces_nonce_digest "
+                    "ON security.restore_capability_nonces(nonce_digest) "
+                    "WHERE nonce_digest IS NOT NULL"
                 )
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_restore_nonces_op "
@@ -8845,6 +8906,21 @@ class CacheStore:
                 await conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_restore_nonces_backup_id_crdb "
                     "ON security.restore_capability_nonces(backup_id)"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_restore_nonces_capability_digest_crdb "
+                    "ON security.restore_capability_nonces(capability_digest) "
+                    "WHERE capability_digest IS NOT NULL"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_restore_nonces_target_identity_crdb "
+                    "ON security.restore_capability_nonces(target_identity) "
+                    "WHERE target_identity IS NOT NULL"
+                )
+                await conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_restore_nonces_run_id_crdb "
+                    "ON security.restore_capability_nonces(run_id) "
+                    "WHERE run_id IS NOT NULL"
                 )
         except Exception as e:
             logger.warning(
@@ -8860,18 +8936,29 @@ class CacheStore:
         manifest_sha256: str,
         payload_digest: str,
         reserved_by: str = "",
+        *,
+        nonce_digest: Optional[str] = None,
+        capability_digest: Optional[str] = None,
+        target_identity: Optional[str] = None,
+        run_id: Optional[int] = None,
+        run_attempt: Optional[int] = None,
     ) -> bool:
-        """R64 P1-02: 预留 nonce(INSERT status='reserved',CAS)。
+        """R64 P1-02 / R76 P0-06: 预留 nonce(INSERT status='reserved',CAS)。
 
-        nonce 状态机入口:NEW → reserved。PRIMARY KEY=nonce 实现原子 CAS:
+        nonce 状态机入口:NEW → reserved。PRIMARY KEY=nonce + UNIQUE(nonce_digest)
+        双重 CAS,同一 nonce 只能被预留一次:
             - rowcount == 1: 本调用方赢得竞态(nonce 之前不存在)
             - rowcount == 0: nonce 已存在(reserved/consumed/failed,重放攻击或竞态失败)
 
-        assert_valid 调用本方法(替代 R63 P1-01 的直接 consume),writer 在 restore
-        成功后 consume / 失败后 fail。failed 状态允许同 operation 用新 nonce 重试。
+        R76 P0-06 / O8: 新增 5 个独立绑定字段(009 migration):
+            - nonce_digest:       sha256(nonce),UNIQUE INDEX 键(替代明文 nonce 唯一键)
+            - capability_digest:  sha256(canonical_json(capability_without_signature))
+            - target_identity:    恢复目标数据库 identity hash(独立来源)
+            - run_id:             GitHub Actions run ID(独立来源)
+            - run_attempt:        GitHub Actions run attempt(独立来源)
 
-        优先用 CRDB security.restore_capability_nonces(跨实例共享);CRDB 不可用时
-        回退 SQLite(记录 warning,单实例部署仍可用)。
+        所有新字段为可选(默认 None),向后兼容老调用方;新调用方(RestoreNonceStore)
+        应传递全部 5 个字段以激活数据库层 CAS 防重放保护。
 
         Args:
             nonce: 令牌唯一随机数(_RestoreCapability 内嵌的 secrets.token_hex(16))
@@ -8880,6 +8967,11 @@ class CacheStore:
             manifest_sha256: manifest 原始 bytes SHA-256(令牌绑定,审计字段)
             payload_digest: payload canonical JSON SHA-256(令牌绑定,审计字段)
             reserved_by: 预留者标识(hostname:pid,审计字段)
+            nonce_digest: R76 P0-06 nonce 的 SHA-256 摘要(UNIQUE INDEX 键,可选)
+            capability_digest: R76 P0-06 capability canonical JSON 的 SHA-256(可选)
+            target_identity: R76 P0-06 恢复目标数据库 identity hash(可选)
+            run_id: R76 P0-06 GitHub Actions run ID(可选)
+            run_attempt: R76 P0-06 GitHub Actions run attempt(可选)
 
         Returns:
             True=预留成功(本调用方赢得竞态,nonce 之前不存在);
@@ -8894,15 +8986,21 @@ class CacheStore:
             try:
                 await self._ensure_crdb_restore_capability_nonces()
                 # INSERT ... ON CONFLICT DO NOTHING — CRDB CAS,PRIMARY KEY=nonce
+                # R76 P0-06: 同时写入 5 个独立绑定字段(nonce_digest 等)
                 result = await client.fetch(
                     """INSERT INTO security.restore_capability_nonces
                        (nonce, operation_id, backup_id, manifest_sha256,
-                        payload_digest, status, reserved_at, reserved_by)
-                       VALUES ($1, $2, $3, $4, $5, 'reserved', $6, $7)
+                        payload_digest, status, reserved_at, reserved_by,
+                        nonce_digest, capability_digest, target_identity,
+                        run_id, run_attempt)
+                       VALUES ($1, $2, $3, $4, $5, 'reserved', $6, $7,
+                               $8, $9, $10, $11, $12)
                        ON CONFLICT (nonce) DO NOTHING
                        RETURNING nonce""",
                     [nonce, operation_id, backup_id, manifest_sha256,
-                     payload_digest, _now, reserved_by or ""],
+                     payload_digest, _now, reserved_by or "",
+                     nonce_digest, capability_digest, target_identity,
+                     run_id, run_attempt],
                 )
                 # RETURNING 返回插入的行;ON CONFLICT 时返回空 → 预留失败
                 return len(result) == 1
@@ -8916,14 +9014,21 @@ class CacheStore:
         if not self._db:
             return False
         try:
+            # R76 P0-06: SQLite 同步写入 5 个独立绑定字段
+            # UNIQUE INDEX idx_restore_nonces_nonce_digest(nonce_digest) 提供第二重 CAS
             cursor = await self._db.execute(
                 """INSERT OR IGNORE INTO restore_capability_nonces
                    (nonce, backup_id, manifest_sha256, payload_digest,
                     consumed_at, consumed_by, operation_id, status,
-                    reserved_at, reserved_by)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?)""",
+                    reserved_at, reserved_by,
+                    nonce_digest, capability_digest, target_identity,
+                    run_id, run_attempt)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?,
+                           ?, ?, ?, ?, ?)""",
                 (nonce, backup_id, manifest_sha256, payload_digest,
-                 _now, reserved_by or "", operation_id, _now, reserved_by or ""),
+                 _now, reserved_by or "", operation_id, _now, reserved_by or "",
+                 nonce_digest, capability_digest, target_identity,
+                 run_id, run_attempt),
             )
             _affected = cursor.rowcount or 0
             await self._db.commit()
@@ -8941,13 +9046,24 @@ class CacheStore:
         manifest_sha256: str,
         payload_digest: str,
         consumed_by: str = "",
+        *,
+        nonce_digest: Optional[str] = None,
+        capability_digest: Optional[str] = None,
+        operation_id: Optional[str] = None,
     ) -> bool:
-        """R63 P1-01 / R64 P1-02: 原子消费 nonce(CAS UPDATE reserved→consumed)。
+        """R63 P1-01 / R64 P1-02 / R76 P0-06: 原子消费 nonce(CAS UPDATE reserved→consumed)。
 
         R64 P1-02: 从 R63 的 INSERT OR IGNORE CAS 改为 UPDATE CAS:
             - UPDATE ... SET status='consumed' WHERE nonce=? AND status='reserved'
             - rowcount == 1: 成功(reserved→consumed)
             - rowcount == 0: nonce 不在 reserved 状态(已 consumed/failed/不存在)
+
+        R76 P0-06 / O8: CAS WHERE 子句加入 capability_digest 比对(防换 capability 重放):
+            - 若调用方提供 capability_digest,WHERE 子句追加
+              ``AND capability_digest = ?``,确保消费的 capability 与预留时一致
+            - 攻击者即使获取同 nonce 但篡改其他字段的 capability,
+              因 capability_digest 不匹配,consume 失败
+            - 同理 operation_id 加入 WHERE 子句,精确匹配预留行
 
         assert_valid 现调用 reserve_capability_nonce(不再直接 consume),
         writer 在 restore 成功后调用本方法完成 reserved→consumed 转换。
@@ -8960,6 +9076,10 @@ class CacheStore:
             manifest_sha256: manifest 原始 bytes SHA-256(令牌绑定,审计字段)
             payload_digest: payload canonical JSON SHA-256(令牌绑定,审计字段)
             consumed_by: 消费者标识(hostname:pid,审计字段)
+            nonce_digest: R76 P0-06 nonce 的 SHA-256 摘要(可选,审计)
+            capability_digest: R76 P0-06 capability canonical JSON 的 SHA-256
+                              (可选;提供时加入 WHERE 子句,防换 capability 重放)
+            operation_id: R76 P0-06 关联恢复操作 ID(可选;提供时加入 WHERE 子句)
 
         Returns:
             True=消费成功(reserved→consumed CAS 成功);
@@ -8972,12 +9092,31 @@ class CacheStore:
         client = self._get_crdb_client()
         if client is not None:
             try:
+                # R76 P0-06: 动态构造 WHERE 子句,加入 capability_digest / operation_id 比对
+                where_clauses = ["nonce = $1", "status = 'reserved'"]
+                params: list = [nonce]
+                param_idx = 2
+                if capability_digest is not None:
+                    where_clauses.append(f"capability_digest = ${param_idx}")
+                    params.append(capability_digest)
+                    param_idx += 1
+                if operation_id is not None:
+                    where_clauses.append(f"operation_id = ${param_idx}")
+                    params.append(operation_id)
+                    param_idx += 1
+                # consumed_by / consumed_at 用 $N 占位符
+                set_clause = (
+                    f"status = 'consumed', consumed_at = ${param_idx}, "
+                    f"consumed_by = ${param_idx + 1}"
+                )
+                params.extend([_now, consumed_by or ""])
+                where_sql = " AND ".join(where_clauses)
                 result = await client.fetch(
-                    """UPDATE security.restore_capability_nonces
-                       SET status = 'consumed', consumed_at = $1, consumed_by = $2
-                       WHERE nonce = $3 AND status = 'reserved'
+                    f"""UPDATE security.restore_capability_nonces
+                       SET {set_clause}
+                       WHERE {where_sql}
                        RETURNING nonce""",
-                    [_now, consumed_by or "", nonce],
+                    params,
                 )
                 return len(result) == 1
             except Exception as e:
@@ -8990,11 +9129,22 @@ class CacheStore:
         if not self._db:
             return False
         try:
+            # R76 P0-06: 动态构造 WHERE 子句,加入 capability_digest / operation_id 比对
+            # 参数顺序:SET(consumed_at, consumed_by) + WHERE(nonce, [capability_digest], [operation_id])
+            where_clauses = ["nonce = ?", "status = 'reserved'"]
+            where_params: list = [nonce]
+            if capability_digest is not None:
+                where_clauses.append("capability_digest = ?")
+                where_params.append(capability_digest)
+            if operation_id is not None:
+                where_clauses.append("operation_id = ?")
+                where_params.append(operation_id)
+            where_sql = " AND ".join(where_clauses)
             cursor = await self._db.execute(
-                """UPDATE restore_capability_nonces
+                f"""UPDATE restore_capability_nonces
                    SET status = 'consumed', consumed_at = ?, consumed_by = ?
-                   WHERE nonce = ? AND status = 'reserved'""",
-                (_now, consumed_by or "", nonce),
+                   WHERE {where_sql}""",
+                [_now, consumed_by or ""] + where_params,
             )
             _affected = cursor.rowcount or 0
             await self._db.commit()
@@ -9009,8 +9159,11 @@ class CacheStore:
         self,
         nonce: str,
         failure_reason: str = "",
+        *,
+        operation_id: Optional[str] = None,
+        capability_digest: Optional[str] = None,
     ) -> bool:
-        """R64 P1-02: 标记 nonce 为 failed(CAS UPDATE reserved→failed)。
+        """R64 P1-02 / R76 P0-06: 标记 nonce 为 failed(CAS UPDATE reserved→failed)。
 
         nonce 状态机:reserved → failed。用于 restore 失败后释放 nonce
         (允许同 operation 用新 nonce 重试)。failed nonce 保留在 DB 中作为审计轨迹。
@@ -9019,9 +9172,17 @@ class CacheStore:
             - rowcount == 1: 成功(reserved→failed)
             - rowcount == 0: nonce 不在 reserved 状态(已 consumed/failed/不存在)
 
+        R76 P0-06 / O8: 新增 operation_id / capability_digest 参数(可选,仅用于审计):
+            - operation_id: 关联恢复操作 ID(审计追溯:哪次 operation 失败)
+            - capability_digest: 失败的 capability canonical JSON SHA-256(审计追溯)
+            - 这两个字段不加入 WHERE CAS 比对(老 reserved 行已绑定,
+              fail 仅做状态转换;审计字段供后续日志查询使用)
+
         Args:
             nonce: 令牌唯一随机数
             failure_reason: 失败原因(审计字段,如 'restore_crdb_error')
+            operation_id: R76 P0-06 关联恢复操作 ID(可选,审计)
+            capability_digest: R76 P0-06 capability canonical JSON 的 SHA-256(可选,审计)
 
         Returns:
             True=标记失败成功(reserved→failed CAS 成功);

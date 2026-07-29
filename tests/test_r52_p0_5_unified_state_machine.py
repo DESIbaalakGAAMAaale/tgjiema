@@ -858,6 +858,9 @@ class TestRestoreStateMachine:
         self, real_store_with_engine, monkeypatch,
     ):
         """status='approved' → 恢复成功 → status='executed'(经过 executing 中间态)。"""
+        # R76 P0-06: _restore_preverified_payload 内部签发 capability 需要
+        # RESTORE_CAPABILITY_SIGNING_KEY 环境变量
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
         store, engine, fake_storage, _ = real_store_with_engine
         _patch_backup_all_tables(monkeypatch)
         backup_id = await _make_backup(engine)
@@ -941,6 +944,9 @@ class TestRestoreStateMachine:
         self, real_store_with_engine, monkeypatch,
     ):
         """status='approved' → 恢复失败(异常) → status='failed'。"""
+        # R76 P0-06: _restore_preverified_payload 内部签发 capability 需要
+        # RESTORE_CAPABILITY_SIGNING_KEY 环境变量(本地测试用固定 key)
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
         store, engine, fake_storage, _ = real_store_with_engine
         _patch_backup_all_tables(monkeypatch)
         backup_id = await _make_backup(engine)

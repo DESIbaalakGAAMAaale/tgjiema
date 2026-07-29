@@ -381,47 +381,46 @@ class TestNonMasterNonTagPushNoSigning:
 
 
 # ════════════════════════════════════════════════════════════════
-# F. production-evidence / production-promotion-gate 依赖链完整性
+# F. generate-evidence-envelope / production-promotion-gate 依赖链完整性
 # ════════════════════════════════════════════════════════════════
 
 
 class TestProductionChainDependsOnSigning:
-    """R66 P1-01: production-evidence 与 production-promotion-gate 依赖链完整性。
+    """R66 P1-01: generate-evidence-envelope 与 production-promotion-gate 依赖链完整性。
 
     由于 sign-image/publish-attestation 现在在 RC tag push 上也运行,
-    production-evidence (needs: [docker-build, sbom, sign-image, publish-attestation])
+    generate-evidence-envelope (needs: [docker-build, sbom, sign-image, publish-attestation])
     将正确等待 RC tag push 上的签名完成。production-promotion-gate (production-v* tag)
-    通过 needs: [production-evidence, crdb-ru-72h-attribution-gate] 间接依赖签名。
-    """
+    通过 needs: [generate-evidence-envelope, crdb-ru-72h-attribution-gate] 间接依赖签名。"""
 
     def test_production_evidence_needs_sign_image(self, workflow_yaml):
-        """production-evidence 必须依赖 sign-image(确保签名完成后才生成证据)。"""
-        pe = workflow_yaml["jobs"].get("production-evidence", {})
+        """generate-evidence-envelope 必须依赖 sign-image(确保签名完成后才生成证据)。"""
+        pe = workflow_yaml["jobs"].get("generate-evidence-envelope", {})
         needs = pe.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
         assert "sign-image" in needs, (
-            "production-evidence 必须依赖 sign-image(签名完成才生成证据)"
+            "generate-evidence-envelope 必须依赖 sign-image(签名完成才生成证据)"
         )
 
     def test_production_evidence_needs_publish_attestation(self, workflow_yaml):
-        """production-evidence 必须依赖 publish-attestation。"""
-        pe = workflow_yaml["jobs"].get("production-evidence", {})
+        """generate-evidence-envelope 必须依赖 publish-attestation。"""
+        pe = workflow_yaml["jobs"].get("generate-evidence-envelope", {})
         needs = pe.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
         assert "publish-attestation" in needs, (
-            "production-evidence 必须依赖 publish-attestation"
+            "generate-evidence-envelope 必须依赖 publish-attestation"
         )
 
     def test_production_promotion_gate_needs_production_evidence(self, workflow_yaml):
-        """production-promotion-gate 必须依赖 production-evidence(间接依赖签名)。"""
+        """production-promotion-gate 必须依赖 generate-evidence-envelope(间接依赖签名)。"""
         ppg = workflow_yaml["jobs"].get("production-promotion-gate", {})
         needs = ppg.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
-        assert "production-evidence" in needs, (
-            "production-promotion-gate 必须依赖 production-evidence(间接依赖签名)"
+        assert "generate-evidence-envelope" in needs, (
+            "production-promotion-gate 必须依赖 generate-evidence-envelope(间接依赖签名)"
         )
 
     def test_production_promotion_gate_if_tag_only(self, workflow_yaml):

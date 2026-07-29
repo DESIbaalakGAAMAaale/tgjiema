@@ -17,9 +17,11 @@ P1 修复对应:
 - db_restore: mock 数据库连接,测试按 source 分组和列校验
 - 不依赖真实 CRDB / Redis,所有测试在本地可运行
 """
+import ast
 import hashlib
 import json
 import os
+import re
 import sys
 import types
 from datetime import datetime, timezone
@@ -289,6 +291,50 @@ class TestPerTableColumnValidation:
         assert "media_group_id" in manifest_cols
 
 
+def _crdb_columns_from_session_source() -> dict[str, set[str]]:
+    """静态提取 DDL + migration 列，不导入带运行时配置副作用的 session。"""
+    session_path = Path(__file__).parents[1] / "database" / "session.py"
+    module = ast.parse(session_path.read_text(encoding="utf-8"))
+    constants: dict[str, list[str]] = {}
+    for node in module.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [target.id for target in node.targets if isinstance(target, ast.Name)]
+        for name in names:
+            if name in {"DDL_STATEMENTS", "MIGRATION_STATEMENTS"}:
+                constants[name] = ast.literal_eval(node.value)
+
+    create_pattern = re.compile(
+        r"^CREATE TABLE IF NOT EXISTS\s+([a-z_][a-z0-9_]*)\s*\((.*)\)\s*$",
+        re.IGNORECASE | re.DOTALL,
+    )
+    alter_pattern = re.compile(
+        r"^ALTER TABLE IF EXISTS\s+([a-z_][a-z0-9_]*)\s+"
+        r"ADD COLUMN(?: IF NOT EXISTS)?\s+([a-z_][a-z0-9_]*)",
+        re.IGNORECASE,
+    )
+    columns_by_table: dict[str, set[str]] = {}
+    constraints = {"PRIMARY", "UNIQUE", "CONSTRAINT", "CHECK", "FOREIGN"}
+    for statement in constants["DDL_STATEMENTS"]:
+        match = create_pattern.match(statement.strip())
+        if not match:
+            continue
+        table_name = match.group(1).lower()
+        columns = columns_by_table.setdefault(table_name, set())
+        for line in match.group(2).splitlines():
+            definition = line.split("--", 1)[0].strip().rstrip(",")
+            if not definition or definition.split()[0].upper() in constraints:
+                continue
+            columns.add(definition.split()[0].strip('"').lower())
+    for statement in constants["MIGRATION_STATEMENTS"]:
+        match = alter_pattern.match(statement.strip())
+        if match:
+            columns_by_table.setdefault(match.group(1).lower(), set()).add(
+                match.group(2).lower()
+            )
+    return columns_by_table
+
+
 class TestValidateSchema:
     """R35 P1-6: validate_schema 校验 BACKUP_SCHEMA 与 DDL 一致性。"""
 
@@ -318,10 +364,48 @@ class TestValidateSchema:
         assert result["source_mismatches"] == [], \
             f"source 标记不符: {result['source_mismatches']}"
 
+    def test_crdb_schema_columns_match_ddl_and_migrations_exactly(self):
+        """R83: 防止 SELECT/restore 白名单与真实 CRDB schema 再次漂移。"""
+        from services.backup_schema import BACKUP_SCHEMA
+
+        ddl_columns = _crdb_columns_from_session_source()
+        mismatches = {}
+        for table_name, actual_columns in ddl_columns.items():
+            schema = BACKUP_SCHEMA.get(table_name)
+            if schema is None or schema.source != "crdb":
+                continue
+            declared_columns = set(schema.columns)
+            if actual_columns != declared_columns:
+                mismatches[table_name] = {
+                    "missing_from_backup_schema": sorted(actual_columns - declared_columns),
+                    "not_in_crdb_ddl": sorted(declared_columns - actual_columns),
+                }
+        assert mismatches == {}
+
 
 # ═══════════════════════════════════════════════════════════════
 #  P1-7: Bundle Manifest 生成测试
 # ═══════════════════════════════════════════════════════════════
+
+
+@pytest.mark.asyncio
+async def test_crdb_backup_uses_explicit_schema_columns(monkeypatch):
+    """R83: CRDB payload 只能包含单一事实源声明的显式列。"""
+    _ensure_backup_module_importable()
+    from services import db_backup
+    from services.backup_schema import BACKUP_SCHEMA
+
+    fetch = AsyncMock(return_value=[])
+    monkeypatch.setattr(db_backup.db_client, "fetch", fetch)
+    result = await db_backup._backup_crdb_tables(["users"])
+
+    assert result == {"users": []}
+    sql = fetch.await_args.args[0]
+    assert "SELECT *" not in sql.upper()
+    assert 'FROM "users"' in sql
+    for column in BACKUP_SCHEMA["users"].columns:
+        assert f'"{column}"' in sql
+
 
 class TestBundleManifest:
     """R35 P1-7: backup_all_tables 生成 bundle manifest。
@@ -438,7 +522,10 @@ class TestRestoreDelegation:
         mock_r2._access_key = "fake_key"
         mock_r2.download = AsyncMock(return_value=mock_content)
         monkeypatch.setattr(db_backup, "r2_storage", mock_r2)
-        monkeypatch.setattr(db_backup, "configure_r2_dynamic", AsyncMock())
+        # R76 O7: configure_r2_dynamic → configure_storage_from_settings
+        monkeypatch.setattr(db_backup, "configure_storage_from_settings", AsyncMock())
+        # R65 P0-07: 逃生舱 — 单元测试允许 legacy restore
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
 
         # R62 P0-01: db_backup.restore_from_backup 现路由通过
         # validate_and_restore_backup_strict()(严格三段式验证入口)。
@@ -471,6 +558,13 @@ class TestRestoreDelegation:
         # 单元测试无初始化 DB store,patch get_cache_store 返回 None 以跳过
         # nonce 消费(nonce 消费是安全边界,由集成测试覆盖)。
         monkeypatch.setattr("database.cache_store.get_cache_store", lambda: None)
+        # R76 P0-06: mock verify_and_consume_capability 跳过 capability 验证
+        # (capability 验证由集成测试覆盖,单元测试聚焦恢复逻辑)
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "a" * 64)
 
         # 构造含 CRDB + SQLite 表的备份数据
         backup_data = {
@@ -516,6 +610,24 @@ class TestRestoreDelegation:
             schema_fingerprint="test_schema_v1",
             payload_digest=verified_payload.payload_digest,
         )
+        # R76 P0-05: 使用真实 RestoreOperationContext(独立 expected 值来源)
+        # 替代 MagicMock,避免 payload_digest 校验失配
+        from services.restore_operation_context import RestoreOperationContext
+        operation_context = RestoreOperationContext(
+            operation_id="op_test_r35_batch3_groups",
+            backup_id="test_backup_id",
+            source_sha="test_source_sha",
+            run_id=0,
+            run_attempt=1,
+            audience="test_r35_batch3",
+            target_identity="test_schema_v1",
+            target_uri="sqlite:///tmp/test_restore_r35.db",
+            manifest_digest="a" * 64,
+            payload_digest=verified_payload.payload_digest,
+            allowed_action="restore_to_blank_target",
+            nonce="test_nonce_r35_groups_0123456789abcdef01234567",
+        )
+        operation_context.validate()  # fail-closed
 
         # Mock _restore_crdb_tables 和 _restore_sqlite_tables_to_db
         mock_crdb = AsyncMock()
@@ -529,7 +641,9 @@ class TestRestoreDelegation:
         with patch("services.restore_writer._restore_crdb_tables", mock_crdb), \
              patch("services.restore_writer._restore_sqlite_tables_to_db", mock_sqlite):
             result = await _restore_from_backup_data(
-                verified_payload, _capability=_cap, merge=False,
+                verified_payload, capability=_cap,
+                operation_context=operation_context, nonce_store=MagicMock(),
+                merge=False,
             )
 
         # CRDB 表(users)被传给 _restore_crdb_tables
@@ -554,6 +668,12 @@ class TestRestoreDelegation:
         # 单元测试无初始化 DB store,patch get_cache_store 返回 None 以跳过
         # nonce 消费(nonce 消费是安全边界,由集成测试覆盖)。
         monkeypatch.setattr("database.cache_store.get_cache_store", lambda: None)
+        # R76 P0-06: mock verify_and_consume_capability 跳过 capability 验证
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "a" * 64)
 
         backup_data = {
             "tables": {
@@ -595,9 +715,28 @@ class TestRestoreDelegation:
             schema_fingerprint="test_schema_v1",
             payload_digest=verified_payload.payload_digest,
         )
+        # R76 P0-05: 使用真实 RestoreOperationContext(独立 expected 值来源)
+        from services.restore_operation_context import RestoreOperationContext
+        operation_context = RestoreOperationContext(
+            operation_id="op_test_r35_batch3_skip",
+            backup_id="test_backup_id",
+            source_sha="test_source_sha",
+            run_id=0,
+            run_attempt=1,
+            audience="test_r35_batch3",
+            target_identity="test_schema_v1",
+            target_uri="sqlite:///tmp/test_restore_r35_skip.db",
+            manifest_digest="a" * 64,
+            payload_digest=verified_payload.payload_digest,
+            allowed_action="restore_to_blank_target",
+            nonce="test_nonce_r35_skip_0123456789abcdef0123456789",
+        )
+        operation_context.validate()  # fail-closed
 
         result = await _restore_from_backup_data(
-            verified_payload, _capability=_cap, merge=False,
+            verified_payload, capability=_cap,
+            operation_context=operation_context, nonce_store=MagicMock(),
+            merge=False,
         )
 
         assert "nonexistent_table" in result["skipped"]
@@ -749,6 +888,8 @@ def _ensure_backup_module_importable():
         mock_r2_obj._secret_key = ""
         mock_r2._r2 = mock_r2_obj
         mock_r2.configure_r2_dynamic = AsyncMock()
+        # R76 O7: 统一对象存储配置函数
+        mock_r2.configure_storage_from_settings = AsyncMock()
         sys.modules["storage.r2"] = mock_r2
         setattr(sys.modules.get("storage", types.ModuleType("storage")), "r2", mock_r2)
 

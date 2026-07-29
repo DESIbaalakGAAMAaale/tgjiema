@@ -286,20 +286,23 @@ class TestDbBackupRestoreFromBackupCapabilitySeal:
         通过 seal 后会因 R2 凭证未配置抛 BACKUP_RESTORE_R2_CREDENTIAL_MISSING
         或继续执行后续路径(取决于 mock)。
 
-        本用例显式 mock ``configure_r2_dynamic`` 与 ``r2_storage._access_key``,
+        本用例显式 mock ``configure_storage_from_settings`` 与 ``r2_storage._access_key``,
         避免 conftest 的 MagicMock settings 注入导致 ``r2_storage._access_key``
         为 MagicMock 触发 ``TypeError: key: expected bytes or bytearray``。
+
+        R76 O7: ``configure_r2_dynamic`` 已重构为 ``configure_storage_from_settings``
+        (统一 S3 兼容协议,R2 生产 / MinIO CI)。
         """
         from services import db_backup
         from services.error_codes import AppError, ErrorCodes
 
         monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
-        # mock configure_r2_dynamic 不覆盖 _access_key,
+        # mock configure_storage_from_settings 不覆盖 _access_key,
         # _access_key 保持为空字符串 → 触发 BACKUP_RESTORE_R2_CREDENTIAL_MISSING
-        monkeypatch.setattr(db_backup, "configure_r2_dynamic", AsyncMock())
+        monkeypatch.setattr(db_backup, "configure_storage_from_settings", AsyncMock())
         monkeypatch.setattr(db_backup.r2_storage, "_access_key", "")
 
-        # 通过 seal 后会因 configure_r2_dynamic + R2 凭证缺失而失败
+        # 通过 seal 后会因 configure_storage_from_settings + R2 凭证缺失而失败
         # 错误码不是 RESTORE_LEGACY_WRITER_SEALED 即证明 seal 已 bypass
         with pytest.raises(AppError) as exc_info:
             await db_backup.restore_from_backup(
@@ -356,9 +359,12 @@ class TestCommandBusRestoreBackupCapabilitySeal:
         通过 seal 后会调用 db_backup.restore_from_backup(也通过 seal),
         最终因 R2 凭证未配置抛 BACKUP_RESTORE_R2_CREDENTIAL_MISSING 或其他错误。
 
-        本用例显式 mock ``configure_r2_dynamic`` 与 ``r2_storage._access_key``,
+        本用例显式 mock ``configure_storage_from_settings`` 与 ``r2_storage._access_key``,
         避免 conftest 的 MagicMock settings 注入导致 ``r2_storage._access_key``
         为 MagicMock 触发 ``TypeError: key: expected bytes or bytearray``。
+
+        R76 O7: ``configure_r2_dynamic`` 已重构为 ``configure_storage_from_settings``
+        (统一 S3 兼容协议,R2 生产 / MinIO CI)。
         """
         from services import db_backup
         from services.command_bus import make_restore_backup_command
@@ -366,7 +372,7 @@ class TestCommandBusRestoreBackupCapabilitySeal:
 
         monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
         # mock R2 凭证缺失 → restore_from_backup 抛 BACKUP_RESTORE_R2_CREDENTIAL_MISSING
-        monkeypatch.setattr(db_backup, "configure_r2_dynamic", AsyncMock())
+        monkeypatch.setattr(db_backup, "configure_storage_from_settings", AsyncMock())
         monkeypatch.setattr(db_backup.r2_storage, "_access_key", "")
 
         cmd = make_restore_backup_command(
@@ -468,7 +474,7 @@ class TestAstGate:
         source = """
 import sys
 async def bad_caller():
-    await _restore_from_backup_data(payload, _capability=cap)
+    await _restore_from_backup_data(payload, capability=cap)
 """
         import ast as _ast
         tree = _ast.parse(source, filename="<test>")

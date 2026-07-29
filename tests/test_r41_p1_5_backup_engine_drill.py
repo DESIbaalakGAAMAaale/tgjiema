@@ -109,6 +109,8 @@ def _build_engine_with_kek(monkeypatch, kek_b64: str | None = None):
     # 清除 PREVIOUS 以保证干净环境
     monkeypatch.delenv("BACKUP_KEK_PREVIOUS", raising=False)
     monkeypatch.delenv("BACKUP_KEK_PREVIOUS_FILE", raising=False)
+    # R76 P0-06: 注入临时签名密钥(production restore 路径需要 issue_capability)
+    monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "a" * 64)
 
     fake_storage = _FakeR2Storage()
     fake_cache = _FakeCacheStore()
@@ -457,6 +459,16 @@ class TestScenario8StagingRestoreNoDbWrite:
 
         manifest = await engine.create_backup(backup_type="full")
         backup_id = manifest["backup_id"]
+
+        # R76 P0-06: mock get_cache_store 返回 None,跳过 nonce 持久化
+        # (单元测试无初始化 DB store,nonce 消费由集成测试覆盖)
+        monkeypatch.setattr("database.cache_store.get_cache_store", lambda: None)
+        # R76 P0-06: mock verify_and_consume_capability 跳过 capability 验证
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "a" * 64)
 
         # 监视 db_restore
         call_count = {"n": 0}

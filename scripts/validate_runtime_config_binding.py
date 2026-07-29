@@ -165,12 +165,14 @@ class HostConfigDigest:
         exists: 文件是否存在
         sha256: 文件内容的 sha256 hex (64位,无 sha256: 前缀)
         size_bytes: 文件大小(字节)
+        file_mode: 文件 mode(octal 字符串,如 "0o100644";R76 P1-04)
     """
 
     path: str
     exists: bool
     sha256: str
     size_bytes: int
+    file_mode: str = ""
 
 
 @dataclass
@@ -191,6 +193,7 @@ class RuntimeConfigBinding:
     workflow_run_attempt: str = ""
     host_config_digests: list[HostConfigDigest] = field(default_factory=list)
     combined_host_config_digest: str = ""  # sha256:<64hex>
+    canonical_input_manifest: str = ""  # R76 P1-04: 可审计 canonical manifest JSON
     image_reference: str = ""
     image_registry: str = ""
     image_repository: str = ""
@@ -499,7 +502,15 @@ def compute_host_config_digest(
     repo_root: Path,
     config_files: tuple[str, ...] = HOST_CONFIG_FILES,
 ) -> tuple[list[HostConfigDigest], str]:
-    """R71 P1-05: 计算 host config 文件的 digest。
+    """R71 P1-05 / R76 P1-04: 计算 host config 文件的 digest。
+
+    R76 P1-04 整改:
+        - 不再使用 ``path:sha\\n`` 拼接(隐式纳入路径文本和顺序)
+        - 改为生成可审计 canonical input manifest(JSON),包含每个文件的
+          path / file_mode / size_bytes / sha256
+        - combined digest = SHA-256(canonical JSON of manifest)
+        - 部署端可同算法回读:从 ``host_config_digests`` 字段重建 canonical
+          manifest 并重新计算 digest 比对
 
     Args:
         repo_root: 仓库根目录
@@ -507,12 +518,11 @@ def compute_host_config_digest(
 
     Returns:
         (per_file_digests, combined_digest)
-        - per_file_digests: 每个文件的 HostConfigDigest 列表
-        - combined_digest: 所有文件内容按 path 排序后拼接的 sha256
-          (sha256:<64hex>),用于部署前后比对
+        - per_file_digests: 每个文件的 HostConfigDigest 列表(含 file_mode)
+        - combined_digest: canonical manifest 的 sha256(sha256:<64hex>),
+          用于部署前后比对
     """
     per_file: list[HostConfigDigest] = []
-    combined_h = hashlib.sha256()
     for rel_path in sorted(config_files):
         abs_path = repo_root / rel_path
         if not abs_path.exists():
@@ -521,29 +531,114 @@ def compute_host_config_digest(
                 exists=False,
                 sha256="",
                 size_bytes=0,
+                file_mode="",
             ))
             continue
         try:
             sha = _sha256_file(abs_path)
-            size = abs_path.stat().st_size
+            stat_result = abs_path.stat()
+            size = stat_result.st_size
+            # R76 P1-04: 记录文件 mode(octal 字符串)
+            file_mode = oct(stat_result.st_mode)
             per_file.append(HostConfigDigest(
                 path=rel_path,
                 exists=True,
                 sha256=sha,
                 size_bytes=size,
+                file_mode=file_mode,
             ))
-            # combined: path + ":" + sha (按 path 排序后拼接)
-            combined_h.update(f"{rel_path}:{sha}\n".encode("utf-8"))
         except OSError as exc:
             per_file.append(HostConfigDigest(
                 path=rel_path,
                 exists=True,
                 sha256="",
                 size_bytes=0,
+                file_mode="",
             ))
             logger.warning(f"读取 {abs_path} 失败: {exc}")
-    combined_digest = f"sha256:{combined_h.hexdigest()}"
+
+    # R76 P1-04: 构建 canonical input manifest(可审计 JSON)
+    canonical_manifest_json = build_canonical_input_manifest(per_file)
+    combined_digest = f"sha256:{hashlib.sha256(canonical_manifest_json.encode('utf-8')).hexdigest()}"
     return per_file, combined_digest
+
+
+def build_canonical_input_manifest(
+    per_file: list[HostConfigDigest],
+) -> str:
+    """R76 P1-04: 构建 canonical input manifest JSON 字符串。
+
+    canonical manifest = JSON object with:
+        - schema_version: "r76-p1-04-canonical-input-manifest"
+        - algorithm: "sha256-canonical-json"
+        - files: sorted list of {path, exists, file_mode, size_bytes, sha256}
+
+    排序规则:
+        - files 按 path 升序排序
+        - JSON keys 按 sort_keys=True 排序
+        - separators=(",", ":") 紧凑格式
+        - ensure_ascii=False 保留 UTF-8
+
+    部署端回读算法:
+        1. 从 evidence 读取 ``host_config_digests`` 列表
+        2. 调用本函数重建 canonical manifest JSON
+        3. 计算 SHA-256,与 ``combined_host_config_digest`` 比对
+
+    Args:
+        per_file: HostConfigDigest 列表
+
+    Returns:
+        canonical manifest JSON 字符串
+    """
+    manifest_entries = []
+    for f in per_file:
+        if not f.exists:
+            continue
+        manifest_entries.append({
+            "path": f.path,
+            "exists": f.exists,
+            "file_mode": f.file_mode,
+            "size_bytes": f.size_bytes,
+            "sha256": f.sha256,
+        })
+    manifest_entries.sort(key=lambda e: e["path"])
+    canonical_manifest = {
+        "schema_version": "r76-p1-04-canonical-input-manifest",
+        "algorithm": "sha256-canonical-json",
+        "files": manifest_entries,
+    }
+    return json.dumps(
+        canonical_manifest,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def verify_host_config_digest_readback(
+    per_file: list[HostConfigDigest],
+    expected_digest: str,
+) -> tuple[bool, str]:
+    """R76 P1-04: 部署端回读验证 — 从 per_file 重建 manifest 并比对 digest。
+
+    Args:
+        per_file: 部署端实际读取的 HostConfigDigest 列表
+        expected_digest: 部署前记录的 combined digest (sha256:<64hex>)
+
+    Returns:
+        (True, "") 若一致;(False, error_msg) 若漂移
+    """
+    if not expected_digest:
+        return False, "expected_digest 为空(部署前未记录)"
+    canonical_json = build_canonical_input_manifest(per_file)
+    actual_digest = f"sha256:{hashlib.sha256(canonical_json.encode('utf-8')).hexdigest()}"
+    if expected_digest.lower() != actual_digest.lower():
+        return False, (
+            f"host config digest 漂移: expected={expected_digest},"
+            f" actual={actual_digest} — "
+            f"宿主机 config 文件在部署过程中被修改,违反 R76 P1-04 配置身份绑定"
+        )
+    return True, ""
 
 
 def compare_host_config_digest(
@@ -614,10 +709,12 @@ def build_runtime_config_binding(
     )
     binding.overall_passed = True  # 初始为 True,任一检查失败置 False
 
-    # 1. host config digest (P1-05)
+    # 1. host config digest (P1-05 / R76 P1-04)
     per_file, combined = compute_host_config_digest(repo_root)
     binding.host_config_digests = per_file
     binding.combined_host_config_digest = combined
+    # R76 P1-04: 记录 canonical input manifest 供审计与部署端回读
+    binding.canonical_input_manifest = build_canonical_input_manifest(per_file)
     # host config 文件缺失不算失败(项目可选),但记录 warning
     for f in per_file:
         if not f.exists:

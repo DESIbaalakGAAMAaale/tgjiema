@@ -20,6 +20,9 @@ pytest_*.log
 ci_fail.log
 e2e_full.log
 scan_out.log
+# R76 本地扫描/调试输出(不推送)
+r76_scanner11_msg.txt
+static_gates_jobs.json
 
 # 数据库
 *.db
@@ -93,3 +96,15 @@ classify.txt
 
 # R72: break-glass 流程审计日志（敏感操作记录，禁止公开）
 break-glass-audit-*.jsonl
+
+# R73 §5.9: tag-audit & break-glass 审计日志（敏感操作记录，禁止公开）
+create-tag-audit-*.jsonl
+tag-audit-*.jsonl
+
+# R73 §5.24: 生产绕过扫描器输出（运行产物，禁止入库）
+scan_final.json
+scan_result.json
+scan_*.json
+
+# R81: CI/本地测试产物（禁止入库，审查报告不上传 GitHub）
+artifacts/

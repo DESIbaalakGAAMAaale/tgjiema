@@ -31,6 +31,7 @@ from services.sink_adapters.telegram_adapter import (
     build_inline_keyboard,
     build_bot,
     build_input_media,
+    build_provider_client,
 )
 from services.sink_adapters.web_adapter import json_response
 
@@ -42,5 +43,6 @@ __all__ = [
     "build_inline_keyboard",
     "build_bot",
     "build_input_media",
+    "build_provider_client",
     "json_response",
 ]

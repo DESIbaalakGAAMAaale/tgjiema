@@ -112,22 +112,28 @@ class TestGetEntrypointRoles:
             "_get_entrypoint_roles 必须是可调用对象"
         )
 
-    def test_returns_complete_12_roles(self, orch):
+    def test_returns_complete_13_roles(self, orch):
         """_get_entrypoint_roles() 必须返回 entrypoint.py 中 ALLOWED_SERVICE_ROLES 的全部角色。
 
         entrypoint.py 定义:
           - SERVICE_ROLE_RUN_ALL = {up, idx, dsp, mon, admin, admin_bot,
             db_writer, crdb_sync, db_backup, r40_scheduler}
-          - SERVICE_ROLE_MODULE = {migration: ..., prometheus_exporter: ...}
-          - ALLOWED_SERVICE_ROLES = 10 + 2 = 12 个角色
+          - SERVICE_ROLE_MODULE = {migration: ..., prometheus_exporter: ...,
+            provider_sim: ...}
+          - ALLOWED_SERVICE_ROLES = 10 + 3 = 13 个角色
+
+        R76 §10.C/O6: 新增 provider_sim 角色(secretless CI 协议模拟器,
+        仅在 APP_ENV=test / SECRETLESS_MODE=true 下启用,生产环境禁止)。
         """
         roles = orch._get_entrypoint_roles()
         expected_roles = {
             # SERVICE_ROLE_RUN_ALL(10 个)
             "up", "idx", "dsp", "mon", "admin", "admin_bot",
             "db_writer", "crdb_sync", "db_backup", "r40_scheduler",
-            # SERVICE_ROLE_MODULE keys(2 个)
+            # SERVICE_ROLE_MODULE keys(3 个)
             "migration", "prometheus_exporter",
+            # R76 §10.C/O6: secretless CI 协议模拟器角色
+            "provider_sim",
         }
         assert roles == expected_roles, (
             f"_get_entrypoint_roles() 返回的角色不匹配: "
@@ -269,7 +275,7 @@ class TestSyntheticTransactionExecutor:
             "verify_idempotency",
             "inject_failure_scenario",
             "cleanup",
-            "run_full_transaction",
+            "run_dbwriter_component_test",
             "TransactionEvidence",
             "StepResult",
         ]
@@ -322,11 +328,11 @@ class TestSyntheticTransactionExecutor:
             "verify_result 在失败时必须提供 error 说明"
         )
 
-    def test_run_full_transaction_returns_evidence(self, synthetic_tx):
-        """run_full_transaction() 必须返回 TransactionEvidence 对象。"""
-        # mock inject_test_event 失败,让 run_full_transaction 快速返回
+    def test_run_dbwriter_component_test_returns_evidence(self, synthetic_tx):
+        """run_dbwriter_component_test() 必须返回 TransactionEvidence 对象。"""
+        # mock inject_test_event 失败,让 run_dbwriter_component_test 快速返回
         # (验证证据结构,不验证业务逻辑)
-        # 注意:run_full_transaction 在 finally 块中会调用 cleanup(),
+        # 注意:run_dbwriter_component_test 在 finally 块中会调用 cleanup(),
         # cleanup() 会调用 subprocess.run(docker compose exec),
         # 因此也需要 mock subprocess.run 防止实际调用 docker
         def mock_inject(trace_id, timeout=30):
@@ -350,10 +356,10 @@ class TestSyntheticTransactionExecutor:
 
         with patch.object(synthetic_tx, "inject_test_event", side_effect=mock_inject), \
              patch("subprocess.run", side_effect=mock_run_side_effect):
-            evidence = synthetic_tx.run_full_transaction(timeout=2)
+            evidence = synthetic_tx.run_dbwriter_component_test(timeout=2)
 
         assert isinstance(evidence, synthetic_tx.TransactionEvidence), (
-            f"run_full_transaction 必须返回 TransactionEvidence, "
+            f"run_dbwriter_component_test 必须返回 TransactionEvidence, "
             f"实际: {type(evidence)}"
         )
         assert evidence.overall_passed is False, (
@@ -466,9 +472,11 @@ class TestEvidenceOutput:
                 f"实际字段: {sorted(evidence.keys())}"
             )
 
-        # schema_version 必须标识 R71(R71 Wave 2 引入,Wave 7 扩展为 r71-wave7)
-        assert evidence["schema_version"] in ("r71-wave2", "r71-wave7"), (
-            f"schema_version 必须为 'r71-wave2' 或 'r71-wave7', 实际: {evidence['schema_version']!r}"
+        # schema_version 必须标识 R71/R73(R71 Wave 2 引入,Wave 7 扩展为 r71-wave7,
+        # R73 §5.15 扩展为 r73-sec5.15 — 新增 DAG 元数据)
+        assert evidence["schema_version"] in ("r71-wave2", "r71-wave7", "r73-sec5.15"), (
+            f"schema_version 必须为 'r71-wave2' / 'r71-wave7' / 'r73-sec5.15', "
+            f"实际: {evidence['schema_version']!r}"
         )
 
         # role_matrix 必须包含 entrypoint_roles

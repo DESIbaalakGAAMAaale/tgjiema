@@ -230,11 +230,15 @@ def _check_read_only(
             "缺少 read_only: true — 容器文件系统必须只读",
         ))
     tmpfs = svc.get("tmpfs", []) or []
-    if isinstance(tmpfs, list) and "/tmp" not in tmpfs:
-        out.append(Violation(
-            name, "tmpfs",
-            "tmpfs 缺少 /tmp — read_only 容器需要 /tmp 可写挂载",
-        ))
+    # R79 §10.1: tmpfs 条目允许携带挂载选项(如 /tmp:rw,nosuid,nodev,noexec,size=64m),
+    # 判定时取冒号前的挂载目标路径。
+    if isinstance(tmpfs, list):
+        tmpfs_targets = {str(entry).split(":", 1)[0] for entry in tmpfs}
+        if "/tmp" not in tmpfs_targets:
+            out.append(Violation(
+                name, "tmpfs",
+                "tmpfs 缺少 /tmp — read_only 容器需要 /tmp 可写挂载",
+            ))
     return out
 
 

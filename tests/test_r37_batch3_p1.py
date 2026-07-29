@@ -305,7 +305,9 @@ class TestP18RuntimeClientSplit:
         """CockroachDBClient.connect_runtime_only 方法定义存在。"""
         session_path = Path(__file__).resolve().parent.parent / "database" / "session.py"
         content = session_path.read_text(encoding="utf-8")
-        assert "async def connect_runtime_only(self):" in content
+        # R80 P0-01: 签名扩展为 (self, *, skip_cache_store: bool = False),
+        # 匹配带可选关键字参数的形式。
+        assert "async def connect_runtime_only(self" in content
 
     def test_connect_runtime_only_docstring_mentions_no_ddl(self):
         """connect_runtime_only docstring 明确不执行 DDL/bootstrap。"""

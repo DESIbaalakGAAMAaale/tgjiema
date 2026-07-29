@@ -733,15 +733,15 @@ async def finalize_upload(command: FinalizeUploadCommand) -> None:
         # R45: 原子事务 — 所有写入在同一 writer_transaction 中
         # dirty_outbox 失败会抛异常,触发整体 ROLLBACK(不 warning 后 continue)
         async with store.writer_transaction():
-            # 写 file_records_local(mark_dirty=False → 不自动写 dirty_outbox,
-            # 由下方显式 add_dirty_outbox 调用,确保失败可抛异常)
-            await store.upsert_file_record_local(command.file_record, mark_dirty=False)
+            # R75 P0-07: mark_dirty=True (scanner 要求;显式 add_dirty_outbox 仍保留
+            # 以确保失败可抛异常触发 ROLLBACK,自动 dirty_outbox 仅作冗余兜底)
+            await store.upsert_file_record_local(command.file_record, mark_dirty=True)
             # 写 dirty_outbox(file_records) — 显式调用,失败即抛(不 try/except)
             await store.add_dirty_outbox(
                 "file_records", file_code, "upsert", record_payload,
             )
-            # 写 codes_local(mark_dirty=False → 不自动写 dirty_outbox)
-            await store.upsert_code_local(command.code_entry, mark_dirty=False)
+            # 写 codes_local(mark_dirty=True)
+            await store.upsert_code_local(command.code_entry, mark_dirty=True)
             # 写 dirty_outbox(codes) — 显式调用,失败即抛(不 try/except)
             await store.add_dirty_outbox(
                 "codes", code_value, "upsert", ce_payload,

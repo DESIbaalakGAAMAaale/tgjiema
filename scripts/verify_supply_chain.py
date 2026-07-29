@@ -150,8 +150,8 @@ def _migration_digest_workflow_algorithm() -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _migration_digest_workflow_algorithm: subprocess failed: {_e}", file=sys.stderr)
     return ""
 
 
@@ -167,8 +167,8 @@ def _git_rev_parse(ref: str) -> str:
         )
         if result.returncode == 0:
             return result.stdout.strip()
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _git_rev_parse: git rev-parse {ref} failed: {_e}", file=sys.stderr)
     return ""
 
 

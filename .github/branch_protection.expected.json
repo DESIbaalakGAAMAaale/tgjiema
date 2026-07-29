@@ -1,5 +1,5 @@
 {
-  "_comment": "R65 P1-12 / R71 P1-01/02/03: Branch Protection 期望配置(checked-in 基线)。CI 中无 GitHub API 访问权限时,scripts/check_branch_protection_contexts.py 默认读取本文件做一致性校验。本文件由 scripts/configure_branch_protection.sh 在生产环境应用,任何修改都需同步更新本基线。R71 Wave 6: solo-founder 模式 — required_approving_review_count=0(无审批死锁),strict=true(current-SHA),contexts 覆盖所有真实 release-gates.yml job 名。",
+  "_comment": "R65 P1-12 / R71 P1-01/02/03 / R76 P1-07/P1-08: Branch Protection 期望配置(checked-in 基线,legacy API)。CI 中无 GitHub API 访问权限时,scripts/check_branch_protection_contexts.py 默认读取本文件做一致性校验。本文件由 scripts/configure_branch_protection.sh 在生产环境应用,任何修改都需同步更新本基线。R71 Wave 6: solo-founder 模式 — required_approving_review_count=0(无审批死锁),strict=true(current-SHA),contexts 覆盖所有 release-gates.yml job 名(含 tag-only/environment-only,与 ruleset.expected.json 的 PR/master 子集区分)。R74 P1-06: ruleset 用 validate-promotion-workflow 替换 promote-rc-reusable;BP 保留 promote-rc-reusable(workflow_dispatch-only job 名,与 workflow 一致)。R76 P1-07: 新增 secretless-crdb-closed-loop-gate。R76 P1-08: 实际 ruleset (19723336) 收敛到 .github/branch_ruleset.expected.json(规范源,28 项 PR/master 子集)。",
   "_schema": "github_branch_protection_api_response",
   "_r65_p1_12_requirements": {
     "enforce_admins": "true — admin 不能 bypass",
@@ -51,10 +51,12 @@
       "rc-continuity",
       "tag-ruleset-verify",
       "crdb-ru-72h-attribution-gate",
-      "production-evidence",
       "oci-allowlist-verify",
       "validate-oci-rootfs",
+      "validate-promotion-workflow",
+      "promote-rc-reusable",
       "runtime-smoke-compose",
+      "secretless-crdb-closed-loop-gate",
       "bind-runtime-config",
       "release-summary",
       "attestation-semantics-verify",

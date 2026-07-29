@@ -213,7 +213,7 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -259,7 +259,7 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -309,7 +309,7 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -359,7 +359,7 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -409,7 +409,7 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -459,7 +459,7 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -509,7 +509,7 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -612,7 +612,7 @@ services:
           cpus: '1.0'
           memory: 512M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -662,7 +662,7 @@ services:
           cpus: '0.5'
           memory: 256M
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import asyncio,os; from services.health import check_readiness; r=asyncio.run(check_readiness(os.environ.get('SERVICE_ROLE',''))); exit(0 if r.healthy else 1)\""]
+      test: ["CMD-SHELL", "python -c \"import asyncio,os,sys;from services.health import check_liveness,check_readiness;role=os.environ.get('SERVICE_ROLE','');l=check_liveness(role);sys.exit(1) if not l.get('alive') else None;r=asyncio.run(check_readiness(role));sys.exit(0 if r.healthy else 1)\""]
       interval: 60s
       timeout: 15s
       retries: 3
@@ -709,6 +709,10 @@ services:
           cpus: '0.25'
           memory: 64M
     healthcheck:
+      # R73 §5.10 (P1-06): /health 端点内部调用 collect_dependency_status(),
+      # 等价于 services.health.check_dependency_health('prometheus_exporter')
+      # (该函数对 prometheus_exporter 角色委托给 collect_dependency_status)。
+      # HTTP 200 = dependencies_healthy=true;HTTP 503 = 至少一项依赖不健康。
       test: ["CMD-SHELL", "python -c \"import urllib.request; r=urllib.request.urlopen('http://localhost:9100/health'); exit(0 if r.status==200 else 1)\" || exit 1"]
       interval: 30s
       timeout: 10s

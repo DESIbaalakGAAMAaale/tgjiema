@@ -12,7 +12,7 @@
 #   - conditions.ref_name.include 包含 refs/heads/master 与 refs/heads/main
 #   - rules 包含 deletion (deletion=false)
 #   - rules 包含 non_fast_forward (non_fast_forward=false, 禁止 force push)
-#   - rules 包含 update (update=false, 禁止直接 update)
+#   - rules 不含 update restriction (否则 GitHub 会连 PR merge 一起阻止)
 #   - rules 包含 required_signatures (强制 GPG 签名验证)
 #   - rules 包含 pull_request (R71 P1-01 solo-founder 语义):
 #       * required_reviewers == 0 (solo founder, 无审批死锁)
@@ -39,7 +39,8 @@ set -euo pipefail
 
 RULESET_NAME="${RULESET_NAME:-R71 Solo Founder Branch Ruleset}"
 
-# R71 P1-02 / R72 P1-06 / RC61: 必需 status checks 列表(27 项,仅 PR/master 事件可产生的 check)
+# R71 P1-02 / R72 P1-06 / RC61 / R76 P1-07/P1-08: 必需 status checks 列表
+# (28 项,仅 PR/master 事件可产生的 check)
 # 与 .github/branch_ruleset.expected.json / scripts/configure_branch_ruleset.sh 保持一致
 # R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
 # sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
@@ -48,6 +49,11 @@ RULESET_NAME="${RULESET_NAME:-R71 Solo Founder Branch Ruleset}"
 # R72 RC61: 移除 4 个 PR 事件下 skipped 的 check(sign-artifacts / verify-git-source-governance /
 # tag-ruleset-verify / bind-runtime-config — 它们的 if: 条件在 PR 事件下不满足,导致
 # strict_required_status_checks_policy=true 阻断 PR 合并;31→27 项)
+# R74 P1-06: promote-rc-reusable 替换为 validate-promotion-workflow
+#   (promotion job 是 workflow_dispatch only,不能作为 PR required context)
+# R76 P1-07: 新增 secretless-crdb-closed-loop-gate (CRDB 闭环证据门禁)
+# R76 P1-08: 实际 ruleset (19723336) 必须收敛到本期望列表 — 移除 production-evidence,
+#   保留 validate-promotion-workflow,新增 secretless-crdb-closed-loop-gate (27→28 项)
 EXPECTED_REQUIRED_CHECKS=(
   "lint"
   "static-gates"
@@ -71,10 +77,11 @@ EXPECTED_REQUIRED_CHECKS=(
   "verify-branch-ruleset"
   "rc-continuity"
   "crdb-ru-72h-attribution-gate"
-  "production-evidence"
+  "validate-promotion-workflow"
   "oci-allowlist-verify"
   "validate-oci-rootfs"
   "runtime-smoke-compose"
+  "secretless-crdb-closed-loop-gate"
   "release-summary"
 )
 
@@ -282,9 +289,9 @@ assert_contains "rules 含 non_fast_forward (non_fast_forward=false)" \
   "$RULESET_JSON" \
   '[.rules[].type] | any(. == "non_fast_forward")'
 
-assert_contains "rules 含 update (update=false)" \
+assert_contains "rules 不含 update restriction (允许合规 PR merge)" \
   "$RULESET_JSON" \
-  '[.rules[].type] | any(. == "update")'
+  '[.rules[].type] | any(. == "update") | not'
 
 assert_contains "rules 含 required_signatures (强制签名)" \
   "$RULESET_JSON" \

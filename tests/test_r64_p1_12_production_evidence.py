@@ -218,11 +218,12 @@ class TestBuildEvidenceCommand:
 
     def test_command_includes_output_dir(self):
         """命令应包含 --output-dir 参数。"""
+        output_dir = Path("/tmp/evidence")
         cmd = self.module._build_evidence_command(
-            "soak", Path("/tmp/evidence"), dry_run=False, extra_args=[],
+            "soak", output_dir, dry_run=False, extra_args=[],
         )
         assert "--output-dir" in cmd
-        assert "/tmp/evidence" in cmd
+        assert str(output_dir) in cmd
 
     def test_command_for_shell_script_uses_bash(self):
         """shell 脚本应通过 bash 调用。"""
@@ -754,49 +755,55 @@ class TestEvidenceScriptOutputDir:
 
 
 # ════════════════════════════════════════════════════════════════
-# 10. .github/workflows/release-gates.yml — production-evidence job
+# 10. .github/workflows/release-gates.yml — generate-evidence-envelope job
+# (R73 P1-05: 原 production-evidence job 重命名为 generate-evidence-envelope)
 # ════════════════════════════════════════════════════════════════
 
 
 class TestReleaseGatesProductionEvidenceJob:
-    """验证 release-gates.yml 包含 production-evidence job。"""
+    """验证 release-gates.yml 包含 generate-evidence-envelope job。
+
+    R73 P1-05: 原 production-evidence job 已重命名为 generate-evidence-envelope,
+    新增 gate_level / promotion_eligible / artifact_prefix 分级逻辑。
+    """
 
     def test_workflow_file_exists(self):
         """release-gates.yml 应存在。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         assert path.exists(), ".github/workflows/release-gates.yml 应存在"
 
-    def test_workflow_has_production_evidence_job(self):
-        """workflow 应包含 production-evidence job。"""
+    def test_workflow_has_generate_evidence_envelope_job(self):
+        """workflow 应包含 generate-evidence-envelope job (R73 P1-05 重命名)。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
-        assert "production-evidence:" in content, (
-            "release-gates.yml 应包含 production-evidence job"
+        assert "generate-evidence-envelope:" in content, (
+            "release-gates.yml 应包含 generate-evidence-envelope job "
+            "(R73 P1-05: 原 production-evidence 已重命名)"
         )
 
     def test_workflow_has_supply_chain_verification_step(self):
-        """production-evidence job 应包含 supply chain verification 步骤。"""
+        """generate-evidence-envelope job 应包含 supply chain verification 步骤。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
         assert "verify_supply_chain.py" in content
         assert "Supply Chain Verification" in content
 
     def test_workflow_has_production_evidence_index_step(self):
-        """production-evidence job 应包含证据索引生成步骤。"""
+        """generate-evidence-envelope job 应包含证据索引生成步骤。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
         assert "production_evidence_index.json" in content
         assert "ci_dry_run" in content or "ci_dry-run" in content or "dry-run" in content
 
-    def test_release_summary_includes_production_evidence(self):
-        """release-summary job 应在 needs 中包含 production-evidence。"""
+    def test_release_summary_includes_generate_evidence_envelope(self):
+        """release-summary job 应在 needs 中包含 generate-evidence-envelope。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
-        # release-summary 的 needs 列表应包含 production-evidence
-        assert "production-evidence" in content
+        # release-summary 的 needs 列表应包含 generate-evidence-envelope (R73 P1-05 重命名)
+        assert "generate-evidence-envelope" in content
 
-    def test_production_evidence_non_blocking_for_pr(self):
-        """production-evidence 在 PR 上应非阻断(non-blocking 注释)。"""
+    def test_generate_evidence_envelope_non_blocking_for_pr(self):
+        """generate-evidence-envelope 在 PR 上应非阻断(non-blocking 注释)。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
         # 应有 non-blocking 相关注释
@@ -805,18 +812,29 @@ class TestReleaseGatesProductionEvidenceJob:
         assert "if: always()" in content
 
     def test_workflow_uses_check_crdb_ru_threshold_script(self):
-        """production-evidence job 应调用 check_crdb_ru_threshold.py(快速 RU 验证)。"""
+        """generate-evidence-envelope job 应调用 check_crdb_ru_threshold.py(快速 RU 验证)。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
         assert "check_crdb_ru_threshold.py" in content
         assert "ru_threshold_ci" in content
 
-    def test_workflow_uploads_production_evidence_artifact(self):
-        """production-evidence job 应上传 production-evidence artifact。"""
+    def test_workflow_uploads_tiered_evidence_artifact(self):
+        """generate-evidence-envelope job 应上传 tiered evidence artifact (R73 P1-05)。
+
+        artifact 名称按 gate_level 分级:
+          - development-evidence-*       (master push / PR)
+          - rc-candidate-evidence-*      (rc-v* tag push)
+          - production-deployment-evidence-* (production-v* tag push)
+        """
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
-        assert "production-evidence-" in content  # artifact name
-        assert "production-evidence/" in content  # artifact path
+        # R73 P1-05: artifact 名称通过 steps.gate.outputs.artifact_prefix 动态生成
+        assert "artifact_prefix" in content
+        assert "development-evidence" in content
+        assert "rc-candidate-evidence" in content
+        assert "production-deployment-evidence" in content
+        # artifact 内仍包含 production-evidence/ 目录路径 (工作区目录名不变)
+        assert "production-evidence/" in content
 
     def test_workflow_has_skip_cosign_in_ci(self):
         """CI 中 verify_supply_chain.py 应使用 --skip-cosign(无 cosign 环境)。"""
@@ -830,27 +848,42 @@ class TestReleaseGatesProductionEvidenceJob:
         content = path.read_text(encoding="utf-8")
         assert "R64 P1-12" in content
 
-    def test_production_evidence_job_has_proper_permissions(self):
-        """production-evidence job 应有正确的 permissions 设置。"""
+    def test_workflow_has_r73_p1_05_gate_level_logic(self):
+        """workflow 应包含 R73 P1-05 gate_level 分级逻辑。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
-        # 定位 production-evidence job 块
-        pe_idx = content.find("production-evidence:")
+        assert "R73 P1-05" in content
+        assert "gate_level" in content
+        assert "promotion_eligible" in content
+        # 应调用 evidence_envelope.py CLI build 子命令
+        assert "evidence_envelope.py build" in content
+        # 应调用 evidence_envelope.py CLI validate 子命令 (defense in depth)
+        assert "evidence_envelope.py validate" in content
+
+    def test_generate_evidence_envelope_job_has_proper_permissions(self):
+        """generate-evidence-envelope job 应有正确的 permissions 设置。"""
+        path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
+        content = path.read_text(encoding="utf-8")
+        # 定位 generate-evidence-envelope job 块 (R73 P1-05 重命名)
+        pe_idx = content.find("generate-evidence-envelope:")
         assert pe_idx >= 0
-        # 截取 production-evidence job 块(到 release-summary 之前)
-        rs_idx = content.find("release-summary:", pe_idx)
+        # 截取 generate-evidence-envelope job 块(到下一个 job 之前)
+        # 下一个 job 通常是 promote-rc-reusable 或 verify-rc-identity
+        rs_idx = content.find("promote-rc-reusable:", pe_idx)
+        if rs_idx < 0:
+            rs_idx = content.find("verify-rc-identity:", pe_idx)
         pe_block = content[pe_idx:rs_idx] if rs_idx > 0 else content[pe_idx:]
         # 应包含 permissions 块
         assert "permissions:" in pe_block
         # 应包含 id-token / contents / actions 等权限
         assert "id-token" in pe_block or "id_token" in pe_block
 
-    def test_release_summary_treats_production_evidence_as_non_blocking(self):
-        """release-summary 应将 production-evidence 标记为 non-blocking(警告而非阻断)。"""
+    def test_release_summary_treats_generate_evidence_envelope_as_non_blocking(self):
+        """release-summary 应将 generate-evidence-envelope 标记为 non-blocking(警告而非阻断)。"""
         path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
         content = path.read_text(encoding="utf-8")
-        # 应有 production-evidence non-blocking 处理逻辑
-        assert "production-evidence" in content
+        # R73 P1-05: 应有 generate-evidence-envelope non-blocking 处理逻辑
+        assert "generate-evidence-envelope" in content
         # 应有警告逻辑(warning 而非 error)
         assert "::warning::" in content or "non-blocking" in content
 

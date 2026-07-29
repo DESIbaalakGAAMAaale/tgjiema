@@ -131,44 +131,59 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
     # source_digest 重新生成。
     # R72 RC69: 添加 BACKUP_SIGNING_KEY 字符串到字节转换逻辑(供 HMAC 签名),
     # source_digest 重新生成。函数语义未变(仍是 CLI 入口 → strict service 委托)。
+    # R76 P0-05: run_restore 新增 nonce_store 初始化失败 fail-closed 日志(R76 §10.M),
+    # source_digest/ast_signature 重新生成。allowed_callees 未变。
     {
         "file": "services/db_restore.py",
         "function": "run_restore",
-        "ast_signature": "579eadb612b09618369620cf58b041a753ccf4dbb0ffc61d7686e401582eabe9",
-        "source_digest": "eae9c989c23fe3212e4787ed26d63be24410a757e915be100abb0127dbd1b002",
+        "ast_signature": "1124017225989be4550dfa17c15da481d4510ef7ac44aa36c75c46ab1290e74d",
+        "source_digest": "020ba8957656ca2a38fc29843ba624b902196c87f58fcb112f666e4d8a023cdc",
         "allowed_callees": frozenset({"validate_and_restore_backup_strict"}),
         "reason": "CLI 入口委托:run_restore → validate_and_restore_backup_strict(strict service)",
     },
     # db_restore.py: main() CLI argparse 入口委托给 run_restore
     # R72: --target / --backup-id / --output-json 参数新增,source_digest 重新生成
+    # R73 P1-01: 删除 ALLOW_LEGACY_RESTORE 自动解封,新增 --capability-file / --target-identity,
+    # source_digest 重新生成
     {
         "file": "services/db_restore.py",
         "function": "main",
-        "ast_signature": "c19a5fc788f825213e1a57d4f86c4c30c7f0da23605c8e5d4e4f188a63ff33cd",
-        "source_digest": "fd543ce76c47248bc40ec11d44e9a791d944ac5b8d370921265b0b9e338845ce",
+        "ast_signature": "afd0893f233e9a209feb9a2632bbeec8a65cf6bb42a5a282484d7604c87430ac",
+        "source_digest": "343800a462286fd8cd18e442ebd9e3bb00e7e7636b65b522a50164472128d1f4",
         "allowed_callees": frozenset({"run_restore"}),
         "reason": "CLI argparse 入口委托:main → run_restore(运行时由 run_restore 的 seal 防护)",
     },
     # backup_dr_validate.py: validate_and_restore_backup_strict 构造 capability 后调用私有写入器
     # R69 Wave 2: 延迟 import 改为 from services.restore_writer(不再 import services.db_restore),
     # source_digest 随之更新。allowed_callees 仍为 _restore_from_backup_data(restore_writer.py 中)。
+    # R76 §10.M: 函数体开头新增无条件 AppError/ErrorCodes 导入(修 UnboundLocalError),
+    # source_digest/ast_signature 同步刷新。allowed_callees 未变。
+    # R76 P0-06: nonce_store 初始化新增 cache_store None 跳过逻辑(测试场景),
+    # source_digest/ast_signature 再次刷新。allowed_callees 未变。
+    # R76 P0-05/P0-06 follow-up: operation_context/nonce_store 构造逻辑调整,
+    # source_digest/ast_signature 再次刷新。allowed_callees 未变。
     {
         "file": "services/backup_dr_validate.py",
         "function": "validate_and_restore_backup_strict",
-        "ast_signature": "b5542cdc9e9173653bd91693238d7e897bfab06afd1eb1b22b7c1aebe4fdca5e",
-        "source_digest": "4f51443ba979d72d30a2ffe7337ae903b2bd4c43b8a11d26affa9e4c6cd77273",
+        "ast_signature": "18f4fd0243d3211475c9747f7a191da22e8bb91665474318bd5c7a4929ce4bbc",
+        "source_digest": "da212e83c5a832d678da6f2f06e5dec142450d102a44a9d4ac2f282d5ab2f645",
         "allowed_callees": frozenset({"_restore_from_backup_data"}),
         "reason": "strict service 构造 capability 后调用私有写入器(R69 Wave 2: import 改为 services.restore_writer)",
     },
     # backup_dr_validate.py: _restore_preverified_payload 内部委托给 _restore_from_backup_data
     # R69 Wave 2: 延迟 import 改为 from services.restore_writer,source_digest 随之更新。
+    # R76 P0-05/P0-06: 新增 operation_context + nonce_store 构造逻辑,source_digest 再次更新。
+    # R76 P0-06 fix: nonce_store 初始化新增 cache_store None 跳过逻辑(测试场景),
+    # source_digest/ast_signature 再次刷新。allowed_callees 未变。
+    # R76 P0-05/P0-06 follow-up: operation_context/nonce_store 构造逻辑调整,
+    # source_digest/ast_signature 再次刷新。allowed_callees 未变。
     {
         "file": "services/backup_dr_validate.py",
         "function": "_restore_preverified_payload",
-        "ast_signature": "7076e586fde43d12790d4f568dc40ad6b47b510e43527203abbb207a3c0a41f3",
-        "source_digest": "a60051021ac2397dcf4bfebabe94831f2d71352e9daa60e0e72c2cc01ed9b933",
+        "ast_signature": "3127793d9599d5c0f82e25031cbc0ed63f4bed0b6c9644cf09518cc45173b573",
+        "source_digest": "d0afde162c495d5d4f29490cdc3b06f884efaf330cd377c62d23dfd978e4e3da",
         "allowed_callees": frozenset({"_restore_from_backup_data"}),
-        "reason": "preverified payload 路径委托给私有写入器(R69 Wave 2: import 改为 services.restore_writer)",
+        "reason": "preverified payload 路径委托给私有写入器(R69 Wave 2: import 改为 services.restore_writer;R76 P0-05/P0-06: 新增 operation_context + nonce_store)",
     },
     # R69 Wave 2: services/restore_writer.py 是从 services/db_restore.py 提取出的
     # 生产 runtime 写入器模块(.dockerignore 不排除本文件,生产镜像可用)。
@@ -176,13 +191,17 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
     # _restore_sqlite_tables_to_db),与 db_restore.py 中的旧实现保持语义一致。
     # 生产路径:backup_dr_validate.validate_and_restore_backup_strict → restore_writer._restore_from_backup_data
     # 旧 db_restore.py 保留作为 CLI/tests 入口,生产镜像通过 .dockerignore 排除。
+    # R76 P0-05: digest 校验从 verified_payload.payload_digest 迁移到
+    # operation_context.payload_digest(独立来源),source_digest 更新。
+    # R76 P0-05/P0-06 follow-up: operation_context/nonce_store 调用逻辑调整,
+    # source_digest/ast_signature 再次刷新。allowed_callees 未变。
     {
         "file": "services/restore_writer.py",
         "function": "_restore_from_backup_data",
-        "ast_signature": "65ff17d599a0afebc23b6d8946976f6588cb34190045e1b1632a5e97935a3410",
-        "source_digest": "cba917d40bf23f9ad855aff7ce340da46604f2b5eae030a6fe7eec1526ba60e7",
+        "ast_signature": "afd2e32fc1d587c41068586665efe8728f4bcaa4b8c45421461c66363abb3c59",
+        "source_digest": "7dc07e091755f301d33da420cdba7263c1cd93bd14c22212db9e5c4cd3cd3bb8",
         "allowed_callees": frozenset({"_restore_crdb_tables", "_restore_sqlite_tables_to_db"}),
-        "reason": "R69 Wave 2: restore_writer 同模块私有委托(从 db_restore.py 提取,生产镜像可用)",
+        "reason": "R69 Wave 2: restore_writer 同模块私有委托(从 db_restore.py 提取,生产镜像可用);R76 P0-05: digest 校验改用 operation_context.payload_digest",
     },
     # R66 P0-07: 已 sealed 的生产入口(带 ALLOW_LEGACY_RESTORE capability-seal 检查)
     # R67 P0-06: 在 capability-seal 之前增加 _production_guard 硬守卫。
@@ -194,8 +213,8 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
     {
         "file": "services/db_backup.py",
         "function": "restore_from_backup",
-        "ast_signature": "fd9d01c2f1569c7872fbc9a72dc237cfc2028048995184904392efedf797b88f",
-        "source_digest": "23219be711b675bbfdda5f71cef846e98516d5105940a878b308a5084cc8b849",
+        "ast_signature": "95e279b0ba3363dbe77434d6a44f50ec4b309a341cd023f33a8de389546648ac",
+        "source_digest": "c2e7a584a506795b5619a1f9240291a0b035fa7dc7f2e172a8a144c04e1d38dc",
         "allowed_callees": frozenset({"validate_and_restore_backup_strict"}),
         "reason": (
             "sealed 公共入口:"
@@ -222,6 +241,294 @@ PRECISE_WHITELIST: tuple[dict, ...] = (
         ),
     },
 )
+
+# ═══════════════════════════════════════════════════════════════
+# R73 §5.8 (P1-02): Capability-edge policy manifest
+# ═══════════════════════════════════════════════════════════════
+#
+# 旧方案(PRECISE_WHITELIST + source_digest)的问题:
+#     - source_digest 绑定字面源码,任何注释/格式调整都导致 digest 失配
+#     - 团队必须频繁运行 regenerate_scanner_whitelist_digests.py
+#     - digest 不捕捉"能力边"(caller→callee 关系),只绑定源码文本
+#     - 跨 Python 版本 ast_dump 不稳定(R67 P1-07 hotfix 已用 source_digest 兜底)
+#
+# R73 §5.8 新方案(capability-edge policy):
+#     - 用不可变 manifest 定义允许的 caller→callee 边
+#     - AST 遍历验证所有 legacy writer 调用都有匹配的边
+#     - 检测动态分派(getattr/globals()/__import__/importlib)防止绕过
+#     - 不依赖源码文本,函数重构(重命名变量/调整格式)不影响授权
+#
+# 设计原则:
+#     1. **加法式扩展**:保留 PRECISE_WHITELIST(source_digest)作为兜底,
+#        新增 CAPABILITY_EDGE_POLICY 作为主授权信号
+#     2. **不可变 manifest**:policy 定义在代码中(可未来迁移到 YAML/JSON)
+#     3. **AST 边验证**:遍历 AST 找到所有 legacy writer 调用,
+#        验证 (caller_module, caller_function, callee) 在 policy 中有匹配边
+#     4. **动态分派检测**:扫描 getattr()/globals()/__import__() 等模式,
+#        这些可以绕过静态边验证,必须显式标记
+#     5. **fail-closed**:未知边 → 违规(强制团队更新 policy)
+
+CAPABILITY_EDGE_POLICY_VERSION = 1
+
+# 检测到动态分派的违规类型(供测试与告警路由使用)
+DYNAMIC_DISPATCH_VIOLATION = "DYNAMIC_DISPATCH"
+UNAUTHORIZED_EDGE_VIOLATION = "UNAUTHORIZED_EDGE"
+
+CAPABILITY_EDGE_POLICY: dict = {
+    "version": CAPABILITY_EDGE_POLICY_VERSION,
+    "description": (
+        "R73 §5.8 (P1-02): capability-edge policy — "
+        "allowed caller→callee edges for legacy restore writers. "
+        "Validates AST call graph against immutable edge manifest "
+        "instead of brittle source digests."
+    ),
+    # 允许的 caller→callee 边(每条边 = 一个 capability 授权)
+    "edges": [
+        {
+            "caller_module": "services.db_restore",
+            "caller_function": "run_restore",
+            "allowed_callees": ("validate_and_restore_backup_strict",),
+            "reason": "CLI 入口委托 strict service",
+        },
+        {
+            "caller_module": "services.db_restore",
+            "caller_function": "main",
+            "allowed_callees": ("run_restore",),
+            "reason": "CLI argparse 入口委托 run_restore",
+        },
+        {
+            "caller_module": "services.backup_dr_validate",
+            "caller_function": "validate_and_restore_backup_strict",
+            "allowed_callees": ("_restore_from_backup_data",),
+            "reason": "strict service 构造 capability 后调用私有写入器",
+        },
+        {
+            "caller_module": "services.backup_dr_validate",
+            "caller_function": "_restore_preverified_payload",
+            "allowed_callees": ("_restore_from_backup_data",),
+            "reason": "preverified payload 路径委托私有写入器",
+        },
+        {
+            "caller_module": "services.restore_writer",
+            "caller_function": "_restore_from_backup_data",
+            "allowed_callees": (
+                "_restore_crdb_tables",
+                "_restore_sqlite_tables_to_db",
+            ),
+            "reason": "restore_writer 同模块私有委托",
+        },
+        {
+            "caller_module": "services.db_backup",
+            "caller_function": "restore_from_backup",
+            "allowed_callees": ("validate_and_restore_backup_strict",),
+            "reason": "sealed 公共入口委托 strict service",
+        },
+        {
+            "caller_module": "services.command_bus",
+            "caller_function": "_handler",
+            "allowed_callees": ("restore_from_backup",),
+            "reason": "sealed command handler 委托 sealed 公共入口",
+        },
+    ],
+    # 动态分派模式 — 这些 AST 模式可绕过静态边验证,必须显式标记/禁止
+    # 检测到这些模式时记录为 DYNAMIC_DISPATCH 违规,需人工审计
+    "dynamic_dispatch_patterns": (
+        "getattr",                  # getattr(obj, name)() — 动态调用
+        "globals",                  # globals()[name]() — 动态调用
+        "__import__",               # __import__(name) — 动态导入
+        "importlib.import_module",  # 动态导入(完整路径)
+        "eval",                     # eval(code) — 任意代码执行
+        "exec",                     # exec(code) — 任意代码执行
+    ),
+}
+
+
+def load_capability_edge_policy() -> dict:
+    """R73 §5.8: 加载 capability-edge policy manifest。
+
+    policy 当前硬编码在源码中(不可变),未来可迁移到外部 YAML/JSON 文件
+    (通过 CAPABILITY_EDGE_POLICY_FILE 环境变量指定)。
+
+    Returns:
+        policy dict,包含:
+        - version: int
+        - description: str
+        - edges: list[dict](每条边含 caller_module/caller_function/
+          allowed_callees/reason)
+        - dynamic_dispatch_patterns: tuple[str]
+    """
+    # 未来支持外部文件加载(当前返回硬编码 manifest):
+    # policy_file = os.getenv("CAPABILITY_EDGE_POLICY_FILE")
+    # if policy_file:
+    #     with open(policy_file) as f:
+    #         return json.load(f)
+    return CAPABILITY_EDGE_POLICY
+
+
+def _find_module_name(file_rel: str) -> str:
+    """R73 §5.8: 从相对 POSIX 路径推断 Python 模块名。
+
+    例如:
+        "services/db_restore.py" → "services.db_restore"
+        "services/restore_writer.py" → "services.restore_writer"
+        "bots/admin_bot/handlers.py" → "bots.admin_bot.handlers"
+
+    Args:
+        file_rel: 相对仓库根的 POSIX 路径
+
+    Returns:
+        Python 模块名(点分)
+    """
+    if file_rel.endswith(".py"):
+        file_rel = file_rel[:-3]
+    return file_rel.replace("/", ".")
+
+
+def _is_capability_edge_allowed(
+    policy: dict,
+    caller_module: str,
+    caller_function: str | None,
+    callee: str,
+) -> bool:
+    """R73 §5.8: 检查 (caller_module, caller_function, callee) 是否在 policy 中有匹配边。
+
+    与 _is_call_allowed(source_digest 方案)不同,本函数不绑定源码文本,
+    仅检查 caller→callee 关系是否在 policy 中授权。
+
+    Args:
+        policy: capability-edge policy dict
+        caller_module: 调用方模块名(如 "services.db_restore")
+        caller_function: 调用方函数名(None 表示模块级,永远不允许)
+        callee: 被调用的函数名
+
+    Returns:
+        True 如果有匹配的允许边;False 否则(fail-closed)
+    """
+    if caller_function is None:
+        # 模块级调用 legacy writer 永远不允许
+        return False
+    for edge in policy.get("edges", []):
+        if (
+            edge.get("caller_module") == caller_module
+            and edge.get("caller_function") == caller_function
+            and callee in edge.get("allowed_callees", ())
+        ):
+            return True
+    return False
+
+
+def _find_unauthorized_capability_edges(
+    tree: ast.AST,
+    legacy_funds: set[str],
+    parent_map: dict[int, ast.AST],
+    caller_module: str,
+    policy: dict,
+) -> list[dict]:
+    """R73 §5.8: 遍历 AST 找到所有未授权的 capability 边。
+
+    与 _find_legacy_calls 不同,本函数用 capability-edge policy 验证,
+    而非 source_digest。每个 legacy writer 调用必须有匹配的边在 policy 中。
+
+    Args:
+        tree: AST 树
+        legacy_funds: legacy writer 函数名集合
+        parent_map: 父节点映射
+        caller_module: 当前文件的模块名
+        policy: capability-edge policy dict
+
+    Returns:
+        未授权边列表:
+        [{line, col, func, enclosing, caller_module, callee, violation_type}, ...]
+    """
+    unauthorized: list[dict] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = _get_call_func_name(node)
+        if not func_name or func_name not in legacy_funds:
+            continue
+        enclosing = _find_enclosing_function(node, parent_map)
+        if not _is_capability_edge_allowed(
+            policy, caller_module, enclosing, func_name
+        ):
+            unauthorized.append({
+                "line": node.lineno,
+                "col": node.col_offset,
+                "func": func_name,
+                "enclosing": enclosing,
+                "caller_module": caller_module,
+                "callee": func_name,
+                "violation_type": UNAUTHORIZED_EDGE_VIOLATION,
+            })
+    return unauthorized
+
+
+def _detect_dynamic_dispatch(
+    tree: ast.AST,
+    parent_map: dict[int, ast.AST],
+    caller_module: str,
+    policy: dict,
+) -> list[dict]:
+    """R73 §5.8: 检测动态分派模式(getattr/globals()/__import__ 等)。
+
+    动态分派可绕过静态 capability-edge 验证:
+        getattr(obj, "run_restore")()  # 静态扫描看不到 run_restore
+        globals()["_restore_from_backup_data"]()
+        __import__("services.db_restore").run_restore()
+        importlib.import_module("services.db_restore").run_restore()
+
+    在生产代码中检测到这些模式时,需人工审计确认非恶意绕过。
+    本函数仅检测模式存在性,不判定是否实际调用 legacy writer
+    (动态分派的本质就是静态分析无法判定)。
+
+    Args:
+        tree: AST 树
+        parent_map: 父节点映射
+        caller_module: 当前文件的模块名
+        policy: capability-edge policy dict
+
+    Returns:
+        动态分派违规列表:
+        [{line, col, pattern, enclosing, caller_module, violation_type}, ...]
+    """
+    patterns = set(policy.get("dynamic_dispatch_patterns", ()))
+    violations: list[dict] = []
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func_name = _get_call_func_name(node)
+        if not func_name:
+            continue
+        # 检测直接调用动态分派函数:getattr(...) / globals()(...) / eval(...)
+        if func_name in patterns:
+            enclosing = _find_enclosing_function(node, parent_map)
+            violations.append({
+                "line": node.lineno,
+                "col": node.col_offset,
+                "pattern": func_name,
+                "enclosing": enclosing,
+                "caller_module": caller_module,
+                "violation_type": DYNAMIC_DISPATCH_VIOLATION,
+            })
+            continue
+        # 检测 importlib.import_module(...) 调用(Attribute access 形式)
+        if isinstance(node.func, ast.Attribute):
+            attr = node.func.attr
+            if attr in patterns or f"importlib.{attr}" in patterns:
+                value = node.func.value
+                if isinstance(value, ast.Name) and value.id == "importlib":
+                    enclosing = _find_enclosing_function(node, parent_map)
+                    violations.append({
+                        "line": node.lineno,
+                        "col": node.col_offset,
+                        "pattern": f"importlib.{attr}",
+                        "enclosing": enclosing,
+                        "caller_module": caller_module,
+                        "violation_type": DYNAMIC_DISPATCH_VIOLATION,
+                    })
+    return violations
+
 
 # 完整跳过的白名单文件(不扫描)— 仅引用错误码字符串,无 legacy writer 调用
 WHITELIST_FILES_FULL_SKIP: frozenset[str] = frozenset({

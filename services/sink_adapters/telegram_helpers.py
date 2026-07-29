@@ -45,6 +45,19 @@
     )
     from services.sink_adapters.telegram_adapter import build_bot
     bot = build_bot(token=...)
+
+R76 O2 边界声明:
+    本模块仅重导出 Telegram 类(Application/Bot/Update 等),用于 handler 注册、
+    类型注解和异常捕获。**Provider client 选择**统一由
+    ``services.sink_adapters.telegram_adapter.build_provider_client(settings, token)``
+    工厂完成,业务模块不得:
+        - 自行 ``Application.builder().token(...).build()`` 选择测试实现;
+        - 把 contract adapter(``ContractProviderClient``)伪装为 ``telegram.Bot``
+          子类注入 Application;
+        - 通过 monkey patch ``bot.get_file``/``bot.download_file`` 冒充真实 Provider。
+
+    contract 模式下不构建 Application,updates 由 ``web_adapter`` 的
+    ``/internal/contract/update`` 端点接收并 dispatch(O5 实现)。
 """
 from __future__ import annotations
 

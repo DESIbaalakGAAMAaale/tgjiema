@@ -223,7 +223,56 @@ def _install_telegram_mock_if_missing() -> None:
     _sys.modules["telegram"] = _MM(name="mock_telegram")
     _sys.modules["telegram.ext"] = _MM(name="mock_telegram_ext")
     # 关键:为 Update 类提供可调用构造器,避免 isinstance() 检查失败
-    _sys.modules["telegram"].Update = type("Update", (), {})
+    # R76 §10.M: 补充 de_json 静态方法,供 services/sink_adapters/web_adapter.py
+    # 的 _dispatch_contract_update 调用(telegram.Update.de_json(data, bot))
+    # 返回的 mock Update 需含 message.message_id 等属性,以通过 dispatcher 调用
+    class _MockTelegramUpdate:
+        """Mock telegram.Update(telegram 未安装时供 contract API 测试使用)。"""
+
+        def __init__(self) -> None:
+            self.message = None
+            self.update_id: int = 0
+            self._raw: dict = {}
+            self.effective_user = None
+
+        @staticmethod
+        def de_json(data, bot):
+            """模拟 telegram.Update.de_json — 从 dict 构造 Update 对象。
+
+            Args:
+                data: dict 形式的 Telegram Update payload
+                bot: bot 实例(mock)
+
+            Returns:
+                _MockTelegramUpdate 实例;若 data 非 dict 返回 None
+            """
+            if not isinstance(data, dict):
+                return None
+            update = _MockTelegramUpdate()
+            update._raw = data
+            update.update_id = data.get("update_id", 0)
+            # 构造 mock message(若 data 含 message 字段)
+            msg_data = data.get("message") or {}
+            message = type("MockMessage", (), {})()
+            message.message_id = msg_data.get("message_id", 0)
+            message.date = msg_data.get("date")
+            message.from_user = msg_data.get("from")
+            message.chat = msg_data.get("chat")
+            message.document = msg_data.get("document")
+            update.message = message
+            # R81 fix: web_adapter._dispatch_contract_update 读取 effective_user
+            # 构造 mock effective_user(若 message 含 from 字段)
+            from_data = msg_data.get("from")
+            if isinstance(from_data, dict):
+                user = type("MockUser", (), {})()
+                user.id = from_data.get("id", 0)
+                user.is_bot = from_data.get("is_bot", False)
+                user.first_name = from_data.get("first_name", "")
+                user.username = from_data.get("username")
+                update.effective_user = user
+            return update
+
+    _sys.modules["telegram"].Update = _MockTelegramUpdate
     # R45: mock telegram.error 子模块(mon_bot 从中导入 TelegramError/RetryAfter)
     _telegram_err_mod = _MM(name="mock_telegram_error")
     for _err_name in ("BadRequest", "Forbidden", "RetryAfter", "NetworkError",

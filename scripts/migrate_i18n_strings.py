@@ -165,8 +165,8 @@ def extract_fstring_parts(node: ast.JoinedStr) -> list[tuple[str, str, str]]:
         else:
             try:
                 parts.append(('text', str(ast.unparse(val)), ''))
-            except Exception:
-                pass
+            except Exception as _e:
+                print(f"[WARN] extract_fstring_parts: ast.unparse failed: {_e}", file=sys.stderr)
     return parts
 
 

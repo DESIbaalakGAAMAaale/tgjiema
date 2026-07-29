@@ -1426,7 +1426,8 @@ def _load_module_baseline() -> dict:
         return {}
     try:
         return json.loads(MODULE_BASELINE_FILE.read_text(encoding='utf-8'))
-    except Exception:
+    except Exception as _e:
+        print(f"[WARN] _load_module_baseline: failed to load baseline: {_e}", file=sys.stderr)
         return {}
 
 
@@ -1531,8 +1532,8 @@ def _baseline_total(baseline: dict) -> int:
             if isinstance(t, dict):
                 return int(t.get("baseline", 0))
             return int(t)
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _baseline_total: failed to parse total: {_e}", file=sys.stderr)
     return sum(_baseline_module_count(baseline, m) for m in MODULE_KEYS)
 
 
@@ -1633,8 +1634,8 @@ def _git_base_commit() -> str | None:
             sha = result.stdout.strip()
             if sha:
                 return sha
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _git_base_commit: git merge-base failed: {_e}", file=sys.stderr)
     return None
 
 
@@ -1649,8 +1650,8 @@ def _git_current_branch() -> str | None:
             branch = result.stdout.strip()
             if branch and branch != 'HEAD':
                 return branch
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _git_current_branch: git rev-parse failed: {_e}", file=sys.stderr)
     return None
 
 
@@ -1663,8 +1664,8 @@ def _git_show_file(commit: str, rel_path: str) -> str | None:
         )
         if result.returncode == 0:
             return result.stdout
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _git_show_file: git show failed: {_e}", file=sys.stderr)
     return None
 
 
@@ -1678,8 +1679,8 @@ def _git_list_files_at_commit(commit: str) -> list[str]:
         if result.returncode == 0:
             return [l.replace(chr(92), '/').strip()
                     for l in result.stdout.split('\n') if l.strip()]
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _git_list_files_at_commit: git ls-tree failed: {_e}", file=sys.stderr)
     return []
 
 

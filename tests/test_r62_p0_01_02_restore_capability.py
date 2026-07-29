@@ -94,6 +94,8 @@ def _ensure_restore_module_importable():
         mock_r2_obj._access_key = ""
         mock_r2._r2 = mock_r2_obj
         mock_r2.configure_r2_dynamic = AsyncMock()
+        # R76 O7: configure_r2_dynamic 已重构为 configure_storage_from_settings
+        mock_r2.configure_storage_from_settings = AsyncMock()
         sys.modules["storage.r2"] = mock_r2
         setattr(sys.modules.get("storage", types.ModuleType("storage")), "r2", mock_r2)
 
@@ -145,6 +147,37 @@ async def _fresh_store():
     _store = CacheStore(db_path=_db_path)
     await _store.init()
     return _store
+
+
+def _build_operation_context(
+    *,
+    payload_digest: str,
+    backup_id: str = "backup_test_001",
+    schema_fingerprint: str = "R62-P0-01-test-fingerprint",
+    nonce: str = "test_nonce_0123456789abcdef0123456789abcdef",
+):
+    """R76 P0-05: 构造合法的 RestoreOperationContext(独立 expected 值来源)。
+
+    writer 用 operation_context.payload_digest 校验 actual bytes digest,
+    替代旧 R63 的 verified_payload.payload_digest(同对象内字段,可被同时篡改)。
+    """
+    from services.restore_operation_context import RestoreOperationContext
+    ctx = RestoreOperationContext(
+        operation_id="op_test_001",
+        backup_id=backup_id,
+        source_sha="test_source_sha",
+        run_id=0,
+        run_attempt=1,
+        audience="test_audience",
+        target_identity=schema_fingerprint,
+        target_uri="sqlite:///tmp/test_restore.db",
+        manifest_digest="a" * 64,
+        payload_digest=payload_digest,
+        allowed_action="restore_to_blank_target",
+        nonce=nonce,
+    )
+    ctx.validate()  # fail-closed
+    return ctx
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -687,15 +720,33 @@ class TestStrictValidationRejectsTampering:
     @pytest.mark.asyncio
     async def test_valid_three_stage_backup_passes_and_calls_writer(self, monkeypatch):
         """附加: 合法三段式备份通过验证,调用 _restore_from_backup_data 并传入 VerifiedBackupPayload。"""
+        # R76 P0-06: validate_and_restore_backup_strict 内部签发 capability 需要
+        # RESTORE_CAPABILITY_SIGNING_KEY 环境变量(本地测试用固定 key)
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
         mod = _ensure_backup_dr_validate_importable()
         bundle = _build_three_stage_backup(mod)
+
+        # R76 P0-06: mock RestoreNonceStore.reserve 返回 True,避免依赖真实 cache_store
+        # (测试环境下 cache_store 单例可能未初始化 SQLite/CRDB,导致 reserve 返回 False)
+        # 同时 mock RestoreOperationContext.validate 通过(由 issue_capability 已生成合法字段)
+        mock_nonce_store_instance = MagicMock()
+        mock_nonce_store_instance.reserve = AsyncMock(return_value=True)
+        mock_nonce_store_instance.consume = AsyncMock(return_value=True)
+        mock_nonce_store_instance.fail = AsyncMock(return_value=True)
+        mock_nonce_store_cls = MagicMock(return_value=mock_nonce_store_instance)
+        monkeypatch.setattr(
+            "services.restore_nonce_store.RestoreNonceStore", mock_nonce_store_cls,
+        )
 
         # Mock 写入器,验证传入的是 VerifiedBackupPayload
         captured = {}
 
-        async def _fake_writer(verified_payload, *, _capability, tables=None, merge=False):
+        async def _fake_writer(verified_payload, *, capability, operation_context,
+                               nonce_store, tables=None, merge=False):
             captured["verified_payload"] = verified_payload
-            captured["capability"] = _capability
+            captured["capability"] = capability
+            captured["operation_context"] = operation_context
+            captured["nonce_store"] = nonce_store
             captured["tables"] = tables
             captured["merge"] = merge
             return {"restored": {}, "skipped": [], "errors": []}
@@ -725,8 +776,16 @@ class TestStrictValidationRejectsTampering:
 
         # 验证传入的是 VerifiedBackupPayload 实例(而非 raw dict)
         assert isinstance(captured["verified_payload"], mod.VerifiedBackupPayload)
-        # 验证 capability 的 payload_digest 与 VerifiedBackupPayload.payload_digest 一致
-        assert captured["capability"].payload_digest == captured["verified_payload"].payload_digest
+        # R76 P0-05: operation_context 提供独立 expected 值,与 verified_payload 共享
+        # 信任链字段(manifest_sha256 / backup_id)一致(均来自已验证的 manifest)
+        assert captured["operation_context"].manifest_digest == captured["verified_payload"].manifest_sha256
+        assert captured["operation_context"].backup_id == captured["verified_payload"].backup_id
+        # R76 P0-05: operation_context.payload_digest 必须为 64 hex(非空,fail-closed)
+        assert len(captured["operation_context"].payload_digest) == 64
+        # R76 P0-06: capability 是 dict(HMAC 签名),nonce 与 operation_context.nonce 一致
+        assert captured["capability"]["nonce"] == captured["operation_context"].nonce
+        # nonce_store 被注入(非 None)
+        assert captured["nonce_store"] is not None
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -844,7 +903,15 @@ class TestRunRestoreFailsOnLegacyFormat:
         mock_r2._access_key = "fake"
         mock_r2.download = AsyncMock(return_value=mock_content)
         monkeypatch.setattr(db_backup, "r2_storage", mock_r2)
-        monkeypatch.setattr(db_backup, "configure_r2_dynamic", AsyncMock())
+        # R76 O7: configure_r2_dynamic 已重构为 configure_storage_from_settings
+        monkeypatch.setattr(db_backup, "configure_storage_from_settings", AsyncMock())
+        # R67 P0-06 / R65 P0-07: 旧格式 key 拒绝逻辑在 capability-seal 之后,
+        # 需设置 ALLOW_LEGACY_RESTORE=1 才能到达旧格式 key 检测分支
+        monkeypatch.setenv("ALLOW_LEGACY_RESTORE", "1")
+        # 确保非生产环境(_production_guard 不阻断)
+        monkeypatch.delenv("APP_ENV", raising=False)
+        monkeypatch.delenv("ENVIRONMENT", raising=False)
+        monkeypatch.delenv("DEPLOY_ENV", raising=False)
 
         # 旧格式 key: db_backup/db_backup_*.json
         with pytest.raises(AppError):
@@ -904,6 +971,19 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
             schema_fingerprint="R62-P0-01-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        # R76 P0-05: 用真实 RestoreOperationContext(独立 payload_digest 来源)
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R62-P0-01-test-fingerprint",
+        )
+
         captured = {}
 
         async def _fake_crdb(tables_data, merge, result):
@@ -921,7 +1001,9 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
              patch("services.restore_writer._restore_sqlite_tables_to_db", _fake_sqlite):
             result = await _restore_from_backup_data(
                 verified_payload,
-                _capability=cap,
+                capability=cap,
+                operation_context=operation_context,
+                nonce_store=MagicMock(),
                 tables=None,
                 merge=False,
             )
@@ -961,6 +1043,21 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
             schema_fingerprint="R62-P0-01-test-fingerprint",
         )
 
+        # R76 P0-05/P0-06: writer 需要 RESTORE_CAPABILITY_SIGNING_KEY env + operation_context + nonce_store
+        monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "test-restore-capability-signing-key-32b")
+        monkeypatch.setattr(
+            "services.restore_capability_file.verify_and_consume_capability",
+            AsyncMock(return_value=True),
+        )
+        # R76 P0-05: 用真实 RestoreOperationContext(独立 payload_digest 来源)
+        # operation_context.payload_digest 与 cap.payload_digest 一致("0"*64),
+        # 与 verified_payload.payload_digest 不匹配 → writer digest 校验 fail-closed
+        operation_context = _build_operation_context(
+            payload_digest=cap.payload_digest,
+            backup_id="backup_test_001",
+            schema_fingerprint="R62-P0-01-test-fingerprint",
+        )
+
         # 调用应在首条语句(assert_valid)抛 AppError,不读 tables
         from unittest.mock import patch
         read_called = MagicMock()
@@ -974,7 +1071,9 @@ class TestRestoreFromBackupDataReadsVerifiedPayload:
             with pytest.raises(AppError):
                 await _restore_from_backup_data(
                     verified_payload,
-                    _capability=cap,
+                    capability=cap,
+                    operation_context=operation_context,
+                    nonce_store=MagicMock(),
                     tables=None,
                     merge=False,
                 )

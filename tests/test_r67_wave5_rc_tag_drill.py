@@ -56,7 +56,7 @@ import json
 import sys
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -237,7 +237,6 @@ class TestVerifyTagWorkflowTriggered:
         assert result["details"]["conclusion"] == "success"
 
     @patch("scripts.rc_tag_drill._run_git")
-    @patch.dict("os.environ", {}, clear=False)
     def test_no_repo_fails(self, mock_git, monkeypatch):
         """无法确定 repo → 失败。"""
         monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)

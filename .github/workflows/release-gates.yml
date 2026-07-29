@@ -1,4 +1,4 @@
-name: Release Gates
+﻿name: Release Gates
 
 # ════════════════════════════════════════════════════════════════
 # R58 P0-1: build-once + 签名 verification statement + digest-pinned promote
@@ -89,6 +89,10 @@ on:
   #     3. 校验 typed_confirmation == "PROMOTE-RC-TO-PRODUCTION"
   #   任何字段不匹配 → verify-rc-identity failure → production-promotion-gate
   #   无法运行 → production 部署被阻断(fail-closed)。
+  # R73 §5.6 (P0-07): workflow_dispatch 不再内联执行 production promotion 逻辑,
+  #   而是委托给 _promote-verified-rc.yml (single reusable workflow)。
+  #   inputs 扩展为 9 个字段 (与 reusable workflow 对齐),增加:
+  #     rc_run_attempt / image_repo_digest / runtime_config_digest / production_tag
   workflow_dispatch:
     inputs:
       rc_tag:
@@ -99,6 +103,11 @@ on:
         description: 'RC workflow run ID (numeric)'
         required: true
         type: string
+      rc_run_attempt:
+        description: 'RC workflow run attempt number (must match the successful run)'
+        required: true
+        type: string
+        default: '1'
       source_sha:
         description: 'Source commit SHA the RC was built from (40-char hex)'
         required: true
@@ -107,12 +116,20 @@ on:
         description: 'Candidate manifest digest (sha256:<64-hex>)'
         required: true
         type: string
-      image_digest:
-        description: 'RC image digest (sha256:<64-hex>)'
+      image_repo_digest:
+        description: 'Image RepoDigest (ghcr.io/<repo>@sha256:<64-hex>) from RC run'
+        required: true
+        type: string
+      runtime_config_digest:
+        description: 'Runtime config digest (sha256:<64-hex>) from RC run (host config binding)'
         required: true
         type: string
       typed_confirmation:
         description: 'Type "PROMOTE-RC-TO-PRODUCTION" to confirm'
+        required: true
+        type: string
+      production_tag:
+        description: 'Production tag to create (e.g. production-v1.0.0, format production-vX.Y.Z)'
         required: true
         type: string
 
@@ -152,8 +169,16 @@ jobs:
       # R66 P0-02: catalog digest 在 build 前已冻结,作为 sign-image job
       # 校验镜像内 catalog 的 baseline(禁止 build 后修改)。
       catalog_digest: ${{ steps.regenerate_catalog.outputs.catalog_digest }}
+      # R73 P1-04: 是否推送镜像到 GHCR。
+      #   master push → 'false' (只做可重复构建验证,不推送,减少候选身份噪声)
+      #   rc-v* tag   → 'true'  (推送不可变 RC candidate digest)
+      #   PR          → 'true'  (推送临时 ci 命名空间镜像,短 retention)
+      # 下游 job (oci-allowlist-verify / validate-oci-rootfs /
+      # runtime-smoke-compose / bind-runtime-config) 通过此输出判断
+      # 是否能 docker pull by digest。
+      should_push: ${{ steps.meta.outputs.should_push }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     # R71 P0-09: fail-closed guard — defense in depth. If a production-v* tag
     # ever reaches this job (e.g. via a bypassed `if:`), exit 1 immediately.
@@ -197,15 +222,17 @@ jobs:
     # R71 P0-10: master push → staging 命名空间 ONLY(不再进入生产命名空间)
     #            只有 rc-v* tag 产生 production-eligible 镜像。
     #            production-v* tag 不触发 docker-build(P0-09 if 守卫 + fail-closed 步骤)。
+    # R73 P1-04: master push 只做可重复构建验证 — 不推送 GHCR,减少候选身份噪声。
+    #            唯一 RC 构建由 rc-v* tag 触发,promotion 只消费该 digest。
     - name: Compute image tag
       id: meta
       run: |
         # tag 在所有 job 间共享 (rc-continuity / publish-attestation / sign-image)
         # 同一 SHA + 不同 run_id 时 tag 也会变化 (用于 RC continuity 比对)
-        # R67 P1-14 / R70 P0-10 / R71 P0-10: 命名空间选择
+        # R67 P1-14 / R70 P0-10 / R71 P0-10 / R73 P1-04: 命名空间选择
         #   - 生产命名空间 ghcr.io/${{ github.repository }}:仅 rc-v* tag 可推送(可晋级镜像)
         #   - Staging 命名空间 ghcr.io/${{ github.repository }}-staging:master/main push
-        #     (CI/staging 用,NOT eligible for production promotion)
+        #     (R73 P1-04: master push 不再推送,只做构建验证 — should_push=false)
         #   - 临时命名空间 ghcr.io/${{ github.repository }}-ci:PR 与非 master 分支 push
         #     使用短 retention(由 cleanup-ci-images job 自动清理)
         #   - production-v* tag:理论上不会到达此步骤(R71 P0-09 在 job-if 层 + fail-closed
@@ -219,36 +246,46 @@ jobs:
           IMAGE_NAME="ghcr.io/${REPO}"
           IS_PRODUCTION_NAMESPACE="true"
           RETENTION_DAYS="permanent"
+          SHOULD_PUSH="true"  # R73 P1-04: RC tag 推送不可变 digest
+          IMAGE_TAG_PREFIX="rc"
         elif [[ "${GITHUB_REF}" == refs/tags/production-v* ]]; then
           # R71 P0-09: production-v* tag 不应到达此步骤(job-if + fail-closed guard
           #   已双重拦截)。本分支为 defense-in-depth 文档化保留 — 若实际执行,
           #   上方 fail-closed guard step 已 exit 1,此赋值不会被使用。
-          #   保留生产命名空间赋值以保持向后兼容(且符合"production 不重建"语义)。
           IMAGE_NAME="ghcr.io/${REPO}"
           IS_PRODUCTION_NAMESPACE="true"
           RETENTION_DAYS="permanent"
+          SHOULD_PUSH="false"  # production 不重建(P0-09)
+          IMAGE_TAG_PREFIX="production"
         elif [[ "${GITHUB_REF}" == "refs/heads/master" || "${GITHUB_REF}" == "refs/heads/main" ]]; then
-          # R71 P0-10: master/main push → staging 命名空间 ONLY
-          #   只有 rc-v* tag 产生 production-eligible 镜像。
-          #   master 镜像仅用于 CI/staging — NOT eligible for production promotion。
+          # R71 P0-10 + R73 P1-04: master/main push → 只做构建验证,不推送 GHCR
+          #   候选身份噪声过大 — 唯一 RC 构建由 rc-v* tag 触发。
+          #   master push 仍构建镜像(验证 Dockerfile 可重复构建),但 should_push=false。
+          #   下游需要 docker pull 的 job 通过 should_push 输出跳过。
           IMAGE_NAME="ghcr.io/${REPO}-staging"
           IS_PRODUCTION_NAMESPACE="false"
-          RETENTION_DAYS="30"  # staging retention, not permanent
+          RETENTION_DAYS="30"  # staging retention (仅文档化,实际不推送)
+          SHOULD_PUSH="false"  # R73 P1-04: master push 不推送
+          IMAGE_TAG_PREFIX="dev"
         else
           # PR 或非 master 分支 push → 临时命名空间 + 短 retention
           IMAGE_NAME="ghcr.io/${REPO}-ci"
           IS_PRODUCTION_NAMESPACE="false"
           RETENTION_DAYS="7"
+          SHOULD_PUSH="true"  # PR 推送 ci 命名空间镜像用于测试
+          IMAGE_TAG_PREFIX="ci"
         fi
-        IMAGE_TAG="ci-${{ github.sha }}-${{ github.run_id }}"
+        IMAGE_TAG="${IMAGE_TAG_PREFIX}-${{ github.sha }}-${{ github.run_id }}"
         echo "name=${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
         echo "tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
         echo "image_ref=${IMAGE_NAME}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
         echo "is_production_namespace=${IS_PRODUCTION_NAMESPACE}" >> "$GITHUB_OUTPUT"
         echo "retention_days=${RETENTION_DAYS}" >> "$GITHUB_OUTPUT"
+        echo "should_push=${SHOULD_PUSH}" >> "$GITHUB_OUTPUT"
         echo "镜像引用: ${IMAGE_NAME}:${IMAGE_TAG}"
         echo "命名空间类型: $([ "${IS_PRODUCTION_NAMESPACE}" = "true" ] && echo '生产(可晋级)' || echo '临时/staging(短 retention)')"
         echo "Retention: ${RETENTION_DAYS}"
+        echo "R73 P1-04: should_push=${SHOULD_PUSH} (master=false / rc=true / PR=true)"
 
     # R66 P0-02: manifest 在 docker build 前已冻结, build 后禁止修改任何
     #   声称位于镜像内的发布输入。catalog-only manifest 必须在 build 前重生,
@@ -260,7 +297,7 @@ jobs:
     # R66 P0-01: catalog 不再绑定 release_commit/tree_sha(catalog-only 模型,
     #            自引用循环根因)。HEAD 绑定由 release-manifest.json 承担。
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -295,12 +332,16 @@ jobs:
         echo "  manifest sha256: ${CATALOG_DIGEST}"
 
     # R58 P0-1: build once — 构建并推送 GHCR 一次
+    # R73 P1-04: master push 只构建验证,不推送(push: false + load: true)。
+    #            rc-v* tag 与 PR 仍正常推送(push: true)。
+    #            通过 steps.meta.outputs.should_push 动态决定。
     - name: Build and push OCI image (build once)
       id: build
       uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25
       with:
         context: .
-        push: true
+        push: ${{ steps.meta.outputs.should_push == 'true' }}
+        load: ${{ steps.meta.outputs.should_push == 'false' }}
         tags: ${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.tag }}
         build-args: |
           PYTHON_IMAGE=${{ steps.parse.outputs.image_ref }}
@@ -310,6 +351,9 @@ jobs:
         cache-to: type=gha,mode=max
 
     # R58 P0-1: 输出 image_digest 供后续 job 引用 (强引用, 不可变)
+    # R73 P1-04: master push (should_push=false) 仍输出本地构建 digest,
+    #            但该 digest 未推送 GHCR,下游 job 通过 should_push 输出
+    #            跳过 docker pull 等需要 registry 访问的步骤。
     - name: Expose image digest
       run: |
         echo "=== R58 P0-1: Build Once Digest Exposed ==="
@@ -317,6 +361,7 @@ jobs:
         echo "image_tag: ${{ steps.meta.outputs.tag }}"
         echo "image_digest: ${{ steps.build.outputs.digest }}"
         echo "image_ref (digest-pinned): ${{ steps.meta.outputs.name }}@${{ steps.build.outputs.digest }}"
+        echo "R73 P1-04: should_push=${{ steps.meta.outputs.should_push }}"
         # 写入文件供 artifact 上传
         cat > image_build_info.json <<EOF
         {
@@ -325,12 +370,16 @@ jobs:
           "image_digest": "${{ steps.build.outputs.digest }}",
           "image_ref": "${{ steps.meta.outputs.name }}@${{ steps.build.outputs.digest }}",
           "commit_sha": "${{ github.sha }}",
-          "run_id": "${{ github.run_id }}"
+          "run_id": "${{ github.run_id }}",
+          "should_push": "${{ steps.meta.outputs.should_push }}"
         }
         EOF
         cat image_build_info.json
 
+    # R73 P1-04: master push (should_push=false) 跳过 digest pull 验证
+    #            (镜像未推送 GHCR,无法 docker pull by digest)
     - name: Verify image pull by digest
+      if: steps.meta.outputs.should_push == 'true'
       run: |
         # R58 P0-1: 通过 digest 拉取验证镜像真实可用 (内容地址, 不可变)
         # R66 P0-04 修复: GHCR 在 docker buildx build --push 后存在短暂的传播延迟,
@@ -407,7 +456,9 @@ jobs:
     #   3. 验证 content-addressed 不可变性跨 3 次访问成立
     # 注意:这里是 replay(重新 pull/inspect 同一 digest),不是 rebuild(重新 build)。
     #       rebuild 会产生新 digest,无法验证不可变性;replay 验证同 digest 不变性。
+    # R73 P1-04: master push (should_push=false) 跳过 — 镜像未推送 GHCR。
     - name: "R66 P1-12: Same-candidate immutable re-verification (3x digest replay)"
+      if: steps.meta.outputs.should_push == 'true'
       run: |
         set -euo pipefail
         echo "=== R66 P1-12: Same-candidate immutable re-verification (3x digest replay) ==="
@@ -473,7 +524,7 @@ jobs:
         echo "  immutability: verified (same digest across 3 independent pulls)"
 
     - name: Upload build info artifact
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: docker-build-info-${{ github.sha }}-${{ github.run_id }}
         path: image_build_info.json
@@ -485,21 +536,24 @@ jobs:
   #   2. allowlist 验证:生产入口依赖文件存在
   #   3. import smoke:关键模块在镜像内可 import
   # R69 P0-5: 不得依靠 .dockerignore 单点排除敏感文件 — 此 job 是第三道防线
+  # R73 P1-04: master push (should_push=false) 跳过 — 镜像未推送 GHCR,
+  #            无法 docker pull by digest 进行 allowlist 验证。
   oci-allowlist-verify:
     runs-on: ubuntu-latest
     needs: [docker-build]
+    if: needs.docker-build.result == 'success' && needs.docker-build.outputs.should_push == 'true'
     # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
-    # production-v*=production。oci-allowlist-verify 在 master push 与 RC tag 都运行。
+    # production-v*=production。oci-allowlist-verify 在 RC tag 与 PR 都运行。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
       packages: read   # 拉取 GHCR 镜像必需
     steps:
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
 
@@ -536,21 +590,23 @@ jobs:
   #   6. 输出 oci-file-manifest.json(绑定 source_sha + image_digest + base_image_digest)
   # R71 P0-12: 不再依赖 .dockerignore 单点排除,CI 直接验证最终 rootfs
   # 依赖 docker-build(image digest)+ oci-allowlist-verify(已 pull image)
+  # R73 P1-04: master push (should_push=false) 跳过 — 镜像未推送 GHCR。
   validate-oci-rootfs:
     runs-on: ubuntu-latest
     needs: [docker-build, oci-allowlist-verify]
+    if: needs.docker-build.result == 'success' && needs.docker-build.outputs.should_push == 'true'
     # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
-    # production-v*=production。validate-oci-rootfs 在 master push 与 RC tag 都运行。
+    # production-v*=production。validate-oci-rootfs 在 RC tag 与 PR 都运行。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
       packages: read   # 拉取 GHCR 镜像必需
     steps:
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
 
@@ -616,7 +672,7 @@ jobs:
 
       - name: Upload oci-file-manifest artifact (immutable)
         if: always()
-        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: oci-file-manifest-${{ github.sha }}
           path: oci-file-manifest.json
@@ -627,21 +683,23 @@ jobs:
   # R69 Wave 7 要求:静态 lint 不得命名为 runtime smoke,
   # 真实运行态 smoke 必须实际启动容器验证 SIGTERM 处理与日志扫描
   # 依赖 docker-build(image digest),验证同一不可变候选的真实运行时行为
+  # R73 P1-04: master push (should_push=false) 跳过 — 镜像未推送 GHCR。
   runtime-smoke-compose:
     runs-on: ubuntu-latest
     needs: [docker-build]
+    if: needs.docker-build.result == 'success' && needs.docker-build.outputs.should_push == 'true'
     # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
-    # production-v*=production。runtime-smoke-compose 在 master push 与 RC tag 都运行。
+    # production-v*=production。runtime-smoke-compose 在 RC tag 与 PR 都运行。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     permissions:
       contents: read
       packages: read   # 拉取 GHCR 镜像必需
     steps:
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
 
@@ -683,36 +741,73 @@ jobs:
     runs-on: ubuntu-latest
     needs: [docker-build]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v')
+    # R74 P0-04/P0-05: RC identity outputs — 供下游 job 核验 RC 身份
+    # R75 P1-03: tag_object_sha 和 source_sha 必须分别获取 — annotated tag 的 tag object SHA
+    # 与 peeled commit SHA 不是同一对象。
+    outputs:
+      rc_tag: ${{ github.ref_name }}
+      tag_object_sha: ${{ steps.identity.outputs.tag_object_sha }}
+      source_sha: ${{ steps.identity.outputs.source_sha }}
+      tree_sha: ${{ steps.identity.outputs.tree_sha }}
+      run_id: ${{ github.run_id }}
+      run_attempt: ${{ github.run_attempt }}
+      workflow_path: ${{ github.workflow_ref }}
+      image_repo_digest: ${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}
+      runtime_config_digest: ${{ steps.identity.outputs.runtime_config_digest }}
     environment: rc-candidate
     permissions:
       contents: read
       packages: read   # 拉取 GHCR 镜像必需
-    services:
-      # R71 RC13 fix: cockroach insecure 模式只监听 localhost:26257,Docker
-      # port publishing 转发到容器 eth0:26257 无法到达 localhost-only 进程。
-      # 多次尝试 (RC11 listen-addr=0.0.0.0 被拒, RC12 默认配置仍不可达) 均失败。
-      # 改用 PostgreSQL service container — asyncpg 驱动兼容两种数据库 wire
-      # protocol,DDL 99% 兼容 (TTL 语句由 try/except 兜底)。
-      # UPSERT 已改为 INSERT ... ON CONFLICT (两种 DB 都支持)。
-      # 生产仍使用 CockroachDB,CI 用 PostgreSQL 仅用于 compose-runtime-e2e。
-      postgres:
-        image: postgres:16-alpine
-        ports:
-          - 5432:5432
-        env:
-          # CI 无密码连接 (类似 cockroach insecure 模式)
-          POSTGRES_HOST_AUTH_METHOD: trust
-        options: >-
-          --health-cmd "pg_isready -h localhost -p 5432"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
+    # R75 P0-02/P0-03: 删除 GitHub Actions service container —
+    # GitHub Actions service 不支持 entrypoint/command 参数,导致 workflow 0 jobs 失败。
+    # CockroachDB 改为在 docker-compose.yml 中定义,与应用容器在同一 compose 网络。
+    # 应用容器通过 DNS 名称 "cockroachdb:26257" 连接 CRDB。
     steps:
       - name: Checkout
-        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0  # R75 P1-03: 需要 tag 对象用于 rev-parse
+
+      - name: Compute RC identity outputs (tag_object_sha, source_sha, tree_sha, runtime_config_digest)
+        id: identity
+        run: |
+          set -euo pipefail
+          # R76 10.F / P0-07: 严格 annotated signed tag 身份校验
+          # 禁止 lightweight tag 降级、禁止 fallback、禁止 warning
+          # 关闭条件:lightweight、无签名、无可验证 tagger 或 tag object 不存在必须立即失败
+          TAG_NAME="${{ github.ref_name }}"
+          # 1. 验证 tag object 类型必须为 "tag"(annotated tag)
+          TAG_TYPE=$(git cat-file -t "refs/tags/${TAG_NAME}")
+          if [ "${TAG_TYPE}" != "tag" ]; then
+            echo "::error::Tag ${TAG_NAME} is '${TAG_TYPE}', not 'tag' (annotated tag required)"
+            exit 1
+          fi
+          # 2. 获取 tag object SHA (annotated tag 对象本身,不等于 commit SHA)
+          TAG_OBJECT_SHA=$(git rev-parse "refs/tags/${TAG_NAME}^{tag}")
+          # 3. 验证 tag 签名 (必须为 signed annotated tag)
+          git verify-tag "${TAG_NAME}"
+          # 4. 获取 peeled commit SHA (tag 指向的 commit)
+          SOURCE_SHA=$(git rev-parse "refs/tags/${TAG_NAME}^{commit}")
+          # 5. tag object SHA 必须不等于 peeled commit SHA (annotated tag 的本质特征)
+          if [ "${TAG_OBJECT_SHA}" = "${SOURCE_SHA}" ]; then
+            echo "::error::tag_object_sha == source_sha (${TAG_OBJECT_SHA}) — annotated tag required, not lightweight"
+            exit 1
+          fi
+          TREE_SHA=$(git rev-parse "${TAG_NAME}^{tree}")
+          echo "tag_object_sha=${TAG_OBJECT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "tree_sha=${TREE_SHA}" >> "$GITHUB_OUTPUT"
+          # R75 P1-02: 删除 runtime config digest 的 || echo unknown 吞错
+          # 文件缺失或 sha 计算失败必须 fail-closed,不得生成可继续使用的 "unknown" digest
+          RUNTIME_CONFIG_DIGEST=$(sha256sum docker-compose.yml docker-compose.prod.yml config/groups.yaml config/topology.yaml | sha256sum | cut -d' ' -f1)
+          echo "runtime_config_digest=sha256:${RUNTIME_CONFIG_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "tag_object_sha=${TAG_OBJECT_SHA}"
+          echo "source_sha=${SOURCE_SHA}"
+          echo "tree_sha=${TREE_SHA}"
+          echo "runtime_config_digest=sha256:${RUNTIME_CONFIG_DIGEST}"
 
       - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
 
@@ -733,8 +828,9 @@ jobs:
       - name: Prepare .env for Compose Runtime E2E
         run: |
           set -euo pipefail
-          # 生成最小 .env 占位,让 compose_runtime_e2e.py preflight 通过
-          # (compose_runtime_e2e.py 检查 REDIS_*_PASSWORD 非空 + TGJIEMA_IMAGE@sha256:)
+          # R76 10.F: secretless 模式 — 不读取任何真实外部凭证
+          # 所有 secrets.TEST_* / secrets.R2_* / secrets.COCKROACHDB_* 已删除
+          # 使用 docker-compose.secretless.yml overlay 提供 provider-sim/MinIO/CRDB
           IMAGE_REF="${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}"
           cat > .env <<EOF
           REDIS_HEALTH_PASSWORD=ci-placeholder-health
@@ -745,84 +841,83 @@ jobs:
           EOF
           echo ".env 已生成(含 TGJIEMA_IMAGE digest)"
 
-      - name: Generate minimal secrets placeholders
+      - name: Generate secretless CI credentials (single-run temporary)
+        env:
+          # R72 RC69: BACKUP_SIGNING_KEY 从 GitHub Secrets 读取(非 secretless 模式)
+          # R76 §10.F: secretless 模式下 secrets.BACKUP_SIGNING_KEY 可为空,
+          # 由脚本生成 CI_BACKUP_SIGNING_KEY 覆盖,确保 backup/restore round-trip 可执行
+          BACKUP_SIGNING_KEY: ${{ secrets.BACKUP_SIGNING_KEY }}
         run: |
           set -euo pipefail
-          # 与 compose-config job 一致:生成 .env.secrets.<service> 占位
+          # R76 10.F / 10.A: 生成单次 run 临时凭证,job 结束销毁
+          # 禁止读取 secrets.TEST_* / secrets.R2_* / secrets.COCKROACHDB_* / production Environment
+          # 所有外部边界使用协议兼容模拟服务(provider-sim / MinIO / 本地 CRDB)
+          # 生成临时凭证并立即 mask(避免日志泄露)
+          CI_MINIO_ROOT_USER="minio-ci-$(date +%s)"
+          CI_MINIO_ROOT_PASSWORD=$(openssl rand -hex 24)
+          CI_PROVIDER_CONTRACT_TOKEN=$(openssl rand -hex 24)
+          CI_PROVIDER_RECEIPT_KEY=$(openssl rand -hex 32)
+          CI_BACKUP_SIGNING_KEY=$(openssl rand -hex 32)
+          # R76 §10.F: secretless 模式下,如果 secrets.BACKUP_SIGNING_KEY 为空,
+          # 使用运行时生成的 CI_BACKUP_SIGNING_KEY 替代,确保 backup/restore round-trip 可执行
+          # RC69 round-trip HMAC 签名密钥:backup 用此 key 签名 COMPLETE marker,
+          # restore 用同一 key 验签,两者必须一致才能完成 round-trip 验证
+          if [ -z "${BACKUP_SIGNING_KEY}" ]; then
+            BACKUP_SIGNING_KEY="${CI_BACKUP_SIGNING_KEY}"
+          fi
+          # mask 临时凭证(防止日志意外输出)
+          echo "::add-mask::${CI_MINIO_ROOT_PASSWORD}"
+          echo "::add-mask::${CI_PROVIDER_CONTRACT_TOKEN}"
+          echo "::add-mask::${CI_PROVIDER_RECEIPT_KEY}"
+          echo "::add-mask::${CI_BACKUP_SIGNING_KEY}"
+          # 导出到 GITHUB_ENV 供后续 step 使用
+          echo "CI_MINIO_ROOT_USER=${CI_MINIO_ROOT_USER}" >> "$GITHUB_ENV"
+          echo "CI_MINIO_ROOT_PASSWORD=${CI_MINIO_ROOT_PASSWORD}" >> "$GITHUB_ENV"
+          echo "CI_PROVIDER_CONTRACT_TOKEN=${CI_PROVIDER_CONTRACT_TOKEN}" >> "$GITHUB_ENV"
+          echo "CI_PROVIDER_RECEIPT_KEY=${CI_PROVIDER_RECEIPT_KEY}" >> "$GITHUB_ENV"
+          echo "CI_BACKUP_SIGNING_KEY=${CI_BACKUP_SIGNING_KEY}" >> "$GITHUB_ENV"
+
+          # 生成 .env.secrets.<service> 占位(secretless 模式下 bot token 为固定 ci-local-token)
           for svc in db_writer up idx dsp mon admin_bot admin prometheus_exporter; do
             touch ".env.secrets.${svc}"
           done
-          # R71 RC25 fix: CI 环境无法提供真实 Telegram Bot Token。
-          # 设置占位符 BOT_TOKEN 使 Settings 验证通过 + readiness gate 的
-          # _check_bot_token_valid() 在 CI 模式下(CI=true)跳过 getMe 调用,
-          # 只验证 token 格式(数字:字母数字混合,>= 10 字符)。
-          # 占位符格式: 0000000000:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB
-          PLACEHOLDER_TOKEN="0000000000:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
-          echo "UP_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.up
-          echo "IDX_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.idx
-          echo "DSP_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.dsp
-          echo "MON_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.mon
-          echo "ADMIN_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.admin_bot
-          # admin 服务也需要 ADMIN_BOT_TOKEN(ROLE_REQUIREMENTS["admin"] 包含
-          # bot_token_valid 全部检查,_get_bot_token_for_role("admin") 读取
-          # ADMIN_BOT_TOKEN 环境变量)
-          echo "ADMIN_BOT_TOKEN=${PLACEHOLDER_TOKEN}" > .env.secrets.admin
-          # R71 RC13 fix: 改用 PostgreSQL service container (cockroach insecure
-          # 模式 listen-addr 限制导致多次失败)。PostgreSQL 监听 0.0.0.0:5432,
-          # Docker port publishing 可正常工作。asyncpg 兼容两种 DB wire protocol。
-          # compose 容器通过 172.17.0.1(Docker 默认 bridge gateway)访问 host
-          # network 上的 PostgreSQL service container。
-          # 变量名仍为 COCKROACHDB_URL(代码用此名,实际指向 PostgreSQL)。
-          CRDB_URL="postgresql://postgres@172.17.0.1:5432/postgres?sslmode=disable"
+          # R76 10.F: secretless 模式 — bot token 使用固定 ci-local-token
+          # provider-sim 只接受 ci-local-token,不访问公网
+          echo "UP_BOT_TOKEN=ci-local-token" > .env.secrets.up
+          echo "IDX_BOT_TOKEN=ci-local-token" > .env.secrets.idx
+          echo "DSP_BOT_TOKEN=ci-local-token" > .env.secrets.dsp
+          echo "MON_BOT_TOKEN=ci-local-token" > .env.secrets.mon
+          echo "ADMIN_BOT_TOKEN=ci-local-token" > .env.secrets.admin_bot
+          echo "ADMIN_BOT_TOKEN=ci-local-token" > .env.secrets.admin
+          # R76 10.F / R79 §10.2: 单拓扑 — 服务名 cockroachdb
+          # (覆盖基础 compose,resolved 中 CRDB 仅 1 个服务键)
+          # DSN 由 docker-compose.secretless.yml overlay 注入到各服务的 environment
+          # .env.secrets.migration/crdb_sync/db_backup 保留占位(CRDB URL 由 overlay 提供)
+          # R76 §10.M: CRDB v24.1 insecure 模式强制 listen-addr port=26257,
+          # sql-addr 用 26258 避免与 listen-addr 同 host:port 冲突,客户端用 26258
+          CRDB_URL="postgresql://root@cockroachdb:26258/tgjiema?sslmode=disable"
           echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.migration
           echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.crdb_sync
+          # RC69 round-trip: BACKUP_SIGNING_KEY 冗余注入 .env.secrets.db_backup
+          # HMAC 签名密钥用于 COMPLETE marker 签名/验签,确保 backup → restore round-trip
           echo "COCKROACHDB_URL=${CRDB_URL}" > .env.secrets.db_backup
-          # R71 RC14 fix: db_writer 的 env_file 只有 .env.shared(无独立 secrets
-          # 文件),且 health.py _check_database_crdb 现已回退到 COCKROACHDB_URL。
-          # 将 COCKROACHDB_URL 写入 .env.shared 使 db_writer 也能通过 readiness gate。
-          echo "COCKROACHDB_URL=${CRDB_URL}" > .env.shared
-          # R72 P0-10: compose-runtime-e2e backup_restore 阶段需要真实 R2 凭证
-          # 和 BACKUP_KEK。backup_once() 严格 fail-closed:R2 凭证缺失抛 AppError。
-          # db_restore 通过 `compose run db_writer` 执行,env_file 只有 .env.shared,
-          # 所以 R2 凭证必须写入 .env.shared 才能被 db_restore 读取。
-          # 凭证来源:GitHub Secrets(rc-candidate environment 配置)。
-          # 安全说明:CI 环境是隔离的临时 VM,凭证不会持久化;GitHub Actions 日志
-          # 会自动 mask secrets 值,不会暴露在日志输出中。
-          echo "R2_ACCOUNT_ID=${R2_ACCOUNT_ID}" >> .env.shared
-          echo "R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}" >> .env.shared
-          echo "R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}" >> .env.shared
-          echo "R2_BUCKET_NAME=${R2_BUCKET_NAME}" >> .env.shared
-          echo "R2_ENDPOINT=${R2_ENDPOINT}" >> .env.shared
-          echo "BACKUP_KEK=${BACKUP_KEK}" >> .env.shared
-          # R72 RC69: 注入 BACKUP_SIGNING_KEY(用于 COMPLETE marker HMAC 签名)。
-          # backup 用此密钥签名 COMPLETE marker,restore 用同一密钥验证签名 —
-          # 两者必须使用相同密钥才能完成 round-trip 验证。
-          # db_restore 通过 `compose run db_writer` 执行,env_file 只有 .env.shared,
-          # 所以必须写入 .env.shared 才能被 db_restore 读取。
-          # 密钥来源:GitHub Secrets(32 字节十六进制 HMAC 密钥)。
-          echo "BACKUP_SIGNING_KEY=${BACKUP_SIGNING_KEY}" >> .env.shared
-          # db_backup 也通过 .env.secrets.db_backup 加载(冗余但确保可见)
-          echo "R2_ACCOUNT_ID=${R2_ACCOUNT_ID}" >> .env.secrets.db_backup
-          echo "R2_ACCESS_KEY_ID=${R2_ACCESS_KEY_ID}" >> .env.secrets.db_backup
-          echo "R2_SECRET_ACCESS_KEY=${R2_SECRET_ACCESS_KEY}" >> .env.secrets.db_backup
-          echo "R2_BUCKET_NAME=${R2_BUCKET_NAME}" >> .env.secrets.db_backup
-          echo "R2_ENDPOINT=${R2_ENDPOINT}" >> .env.secrets.db_backup
-          echo "BACKUP_KEK=${BACKUP_KEK}" >> .env.secrets.db_backup
           echo "BACKUP_SIGNING_KEY=${BACKUP_SIGNING_KEY}" >> .env.secrets.db_backup
-          # R71 RC26 fix: CI=true 必须传到容器内,使 services.health 的
-          # _check_bot_token_valid() 在 CI 模式下跳过 getMe 调用(只验证 token 格式),
-          # 以及 services/prometheus_exporter.collect_dependency_status() 在启动
-          # grace period 内放宽 freshness 检查。.env.shared 被 docker-compose.prod.yml
-          # 的 env_file 加载,所有服务容器都会继承此变量。
-          echo "CI=true" >> .env.shared
-        env:
-          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
-          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
-          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
-          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
-          BACKUP_KEK: ${{ secrets.BACKUP_KEK }}
-          BACKUP_SIGNING_KEY: ${{ secrets.BACKUP_SIGNING_KEY }}
+          echo "COCKROACHDB_URL=${CRDB_URL}" > .env.shared
+          # R76 10.F: secretless 模式下 APP_ENV=test(允许 contract provider + minio backend)
+          # production 不允许 SECRETLESS_MODE=true / contract / minio(由 settings.py validator 强制)
+          echo "APP_ENV=test" >> .env.shared
+          echo "SECRETLESS_MODE=true" >> .env.shared
+          echo "PROVIDER_BACKEND=contract" >> .env.shared
+          echo "PROVIDER_BASE_URL=http://provider-sim:8088" >> .env.shared
+          echo "PROVIDER_CONTRACT_TOKEN=${CI_PROVIDER_CONTRACT_TOKEN}" >> .env.shared
+          echo "OBJECT_STORAGE_BACKEND=minio" >> .env.shared
+          echo "S3_ENDPOINT_URL=http://minio:9000" >> .env.shared
+          echo "S3_ACCESS_KEY_ID=${CI_MINIO_ROOT_USER}" >> .env.shared
+          echo "S3_SECRET_ACCESS_KEY=${CI_MINIO_ROOT_PASSWORD}" >> .env.shared
+          echo "S3_BUCKET_NAME=tgjiema-backup" >> .env.shared
+          # RC69 round-trip: BACKUP_SIGNING_KEY 注入 .env.shared(供 db_restore 通过 db_writer 读取)
+          # HMAC 签名密钥用于 COMPLETE marker 签名,实现 backup → restore round-trip 验证
+          echo "BACKUP_SIGNING_KEY=${BACKUP_SIGNING_KEY}" >> .env.shared
 
       - name: Create data and logs directories for bind mounts
         run: |
@@ -841,6 +936,64 @@ jobs:
           mkdir -p data logs
           sudo chown -R 1000:1000 data logs
           echo "Created data/ and logs/ directories owned by UID 1000 (app user)"
+
+      - name: Start secretless infrastructure (provider-sim, MinIO, CockroachDB)
+        run: |
+          set -euo pipefail
+          # R76 10.F / R79 §10.2: 使用 docker-compose.secretless.yml overlay 启动
+          # 单 CRDB 拓扑隔离测试环境(覆盖基础 cockroachdb 服务键)
+          # - provider-sim: 本地 Telegram Bot API 协议模拟器
+          # - minio: S3 兼容对象存储(替代 R2)
+          # - cockroachdb: 单节点 insecure CRDB(仅 CI 网络,单拓扑)
+          # 所有临时凭证通过环境变量注入(由上一步生成)
+          echo "=== R76 10.F / R79 §10.2: Starting single-CRDB infrastructure ==="
+          # R79 §10.3: 先运行 resolved 服务图硬门禁
+          docker compose -f docker-compose.yml -f docker-compose.secretless.yml \
+            config --format json > runtime-smoke-compose-resolved.json 2>/dev/null || \
+            docker compose -f docker-compose.yml -f docker-compose.secretless.yml \
+            config > runtime-smoke-compose-resolved.json
+          python scripts/validate_secretless_service_graph.py \
+            runtime-smoke-compose-resolved.json \
+            --export-graph artifacts/secretless-e2e/service-graph.json
+          docker compose -f docker-compose.yml -f docker-compose.secretless.yml up -d \
+            provider-sim minio minio-init cockroachdb
+          # 等待 provider-sim 就绪
+          echo "Waiting for provider-sim to be ready..."
+          for i in $(seq 1 30); do
+            if docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T provider-sim \
+              python -c "import urllib.request; r=urllib.request.urlopen('http://localhost:8088/health'); exit(0 if r.status==200 else 1)" \
+              >/dev/null 2>&1; then
+              echo "provider-sim is ready (attempt ${i})"
+              break
+            fi
+            sleep 2
+          done
+          # 等待 MinIO 就绪
+          echo "Waiting for MinIO to be ready..."
+          for i in $(seq 1 30); do
+            if docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T minio \
+              mc ready local >/dev/null 2>&1; then
+              echo "MinIO is ready (attempt ${i})"
+              break
+            fi
+            sleep 2
+          done
+          # 等待 CockroachDB 就绪(healthcheck 已含 CREATE DATABASE IF NOT EXISTS tgjiema)
+          # R79 §10.2: 单拓扑服务 cockroachdb,healthcheck 走 SQL 端口 26258
+          echo "Waiting for CockroachDB (cockroachdb:26258 single-topology) to be ready..."
+          for i in $(seq 1 30); do
+            if docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T cockroachdb \
+              cockroach sql --insecure --host=localhost:26258 -e "SELECT 1" >/dev/null 2>&1; then
+              echo "CockroachDB is ready (attempt ${i})"
+              break
+            fi
+            sleep 2
+          done
+          # 验证 CRDB 版本和 tgjiema 数据库(显式 --host=localhost:26258)
+          CRDB_VERSION=$(docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T \
+            cockroachdb cockroach sql --insecure --host=localhost:26258 -e "SELECT version();" -t 2>/dev/null | head -1 | xargs)
+          echo "CockroachDB version: ${CRDB_VERSION}"
+          echo "=== Secretless infrastructure ready ==="
 
       - name: Run Compose Runtime E2E (11 phases, fail-closed)
         env:
@@ -874,7 +1027,7 @@ jobs:
 
       - name: Upload runtime-e2e-evidence.json artifact
         if: always()
-        uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: runtime-e2e-evidence
           path: runtime-e2e-evidence.json
@@ -890,7 +1043,7 @@ jobs:
     # 但为保持 environment 审计一致性,仍使用动态 environment 表达式。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Verify Docker digest pullability
       run: |
@@ -907,7 +1060,7 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Generate minimal secrets placeholders
       run: |
@@ -952,10 +1105,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -985,10 +1138,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -1015,10 +1168,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -1048,10 +1201,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -1084,10 +1237,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -1118,10 +1271,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -1143,10 +1296,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -1177,10 +1330,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -1205,7 +1358,7 @@ jobs:
         "
 
     - name: Upload SBOM artifact
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: release-gates-sbom
         path: sbom.json
@@ -1219,10 +1372,10 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -1244,7 +1397,7 @@ jobs:
     # production-v*=production。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 0
 
@@ -1292,7 +1445,7 @@ jobs:
       # R53: actions/attest-build-provenance 创建 attestation 需要此权限
       attestations: write
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Install cosign
       uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac
@@ -1547,7 +1700,7 @@ jobs:
         "
 
     - name: Generate SLSA build provenance attestation
-      uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018
+      uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
       with:
         subject-name: ${{ needs.docker-build.outputs.image_name }}
         # R53: steps.build.outputs.digest 已含 "sha256:" 前缀,
@@ -2015,7 +2168,7 @@ jobs:
     #            提取 source_commit/tree,通过 RELEASE_SOURCE_COMMIT/TREE 注入运行时
     - name: Upload signed artifacts
       if: success()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: release-gates-signed-${{ github.sha }}
         path: |
@@ -2054,7 +2207,7 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Verify branch protection is configured
       env:
         GH_TOKEN: ${{ secrets.BP_PAT_TOKEN }}
@@ -2083,7 +2236,7 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Verify branch ruleset is configured (R67 P0-01)
       env:
         GH_TOKEN: ${{ secrets.BP_PAT_TOKEN }}
@@ -2111,7 +2264,7 @@ jobs:
     permissions:
       contents: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 0  # 需要完整历史以验证祖先链签名策略
     - name: Verify git source governance (commit + tag signatures, R67 P0-01)
@@ -2158,7 +2311,7 @@ jobs:
       contents: read
       actions: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Verify RC continuity (current candidate evidence + 3-run promotion gate)
       env:
@@ -2298,10 +2451,20 @@ jobs:
 
               if [ -n "${BUILD_INFO_URL}" ]; then
                 echo "    run #${run_row}: 下载 docker-build-info artifact"
-                curl -sL -H "Authorization: token ${GH_TOKEN}" -o "/tmp/build_info_${run_row}.zip" "${BUILD_INFO_URL}" 2>/dev/null || true
+                # R76 10.M: 删除 curl 的 || true 兜底 — 下载失败必须显式处理
+                # (curl 失败时跳过该 run,不静默继续 digest 比对)
+                if ! curl -sL -H "Authorization: token ${GH_TOKEN}" -o "/tmp/build_info_${run_row}.zip" "${BUILD_INFO_URL}" 2>/dev/null; then
+                  echo "    run #${run_row}: curl 下载 docker-build-info artifact 失败,跳过该 run"
+                  rm -f "/tmp/build_info_${run_row}.zip"
+                  continue
+                fi
                 # 解压并读取 image_build_info.json
                 mkdir -p "/tmp/build_info_${run_row}"
-                unzip -o -q "/tmp/build_info_${run_row}.zip" -d "/tmp/build_info_${run_row}" 2>/dev/null || true
+                if ! unzip -o -q "/tmp/build_info_${run_row}.zip" -d "/tmp/build_info_${run_row}" 2>/dev/null; then
+                  echo "    run #${run_row}: unzip docker-build-info artifact 失败,跳过该 run"
+                  rm -rf "/tmp/build_info_${run_row}" "/tmp/build_info_${run_row}.zip"
+                  continue
+                fi
                 IMG_DIGEST=$(jq -r '.image_digest // empty' "/tmp/build_info_${run_row}/image_build_info.json" 2>/dev/null || echo "")
                 rm -rf "/tmp/build_info_${run_row}" "/tmp/build_info_${run_row}.zip"
 
@@ -2441,7 +2604,8 @@ jobs:
             migration-manifest-gate, migration-binding-gate,
             backup-restore-drill, sbom, pip-audit, trivy,
             verify-branch-protection, verify-branch-ruleset,
-            verify-git-source-governance, rc-continuity, sign-image]
+            verify-git-source-governance, rc-continuity, sign-image,
+            compose-runtime-e2e]
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/rc-v')
     environment: rc-candidate
     permissions:
@@ -2451,7 +2615,7 @@ jobs:
       packages: read
       attestations: write
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 0
 
@@ -2628,7 +2792,7 @@ jobs:
     #   publish-attestation 复用此 cert 提取实际 SAN 做 verify,
     #   与 sign-image verify 步骤使用同一 identity (signed-with == verified-with)
     - name: Download signed artifacts (for cert reuse)
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: release-gates-signed-${{ github.sha }}
 
@@ -2721,7 +2885,7 @@ jobs:
     # sbom_digest 被设为 "pending",verify_supply_chain.py 的 digest_bound:sbom_digest
     # 检查永远失败(非空且非 pending 才算绑定)。
     - name: Download SBOM artifact (for sbom_digest computation)
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: release-gates-sbom
         path: .
@@ -2838,7 +3002,7 @@ jobs:
         cat branch_protection_snapshot.json | python3 -m json.tool 2>/dev/null || cat branch_protection_snapshot.json
 
     - name: Upload attestation artifacts
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: release-attestation-${{ github.sha }}
         path: |
@@ -2883,10 +3047,10 @@ jobs:
       packages: read
       attestations: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -2899,13 +3063,13 @@ jobs:
 
     # 下载 publish-attestation 上传的 attestation artifact(含 production_verify_statement.json)
     - name: Download release-attestation artifact
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: release-attestation-${{ github.sha }}
 
     # 下载 sign-image 上传的签名制品(含 release-manifest.json + image digest 绑定 + image-signing-cert.pem)
     - name: Download signed artifacts (for release-manifest binding)
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: release-gates-signed-${{ github.sha }}
 
@@ -3081,7 +3245,7 @@ jobs:
 
     - name: Upload attestation semantics result
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: attestation-semantics-${{ github.sha }}
         path: attestation_semantics_result.json
@@ -3131,12 +3295,12 @@ jobs:
       id-token: write
       attestations: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -3201,7 +3365,7 @@ jobs:
         "
 
     - name: Upload 3x verification report artifact
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: rc-verify-3x-${{ github.sha }}-${{ github.run_id }}
         path: |
@@ -3238,7 +3402,7 @@ jobs:
       contents: read
       actions: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: "R71 RC3: Login gh CLI with BP_PAT_TOKEN (for rulesets API access)"
       env:
@@ -3334,10 +3498,10 @@ jobs:
       # success 计入 Production GO。
       evidence_present: ${{ steps.gate.outputs.evidence_present }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -3350,7 +3514,7 @@ jobs:
     # 优先尝试下载运维上传的 ru_72h_data.json artifact(由 release manager 在
     # workflow_dispatch 时上传);若未提供(普通 PR / push 场景),仅运行 dry-run。
     - name: Download ru_72h_data artifact (if uploaded by release manager)
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: ru-72h-data-${{ github.sha }}
         path: ./ru-72h-data
@@ -3453,7 +3617,7 @@ jobs:
 
     - name: Upload 72h attribution gate result (if data file exists)
       if: always() && hashFiles('./ru-72h-data/ru_72h_data.json') != ''
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: ru-72h-attribution-result-${{ github.sha }}
         path: ./ru-72h-data/
@@ -3483,16 +3647,16 @@ jobs:
       contents: read
       actions: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
     # R66 P1-02: 下载 sign-image 上传的签名制品(含 release-manifest.json + manifest 签名)
     - name: Download signed artifacts (for release-manifest binding)
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: release-gates-signed-${{ github.sha }}
 
@@ -3508,7 +3672,7 @@ jobs:
         # 绑定一致,禁止两套口径不一致。
         python scripts/check_migration_manifest.py --strict --require-signed-binding
 
-  # ─── 14. production-evidence (R64 P1-12: 生产运行证据框架) ──────
+  # ─── 14. generate-evidence-envelope (R64 P1-12 + R73 P1-05: 强类型分级证据) ──
   # R64 P1-12 整改要点:
   #   审计发现生产运行证据缺失:7 天 soak / 3 轮 VPS 恢复 / 真实 provider
   #   outbox 故障注入 / 72h RU 空载 / 相同 digest 供应链验证均无统一证据归档。
@@ -3524,28 +3688,55 @@ jobs:
   #   完整证据生成通过 workflow_dispatch 手动触发(--all --timeout-seconds 0)。
   #   注意:本 job 不阻断 PR 合并(if: always() + 只在 supply_chain 失败时 exit 1),
   #   避免长时间证据生成阻塞开发流程;完整证据是 release 晋级条件而非 PR 条件。
-  production-evidence:
+  #
+  # R73 P1-05 整改要点(强类型分级):
+  #   本 job 重命名为 generate-evidence-envelope,统一生成强类型 evidence envelope。
+  #   根据 GITHUB_REF / GITHUB_EVENT 动态计算 gate_level / promotion_eligible /
+  #   artifact_prefix,通过 scripts/evidence_envelope.py CLI 构建分级 envelope:
+  #     - master push     → gate_level=development, promotion_eligible=false
+  #                         artifact: development-evidence-{sha}-{run_id}
+  #     - rc-v* tag push  → gate_level=rc, promotion_eligible=(all gates success)
+  #                         artifact: rc-candidate-evidence-{sha}-{run_id}
+  #     - production-v*   → gate_level=production, promotion_eligible=false
+  #                         artifact: production-deployment-evidence-{sha}-{run_id}
+  #     - PR              → gate_level=development, promotion_eligible=false
+  #                         artifact: development-evidence-{sha}-{run_id}
+  #     - workflow_dispatch → 不分级(fallback permissive default)
+  #   promotion_eligible 仅在 rc-v* tag + 所有 required gates success 时为 true,
+  #   failed/cancelled/skipped 的 run 永远不生成可晋级证据(R73 §5.7)。
+  generate-evidence-envelope:
     runs-on: ubuntu-latest
     if: always()
     # R70 P0-10: namespace 完全分离 — master push=staging / rc-v*=rc-candidate /
-    # production-v*=production。production-evidence 通过 if: always() 在所有场景运行
+    # production-v*=production。generate-evidence-envelope 通过 if: always() 在所有场景运行
     # (PR / push / tag),使用动态 environment。RC/production tag 触发真实证据,
     # PR / master push 仅 dry-run。
     environment: ${{ startsWith(github.ref, 'refs/tags/production-v') && 'production' || startsWith(github.ref, 'refs/tags/rc-v') && 'rc-candidate' || 'staging' }}
-    needs: [docker-build, sbom, sign-image, publish-attestation]
+    # R73 P1-05: 加入 bind-runtime-config 依赖,以读取 host_config_digest 用于
+    # RC envelope 的 runtime_config_digest 字段。bind-runtime-config 在 master
+    # push (should_push=false) / PR 场景下会被跳过,本 job 通过 if: always()
+    # 仍会运行,此时 host_config_digest 输出为空字符串 (evidence_envelope.py
+    # CLI 会规范化为 None,envelope 不可晋级 — 符合 R73 §5.7 rules)。
+    needs: [docker-build, sbom, sign-image, publish-attestation, bind-runtime-config]
     permissions:
       contents: read
       actions: read
       id-token: write
       packages: read
       attestations: write
+    outputs:
+      # R73 P1-05: 输出 gate_level / promotion_eligible / artifact_prefix 供下游 job 引用
+      gate_level: ${{ steps.gate.outputs.gate_level }}
+      promotion_eligible: ${{ steps.gate.outputs.promotion_eligible }}
+      artifact_prefix: ${{ steps.gate.outputs.artifact_prefix }}
+      envelope_path: ${{ steps.envelope.outputs.envelope_path }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -3555,8 +3746,68 @@ jobs:
         pip install -r requirements.txt
         pip install pytest pytest-asyncio aiosqlite pyyaml
 
+    # ─── R73 P1-05: Determine gate level (development / rc / production) ──
+    # 根据 GITHUB_REF / GITHUB_EVENT 动态计算 gate_level、promotion_eligible、
+    # artifact_prefix。promotion_eligible 仅在 rc-v* tag push 且所有 required
+    # gates (docker-build / sbom / sign-image / publish-attestation) 均为 success
+    # 时为 true。failed/cancelled/skipped 的 run 永远不生成可晋级证据。
+    - name: "R73 P1-05: Determine gate level (development / rc / production)"
+      id: gate
+      env:
+        GH_EVENT: ${{ github.event_name }}
+        GH_REF: ${{ github.ref }}
+        NEEDS_DOCKER_BUILD: ${{ needs.docker-build.result }}
+        NEEDS_SBOM: ${{ needs.sbom.result }}
+        NEEDS_SIGN_IMAGE: ${{ needs.sign-image.result }}
+        NEEDS_PUBLISH_ATTESTATION: ${{ needs.publish-attestation.result }}
+      run: |
+        set -euo pipefail
+        echo "=== R73 P1-05: Determine gate level ==="
+        echo "  event: ${GH_EVENT}"
+        echo "  ref:   ${GH_REF}"
+        echo "  needs.docker-build.result:        ${NEEDS_DOCKER_BUILD}"
+        echo "  needs.sbom.result:                ${NEEDS_SBOM}"
+        echo "  needs.sign-image.result:          ${NEEDS_SIGN_IMAGE}"
+        echo "  needs.publish-attestation.result: ${NEEDS_PUBLISH_ATTESTATION}"
+        # 1) 根据 ref 计算 gate_level / artifact_prefix
+        if [[ "${GH_REF}" == refs/tags/rc-v* ]]; then
+          GATE_LEVEL="rc"
+          ARTIFACT_PREFIX="rc-candidate-evidence"
+        elif [[ "${GH_REF}" == refs/tags/production-v* ]]; then
+          GATE_LEVEL="production"
+          ARTIFACT_PREFIX="production-deployment-evidence"
+        elif [[ "${GH_REF}" == "refs/heads/master" || "${GH_REF}" == "refs/heads/main" ]]; then
+          GATE_LEVEL="development"
+          ARTIFACT_PREFIX="development-evidence"
+        else
+          # PR / 其他分支 push / workflow_dispatch → development
+          GATE_LEVEL="development"
+          ARTIFACT_PREFIX="development-evidence"
+        fi
+        # 2) 计算 promotion_eligible — 仅 rc-v* tag + 所有 required gates success
+        PROMOTION_ELIGIBLE="false"
+        if [[ "${GATE_LEVEL}" == "rc" && "${GH_EVENT}" == "push" ]]; then
+          ALL_SUCCESS="true"
+          for r in NEEDS_DOCKER_BUILD NEEDS_SBOM NEEDS_SIGN_IMAGE NEEDS_PUBLISH_ATTESTATION; do
+            if [[ "${!r}" != "success" ]]; then
+              ALL_SUCCESS="false"
+              break
+            fi
+          done
+          if [[ "${ALL_SUCCESS}" == "true" ]]; then
+            PROMOTION_ELIGIBLE="true"
+          fi
+        fi
+        echo "gate_level=${GATE_LEVEL}" >> "$GITHUB_OUTPUT"
+        echo "promotion_eligible=${PROMOTION_ELIGIBLE}" >> "$GITHUB_OUTPUT"
+        echo "artifact_prefix=${ARTIFACT_PREFIX}" >> "$GITHUB_OUTPUT"
+        echo ""
+        echo "  gate_level:         ${GATE_LEVEL}"
+        echo "  promotion_eligible: ${PROMOTION_ELIGIBLE}"
+        echo "  artifact_prefix:    ${ARTIFACT_PREFIX}"
+
     - name: Download release attestation artifact (for supply chain verification)
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: release-attestation-${{ github.sha }}
         path: ./attestation
@@ -3657,16 +3908,130 @@ jobs:
         print(json.dumps(index, ensure_ascii=False, indent=2))
         "
 
-    - name: Upload production evidence artifact
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+    # ─── R73 P1-05: Build typed evidence envelope (strongly-typed tiered) ──
+    # 调用 scripts/evidence_envelope.py CLI 构建分级 envelope:
+    #   - master push     → gate_level=development, promotion_eligible=false
+    #   - rc-v* tag push  → gate_level=rc, promotion_eligible=(from steps.gate)
+    #   - production-v*   → gate_level=production, promotion_eligible=false
+    # envelope 通过 _validate_tiered_invariants 二次校验(defense in depth)。
+    # master push (should_push=false) 的 image_repo_digest 可能为本地构建 digest
+    # 或为空 — 此时 image_repo_digest 留空,envelope 仍生成但不可晋级。
+    - name: "R73 P1-05: Build typed evidence envelope (tiered: development/rc/production)"
+      id: envelope
+      env:
+        GATE_LEVEL: ${{ steps.gate.outputs.gate_level }}
+        PROMOTION_ELIGIBLE: ${{ steps.gate.outputs.promotion_eligible }}
+        ARTIFACT_PREFIX: ${{ steps.gate.outputs.artifact_prefix }}
+        GH_EVENT: ${{ github.event_name }}
+        GH_REF: ${{ github.ref }}
+        GH_SHA: ${{ github.sha }}
+        GH_RUN_ID: ${{ github.run_id }}
+        GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+        IMAGE_REPO_DIGEST: ${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}
+        # runtime_config_digest 来自 bind-runtime-config job 的输出;
+        # 当该 job 跳过 (master push should_push=false / PR) 时为空字符串,
+        # evidence_envelope.build 会将其规范化为 None。
+        RUNTIME_CONFIG_DIGEST: ${{ needs.bind-runtime-config.outputs.host_config_digest }}
+        SHOULD_PUSH: ${{ needs.docker-build.outputs.should_push }}
+      run: |
+        set -euo pipefail
+        echo "=== R73 P1-05: Build typed evidence envelope ==="
+        echo "  gate_level:         ${GATE_LEVEL}"
+        echo "  promotion_eligible: ${PROMOTION_ELIGIBLE}"
+        echo "  artifact_prefix:    ${ARTIFACT_PREFIX}"
+        echo "  event:              ${GH_EVENT}"
+        echo "  ref:                ${GH_REF}"
+        echo "  source_sha:         ${GH_SHA}"
+        echo "  run_id:             ${GH_RUN_ID}"
+        echo "  run_attempt:        ${GH_RUN_ATTEMPT}"
+        echo "  image_repo_digest:  ${IMAGE_REPO_DIGEST}"
+        echo "  runtime_config_digest: ${RUNTIME_CONFIG_DIGEST}"
+        echo "  should_push:        ${SHOULD_PUSH}"
+        # R73 P1-04: master push (should_push=false) 不推送镜像到 GHCR,
+        # image_repo_digest 指向本地构建的镜像 (未推送到 registry)。
+        # 这种情况下 envelope 仍然生成 (gate_level=development),但
+        # is_promotion_eligible 审计会因缺有效 registry digest 返回 false
+        # (defense in depth — 即便 promotion_eligible 字段被覆盖也不会晋级)。
+        # 对于 PR 与 master push 的 development envelope,image_repo_digest
+        # 可能为空字符串 (load=true 模式下 buildx outputs digest 可能空),
+        # 传递给 CLI 时会被规范化为 None。
+        ENVELOPE_DIR="./production-evidence"
+        mkdir -p "${ENVELOPE_DIR}"
+        ENVELOPE_PATH="${ENVELOPE_DIR}/${ARTIFACT_PREFIX}.json"
+        # 调用 evidence_envelope.py CLI build 子命令
+        # promotion_eligible 显式传入 (从 steps.gate 计算,基于 needs.*.result)
+        python3 scripts/evidence_envelope.py build \
+          --gate-level "${GATE_LEVEL}" \
+          --promotion-eligible "${PROMOTION_ELIGIBLE}" \
+          --source-sha "${GH_SHA}" \
+          --run-id "${GH_RUN_ID}" \
+          --run-attempt "${GH_RUN_ATTEMPT}" \
+          --event "${GH_EVENT}" \
+          --ref "${GH_REF}" \
+          --overall-conclusion "success" \
+          --image-repo-digest "${IMAGE_REPO_DIGEST}" \
+          --runtime-config-digest "${RUNTIME_CONFIG_DIGEST}" \
+          --output "${ENVELOPE_PATH}"
+        echo "envelope_path=${ENVELOPE_PATH}" >> "$GITHUB_OUTPUT"
+        echo ""
+        echo "=== R73 P1-05: Validate envelope (defense in depth) ==="
+        python3 scripts/evidence_envelope.py validate "${ENVELOPE_PATH}"
+        # 二次断言:promotion_eligible 字段必须与 steps.gate 计算一致
+        python3 -c "
+        import json
+        with open('${ENVELOPE_PATH}') as f:
+            env = json.load(f)
+        assert env['gate_level'] == '${GATE_LEVEL}', \
+            f'gate_level mismatch: {env[\"gate_level\"]} != ${GATE_LEVEL}'
+        expected_pe = '${PROMOTION_ELIGIBLE}'.lower() == 'true'
+        assert env['promotion_eligible'] is expected_pe, \
+            f'promotion_eligible mismatch: {env[\"promotion_eligible\"]} != {expected_pe}'
+        print(f'PASS: envelope tiered invariants verified (gate_level={env[\"gate_level\"]}, promotion_eligible={env[\"promotion_eligible\"]})')
+        "
+
+    - name: "R73 P1-05: Upload tiered evidence artifact"
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: production-evidence-${{ github.sha }}-${{ github.run_id }}
+        # R73 P1-05: artifact 名称按 gate_level 分级
+        #   - development-evidence-{sha}-{run_id}        (master push / PR)
+        #   - rc-candidate-evidence-{sha}-{run_id}       (rc-v* tag push)
+        #   - production-deployment-evidence-{sha}-{run_id} (production-v* tag push)
+        name: ${{ steps.gate.outputs.artifact_prefix }}-${{ github.sha }}-${{ github.run_id }}
         path: |
           production-evidence/
+          production-evidence/${{ steps.gate.outputs.artifact_prefix }}.json
           supply_chain_result.json
           supply_chain_stderr.log
         retention-days: 90
       if: always()
+
+  # ─── R73 §5.6 (P0-07): promote-rc-reusable (workflow_dispatch → reusable call) ──
+  # workflow_dispatch 不再内联执行 production promotion 逻辑,而是委托给
+  # _promote-verified-rc.yml (single reusable workflow)。
+  # 所有晋级步骤 (a-p: checkout / download artifacts / verify tag signature /
+  # verify run event/conclusion/attempt / verify manifest digests /
+  # scan_production_bypasses / verify_rc_3x / break-glass check /
+  # create signed production tag / trigger deployment) 由 reusable workflow 实现。
+  # verify-rc-identity / production-promotion-gate 仅在 production-v* tag push
+  # 时运行,作为冗余验证门禁(本 job 推送的 tag 会触发它们)。
+  promote-rc-reusable:
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/_promote-verified-rc.yml
+    with:
+      rc_tag: ${{ inputs.rc_tag }}
+      rc_run_id: ${{ inputs.rc_run_id }}
+      rc_run_attempt: ${{ inputs.rc_run_attempt }}
+      source_sha: ${{ inputs.source_sha }}
+      candidate_manifest_digest: ${{ inputs.candidate_manifest_digest }}
+      image_repo_digest: ${{ inputs.image_repo_digest }}
+      runtime_config_digest: ${{ inputs.runtime_config_digest }}
+      typed_confirmation: ${{ inputs.typed_confirmation }}
+      production_tag: ${{ inputs.production_tag }}
+    permissions:
+      contents: write   # 委托给 reusable workflow (创建并推送 signed production tag)
+      packages: read    # 委托给 reusable workflow (docker pull RepoDigest)
+      deployments: write  # 委托给 reusable workflow (production deployment record)
+      id-token: write   # 委托给 reusable workflow (OIDC keyless signing)
 
   # ─── 14a. verify-rc-identity (R71 P0-11: RC 身份完整核验,无重建) ─────
   # R71 P0-11 整改要点:
@@ -3694,7 +4059,10 @@ jobs:
   #   失败立即阻断 production-promotion-gate(fail-closed,无 continue-on-error)。
   verify-rc-identity:
     runs-on: ubuntu-latest
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/production-v')
+    # R73 §5.6 (P0-07): workflow_dispatch 不再触发本 job — 晋级逻辑已委托给
+    #   _promote-verified-rc.yml (single reusable workflow)。本 job 仅在
+    #   production-v* tag push 时运行,作为冗余验证门禁。
+    if: startsWith(github.ref, 'refs/tags/production-v')
     permissions:
       contents: read
       actions: read   # 读取其他 workflow run 的 artifacts (RC run_id)
@@ -3707,12 +4075,12 @@ jobs:
       image_digest: ${{ steps.resolve.outputs.image_digest }}
       image_repo_digest: ${{ steps.verify.outputs.image_repo_digest }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 0  # 需要完整历史以读取 production-v* tag annotation
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -3737,11 +4105,15 @@ jobs:
         echo "  ref: ${GITHUB_REF}"
         if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
           # workflow_dispatch: 从 inputs 读取
+          # R73 §5.6 (P0-07): 本 job 不再在 workflow_dispatch 时运行(由
+          #   promote-rc-reusable 委托 _promote-verified-rc.yml)。此分支保留
+          #   仅为 defense in depth,inputs.image_repo_digest 替代旧 inputs.image_digest。
           RC_TAG="${{ inputs.rc_tag }}"
           RC_RUN_ID="${{ inputs.rc_run_id }}"
           SOURCE_SHA="${{ inputs.source_sha }}"
           CANDIDATE_MANIFEST_DIGEST="${{ inputs.candidate_manifest_digest }}"
-          IMAGE_DIGEST="${{ inputs.image_digest }}"
+          IMAGE_REPO_DIGEST_INPUT="${{ inputs.image_repo_digest }}"
+          IMAGE_DIGEST="${IMAGE_REPO_DIGEST_INPUT#*@}"
           TYPED_CONFIRMATION="${{ inputs.typed_confirmation }}"
           echo "  source: workflow_dispatch inputs"
         else
@@ -3794,7 +4166,7 @@ jobs:
     #   actions/download-artifact@v3 支持 run-id 参数下载其他 workflow run 的 artifacts
     #   每个 artifact 解压到 ./rc-evidence/<artifact-name>/ 子目录
     - name: "R71 P0-11: Download RC evidence artifacts from rc_run_id"
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         run-id: ${{ steps.resolve.outputs.rc_run_id }}
         github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -3923,7 +4295,7 @@ jobs:
 
     - name: Upload RC identity verification artifact (immutable)
       if: always()
-      uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: rc-identity-verification-${{ github.sha }}-${{ github.run_id }}
         path: rc-identity-verification.json
@@ -3961,19 +4333,23 @@ jobs:
     #    evidence_status=not_applicable 不允许 — 缺证据 = failure)
     # R67 P0-04: 增加 verify-only-3x 依赖,要求 release tag 前 3x verify-only 必须通过
     # R67 P0-05: 增加 verify-only-3x 作为代码门禁 vs 生产证据门禁分离的一部分
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/production-v')
+    # R73 §5.6 (P0-07): workflow_dispatch 不再触发本 job — 晋级逻辑已委托给
+    #   _promote-verified-rc.yml (single reusable workflow)。本 job 仅在
+    #   production-v* tag push 时运行,作为冗余验证门禁。
+    if: startsWith(github.ref, 'refs/tags/production-v')
     environment: production
-    needs: [production-evidence, crdb-ru-72h-attribution-gate, verify-only-3x, verify-rc-identity]
+    # R73 P1-05: production-evidence 重命名为 generate-evidence-envelope
+    needs: [generate-evidence-envelope, crdb-ru-72h-attribution-gate, verify-only-3x, verify-rc-identity]
     permissions:
       contents: read
       actions: read
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -4081,19 +4457,21 @@ jobs:
         echo "PASS: verify-rc-identity succeeded — production promotes exact signed RC digest"
         echo "  image_repo_digest: ${IMAGE_REPO_DIGEST}"
 
-    # 下载 production-evidence job 上传的 artifact(含 production_evidence_index.json);
+    # 下载 generate-evidence-envelope job 上传的 tiered artifact(含 envelope);
     # 注意:CI 自动生成的是 dry_run 模式,release tag 场景需运维通过单独的
     # workflow_dispatch 上传 production_evidence.json 真实证据 artifact。
-    - name: Download production-evidence artifact
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+    # R73 P1-05: artifact 名称按 gate_level 分级 — 本 job 仅在 production-v*
+    # tag push 时运行,artifact 名称为 production-deployment-evidence-{sha}-{run_id}。
+    - name: Download generate-evidence-envelope artifact
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
-        name: production-evidence-${{ github.sha }}-${{ github.run_id }}
+        name: production-deployment-evidence-${{ github.sha }}-${{ github.run_id }}
         path: ./production-evidence
       continue-on-error: true  # artifact 可能不存在(由运维单独上传真实证据)
 
     # 运维通过单独 workflow_dispatch 上传的签名的真实 production 证据 artifact
     - name: Download signed production_evidence.json (uploaded by release manager)
-      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
       with:
         name: signed-production-evidence-${{ github.sha }}
         path: ./signed-evidence
@@ -4181,9 +4559,12 @@ jobs:
     runs-on: ubuntu-latest
     # 仅在 master/main push + rc-v* tag + production-v* tag + workflow_dispatch 时运行
     # PR 场景:允许 skipped(TGJIEMA_IMAGE 在 PR 阶段可能未配置不可变 digest)
+    # R73 P1-04: master push (should_push=false) 跳过 — 镜像未推送 GHCR,
+    #            无法读取真实 RepoDigest 进行 host config 绑定。
     if: >-
       (github.event_name == 'push' &&
-        (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')) ||
+        (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main') &&
+        needs.docker-build.outputs.should_push == 'true') ||
       startsWith(github.ref, 'refs/tags/rc-v') ||
       startsWith(github.ref, 'refs/tags/production-v') ||
       github.event_name == 'workflow_dispatch'
@@ -4199,12 +4580,12 @@ jobs:
       workflow_run_id: ${{ steps.validate.outputs.workflow_run_id }}
       workflow_run_attempt: ${{ steps.validate.outputs.workflow_run_attempt }}
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -4296,11 +4677,284 @@ jobs:
 
     - name: Upload runtime-config-binding artifact (immutable)
       if: always()
-      uses: actions/upload-artifact@50769540e7f4bd5e21e526ee35c689e35e0d6874
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: runtime-config-binding-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
         path: runtime-config-binding.json
         if-no-files-found: error  # fail-closed: 校验失败时 binding 文件不存在则 FAIL
+
+  # ─── validate-promotion-workflow (PR checks; R74 → R75 fail-closed) ──
+  # 在 PR 上验证 promotion workflow 代码结构,不实际执行 promotion。
+  # 确保 scripts/validate_candidate_manifest.py 和 scripts/scan_production_bypasses.py
+  # 语法正确、可导入、可执行真实正负 fixture。
+  # R75 P1-05: 删除 scanner || echo warning 吞错,改为 fail-closed(set -euo pipefail)。
+  validate-promotion-workflow:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      # R75 P2-01: 固定完整 commit SHA,禁止 @v4 浮动 tag
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: Validate promotion workflow scripts
+        run: |
+          set -euo pipefail
+          echo "=== validate-promotion-workflow (R74 → R75 fail-closed) ==="
+          # R74 P0-08: jsonschema required for candidate manifest validation (fail-closed)
+          # R76 §10.M: pyyaml required for scan_production_bypasses.py — 缺失时
+          # scanner 回退到 regex fallback,会将 docker-compose.yml 中所有 build:
+          # 字段误报为 P0 违规(R73-NO-DOCKER-BUILD-IN-PROD false positive)
+          python -m pip install jsonschema pyyaml
+          if [ -f scripts/validate_candidate_manifest.py ]; then
+            python scripts/validate_candidate_manifest.py --help
+            echo "  validate_candidate_manifest.py: OK"
+          else
+            echo "::error::scripts/validate_candidate_manifest.py not found — promotion workflow validator missing"
+            exit 1
+          fi
+          if [ -f scripts/scan_production_bypasses.py ]; then
+            # R75 P0-07: fail-closed — scanner 非零退出码(P0/P1 违规)必须直接失败,
+            # 不得用 || echo warning 吞掉(set -euo pipefail 会传播非零退出码)
+            python scripts/scan_production_bypasses.py --json --output /dev/null
+            echo "  scan_production_bypasses.py: OK (clean, 0 P0/P1 violations)"
+          else
+            echo "::error::scripts/scan_production_bypasses.py not found — promotion workflow scanner missing"
+            exit 1
+          fi
+          echo "=== Promotion workflow validation complete ==="
+
+  # ════════════════════════════════════════════════════════════════
+  # R76 P1-07: Secretless CRDB Closed-Loop Gate
+  # ════════════════════════════════════════════════════════════════
+  # 整改背景: Release Gates 未创建任何 CRDB job,无当前候选真实迁移、
+  # cluster identity、事务 retry、断连恢复、blank restore 和 switch/rollback 证据。
+  #
+  # 本 job 通过 GitHub API 验证 secretless-contract-e2e workflow 在当前 SHA
+  # 有成功 run,覆盖完整 CRDB 闭环(migration + disconnect recovery + blank restore
+  # + switch/rollback)。fail-closed: 无成功 run 则阻断 release。
+  secretless-crdb-closed-loop-gate:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      # The closed-loop verifier is repository code. Checkout is mandatory before
+      # invoking scripts/verify_secretless_artifact.py; otherwise the job can find
+      # and download the correct artifact but cannot execute the strict verifier.
+      - name: Checkout current candidate for strict verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: "R76 P1-07: Verify secretless-contract-e2e passed for current SHA"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          echo "=== R76 P1-07: Secretless CRDB Closed-Loop Gate ==="
+          echo "  Commit SHA: ${COMMIT_SHA}"
+
+          # 等待 secretless-contract-e2e run 完成(最多 35 分钟)
+          # R80 P1-03: 必须等待同 SHA 权威 run 终态,不能提前失败
+          MAX_WAIT=2100  # 35 分钟(覆盖 Secretless workflow 30min timeout + 余量)
+          POLL_INTERVAL=30
+          ELAPSED=0
+          mkdir -p artifacts/secretless-closed-loop
+          export SECRETLESS_CLOSED_LOOP_STATE="artifacts/secretless-closed-loop/verification.json"
+          write_closed_loop_state() {
+            python3 - "$@" <<'PY'
+          import datetime as dt
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          status, run_id, attempt, run_status, conclusion, wait_seconds, artifact_id, artifact_digest, error_code = sys.argv[1:]
+          document = {
+              "schema_version": "secretless-closed-loop/v1",
+              "status": status,
+              "head_sha": os.environ["COMMIT_SHA"],
+              "selected_run_id": run_id,
+              "selected_run_attempt": attempt,
+              "wait_seconds": int(wait_seconds),
+              "final_status": run_status,
+              "final_conclusion": conclusion,
+              "artifact_id": artifact_id,
+              "artifact_digest": artifact_digest,
+              "error_code": error_code or None,
+              "recorded_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+          }
+          output = Path(os.environ["SECRETLESS_CLOSED_LOOP_STATE"])
+          temporary = output.with_suffix(output.suffix + ".tmp")
+          temporary.write_text(
+              json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          temporary.replace(output)
+          PY
+          }
+          trap 'rc=$?; if [ "$rc" -ne 0 ] && [ ! -s "$SECRETLESS_CLOSED_LOOP_STATE" ]; then write_closed_loop_state "failed" "${RUN_ID:-}" "${RUN_ATTEMPT:-}" "${RUN_STATUS:-unknown}" "${RUN_CONCLUSION:-unknown}" "${ELAPSED:-0}" "${ART_ID:-}" "${ART_DIGEST:-}" "SECRETLESS_CLOSED_LOOP_EXIT_${rc}"; fi' EXIT
+
+          while [ "${ELAPSED}" -lt "${MAX_WAIT}" ]; do
+            # R78 10.6: 删除静默吞错 — API 错误必须显式区分
+            # 401/403/404 不重试;网络级错误最多 3 次指数退避
+            RETRY=0
+            MAX_RETRIES=3
+            while [ "${RETRY}" -le "${MAX_RETRIES}" ]; do
+              # R79 §10.8: 精确绑定 — workflow path=secretless-contract-e2e.yml,
+              # event=push(禁止接受 PR merge SHA / 旧 SHA / 仅摘要绿),
+              # head_sha=current, 返回 attempt 用于 artifact 身份核对
+              if RESPONSE=$(gh api \
+                --method GET \
+                "/repos/${GITHUB_REPOSITORY}/actions/workflows/secretless-contract-e2e.yml/runs" \
+                -f "head_sha=${COMMIT_SHA}" \
+                -f "event=push" \
+                -f "per_page=5" \
+                --jq '[.workflow_runs[]] | sort_by(.run_number, .run_attempt) | last // empty | "\(.id)|\(.status)|\(.conclusion // "null")|\(.run_attempt)"' \
+                2>api-error.txt); then
+                break
+              fi
+              RETRY=$((RETRY + 1))
+              if [ "${RETRY}" -le "${MAX_RETRIES}" ]; then
+                WAIT=$((2 ** RETRY))
+                echo "  GitHub API call failed (attempt ${RETRY}/${MAX_RETRIES}), retrying in ${WAIT}s..."
+                cat api-error.txt >&2
+                sleep "${WAIT}"
+              else
+                echo "::error::GitHub API failed after ${MAX_RETRIES} retries"
+                cat api-error.txt >&2
+                echo 'error_code=GITHUB_RUNS_API_FAILED' >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+            done
+
+            ALL_RUNS="${RESPONSE}"
+
+            if [ -z "${ALL_RUNS}" ]; then
+              echo "  No secretless-contract-e2e run found yet, waiting ${POLL_INTERVAL}s..."
+              sleep "${POLL_INTERVAL}"
+              ELAPSED=$((ELAPSED + POLL_INTERVAL))
+              continue
+            fi
+
+            # API 已只返回 latest current-SHA run/attempt；不得让旧成功 run
+            # 越过较新的 in-progress/failed attempt。
+            LATEST_RUN=$(printf '%s\n' "${ALL_RUNS}" | head -n 1)
+            RUN_ID=$(echo "${LATEST_RUN}" | cut -d'|' -f1)
+            RUN_STATUS=$(echo "${LATEST_RUN}" | cut -d'|' -f2)
+            RUN_CONCLUSION=$(echo "${LATEST_RUN}" | cut -d'|' -f3)
+            RUN_ATTEMPT=$(echo "${LATEST_RUN}" | cut -d'|' -f4)
+
+            if [ "${RUN_STATUS}" = "completed" ] && [ "${RUN_CONCLUSION}" = "success" ]; then
+              echo "Found success run: #${RUN_ID} attempt=${RUN_ATTEMPT} for SHA ${COMMIT_SHA}"
+              # R79 §10.8 / R80 P2-01: artifact 身份绑定核对 — 下载 artifact,验证其中
+              # result.json 的 head_sha / run_id / attempt 与 API 一致
+              # R80 P2-01: artifact 名称包含 event 字段
+              ART_NAME="secretless-e2e-push-${RUN_ID}-${RUN_ATTEMPT}"
+              if ! ART_RESPONSE=$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts?per_page=100" 2>artifact-api-error.txt); then
+                echo "::error::SECRETLESS_ARTIFACT_API_FAILED run_id=${RUN_ID}"
+                cat artifact-api-error.txt >&2
+                exit 34
+              fi
+              ART_MATCHES=$(jq -c --arg name "${ART_NAME}" \
+                '[.artifacts[] | select(.name==$name and .expired==false)]' <<<"${ART_RESPONSE}")
+              ART_COUNT=$(jq 'length' <<<"${ART_MATCHES}")
+              ART_ID=$(jq -r '.[0].id // ""' <<<"${ART_MATCHES}")
+              ART_DIGEST=$(jq -r '.[0].digest // ""' <<<"${ART_MATCHES}")
+              if [ "${ART_COUNT}" -ne 1 ]; then
+                echo "::error::artifact ${ART_NAME} cardinality=${ART_COUNT} for run=${RUN_ID} — expected exactly one"
+                echo 'error_code=SECRETLESS_CLOSED_LOOP_ARTIFACT_CARDINALITY' >> "$GITHUB_OUTPUT"
+                exit 35
+              fi
+              if [ -z "${ART_ID}" ]; then
+                echo "::error::artifact ${ART_NAME} not found — closed-loop identity binding failed"
+                echo 'error_code=SECRETLESS_CLOSED_LOOP_ARTIFACT_MISSING' >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              if ! [[ "${ART_DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+                echo "::error::artifact ${ART_NAME} digest invalid or absent: ${ART_DIGEST}"
+                echo 'error_code=SECRETLESS_CLOSED_LOOP_ARTIFACT_DIGEST_INVALID' >> "$GITHUB_OUTPUT"
+                exit 37
+              fi
+              echo "Artifact found id=${ART_ID} name=${ART_NAME} digest=${ART_DIGEST}"
+              rm -rf /tmp/sl-artifact && mkdir -p /tmp/sl-artifact
+              gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${ART_ID}/zip" \
+                > /tmp/sl-artifact.zip 2>/dev/null
+              (cd /tmp/sl-artifact && unzip -oq /tmp/sl-artifact.zip)
+              # upload-artifact 接收多条 path 时以共同祖先为 archive root；本 workflow
+              # 上传 artifacts/secretless-e2e/ 与 deployment-state-*.json，因此解压后
+              # 权威结果位于 artifacts/secretless-e2e/result.json。将真实 archive root
+              # 交给独立 verifier；缺失、歧义或身份不匹配仍由 verifier fail-closed。
+              if ! SL_ARTIFACT_DIR=/tmp/sl-artifact/artifacts \
+                SL_SHA="${COMMIT_SHA}" SL_RUN_ID="${RUN_ID}" SL_ATTEMPT="${RUN_ATTEMPT}" \
+                SL_ARTIFACT_ID="${ART_ID}" SL_ARTIFACT_DIGEST="${ART_DIGEST}" \
+                SL_VERIFICATION_OUTPUT="/tmp/sl-artifact/secretless-closed-loop-verification.json" \
+                python3 scripts/verify_secretless_artifact.py; then
+                echo 'error_code=SECRETLESS_CLOSED_LOOP_IDENTITY_MISMATCH' >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+              cp /tmp/sl-artifact/secretless-closed-loop-verification.json \
+                "${SECRETLESS_CLOSED_LOOP_STATE}"
+              python3 - "${ELAPSED}" "${RUN_STATUS}" "${RUN_CONCLUSION}" \
+                "${SECRETLESS_CLOSED_LOOP_STATE}" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          wait_seconds, status, conclusion, path = sys.argv[1:]
+          output = Path(path)
+          document = json.loads(output.read_text(encoding="utf-8"))
+          document.update({
+              "selected_run_id": document["run_id"],
+              "selected_run_attempt": document["run_attempt"],
+              "wait_seconds": int(wait_seconds),
+              "final_status": status,
+              "final_conclusion": conclusion,
+              "error_code": None,
+          })
+          output.write_text(
+              json.dumps(document, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+              echo "PASS: secretless-contract-e2e run #${RUN_ID} attempt=${RUN_ATTEMPT} closed-loop verified"
+              echo "  R83: artifact id=${ART_ID} digest=${ART_DIGEST} wait_seconds=${ELAPSED}"
+              exit 0
+            fi
+
+            if [ "${RUN_STATUS}" = "completed" ]; then
+              echo "::error::SECRETLESS_RUN_TERMINAL_FAILURE run_id=${RUN_ID} attempt=${RUN_ATTEMPT} conclusion=${RUN_CONCLUSION}"
+              exit 33
+            fi
+
+            if [ "${RUN_STATUS}" = "in_progress" ] || [ "${RUN_STATUS}" = "queued" ] || [ "${RUN_STATUS}" = "waiting" ]; then
+              echo "  secretless-contract-e2e run #${RUN_ID} status=${RUN_STATUS}, waiting ${POLL_INTERVAL}s... (${ELAPSED}s elapsed)"
+              sleep "${POLL_INTERVAL}"
+              ELAPSED=$((ELAPSED + POLL_INTERVAL))
+              continue
+            fi
+
+            echo "::error::SECRETLESS_RUN_STATUS_UNKNOWN run_id=${RUN_ID} status=${RUN_STATUS} conclusion=${RUN_CONCLUSION}"
+            exit 36
+          done
+
+          if [ -z "${RUN_ID:-}" ]; then
+            echo "::error::SECRETLESS_RUN_NOT_FOUND_FOR_CURRENT_SHA sha=${COMMIT_SHA}"
+            exit 31
+          fi
+          echo "::error::SECRETLESS_RUN_TERMINAL_TIMEOUT run_id=${RUN_ID} attempt=${RUN_ATTEMPT:-unknown}"
+          exit 32
+
+      - name: Upload Secretless closed-loop verification
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: secretless-closed-loop-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/secretless-closed-loop/verification.json
+          retention-days: 14
+          if-no-files-found: warn
 
   release-summary:
     runs-on: ubuntu-latest
@@ -4314,14 +4968,16 @@ jobs:
             verify-git-source-governance,
             rc-continuity, publish-attestation,
             attestation-semantics-verify, verify-only-3x, tag-ruleset-verify,
-            crdb-ru-72h-attribution-gate, production-evidence,
+            crdb-ru-72h-attribution-gate, generate-evidence-envelope,
             production-promotion-gate,
             oci-allowlist-verify,
             validate-oci-rootfs,
             runtime-smoke-compose,
             compose-runtime-e2e,
             verify-rc-identity,
-            bind-runtime-config]
+            bind-runtime-config,
+            secretless-crdb-closed-loop-gate,
+            promote-rc-reusable]
     env:
       DOCKER_BUILD: ${{ needs.docker-build.result }}
       DOCKER_DIGEST_VERIFY: ${{ needs.docker-digest-verify.result }}
@@ -4358,7 +5014,7 @@ jobs:
       CRDB_RU_72H_EVIDENCE_STATUS: ${{ needs.crdb-ru-72h-attribution-gate.outputs.evidence_status }}
       # R66 P1-04: 显式 evidence_present 输出,区分"无数据"与"通过"
       CRDB_RU_72H_EVIDENCE_PRESENT: ${{ needs.crdb-ru-72h-attribution-gate.outputs.evidence_present }}
-      PRODUCTION_EVIDENCE: ${{ needs.production-evidence.result }}
+      PRODUCTION_EVIDENCE: ${{ needs.generate-evidence-envelope.result }}
       PRODUCTION_PROMOTION_GATE: ${{ needs.production-promotion-gate.result }}
       # R71 P0-11: verify-rc-identity (RC 身份完整核验,无重建)
       VERIFY_RC_IDENTITY: ${{ needs.verify-rc-identity.result }}
@@ -4372,6 +5028,10 @@ jobs:
       BIND_RUNTIME_CONFIG_HOST_CONFIG_DIGEST: ${{ needs.bind-runtime-config.outputs.host_config_digest }}
       BIND_RUNTIME_CONFIG_SOURCE_SHA: ${{ needs.bind-runtime-config.outputs.source_sha }}
       BIND_RUNTIME_CONFIG_WORKFLOW_RUN_ID: ${{ needs.bind-runtime-config.outputs.workflow_run_id }}
+      # R73 §5.6 (P0-07): promote-rc-reusable (workflow_dispatch → reusable workflow)
+      PROMOTE_RC_REUSABLE: ${{ needs.promote-rc-reusable.result }}
+      # R76 P1-07: secretless-crdb-closed-loop-gate (CRDB 闭环验证)
+      SECRETLESS_CRDB_CLOSED_LOOP_GATE: ${{ needs.secretless-crdb-closed-loop-gate.result }}
     steps:
     - name: Verify all required jobs succeeded
       run: |
@@ -4445,10 +5105,12 @@ jobs:
           "verify-only-3x=${VERIFY_ONLY_3X}" \
           "tag-ruleset-verify=${TAG_RULESET_VERIFY}" \
           "crdb-ru-72h-attribution-gate=${CRDB_RU_72H_ATTRIBUTION_GATE}" \
-          "production-evidence=${PRODUCTION_EVIDENCE}" \
+          "generate-evidence-envelope=${PRODUCTION_EVIDENCE}" \
           "production-promotion-gate=${PRODUCTION_PROMOTION_GATE}" \
           "verify-rc-identity=${VERIFY_RC_IDENTITY}" \
-          "bind-runtime-config=${BIND_RUNTIME_CONFIG}"; do
+          "bind-runtime-config=${BIND_RUNTIME_CONFIG}" \
+          "promote-rc-reusable=${PROMOTE_RC_REUSABLE}" \
+          "secretless-crdb-closed-loop-gate=${SECRETLESS_CRDB_CLOSED_LOOP_GATE}"; do
           job="${entry%%=*}"
           conclusion="${entry##*=}"
           echo "  ${job}: ${conclusion}"
@@ -4535,21 +5197,24 @@ jobs:
                 FAIL=1
               fi
             fi
-          elif [ "${job}" = "production-evidence" ]; then
-            # R64 P1-12: production-evidence 是证据生成 job,失败不阻断 PR 合并
+          elif [ "${job}" = "generate-evidence-envelope" ]; then
+            # R64 P1-12 / R73 P1-05: generate-evidence-envelope 是证据生成 job,失败不阻断 PR 合并
             # (完整证据是 release 晋级条件,而非 PR 条件;PR 上仅做快速 dry-run 验证)
             # 仅记录状态,failure/cancelled 不设 FAIL=1
             if [ "${conclusion}" != "success" ]; then
-              echo "::warning::Job '${job}' did not succeed (got: ${conclusion}) — non-blocking (R64 P1-12)"
+              echo "::warning::Job '${job}' did not succeed (got: ${conclusion}) — non-blocking (R64 P1-12 / R73 P1-05)"
             fi
           elif [ "${job}" = "production-promotion-gate" ]; then
-            # R70 P0-10: production-promotion-gate 仅在 production-v* tag 或 workflow_dispatch 触发
+            # R70 P0-10: production-promotion-gate 仅在 production-v* tag 触发
+            # R73 §5.6 (P0-07): workflow_dispatch 不再触发本 job — 晋级逻辑已委托给
+            #   _promote-verified-rc.yml (由 promote-rc-reusable 调用)。
+            #   workflow_dispatch 时本 job 为 skipped,由 promote-rc-reusable 替代。
             # - production-v* tag (PRODUCTION_TAG=true): 必须 success(失败立即阻断 production 部署)
-            # - workflow_dispatch: 必须 success(运维手动触发的晋级门禁)
+            # - workflow_dispatch: 允许 skipped(晋级由 promote-rc-reusable 完成)
             # - master push / rc-v* tag / PR: 允许 skipped
-            if [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            if [ "${PRODUCTION_TAG}" = "true" ]; then
               if [ "${conclusion}" != "success" ]; then
-                echo "::error::Job '${job}' did not succeed on production tag/dispatch (got: ${conclusion})"
+                echo "::error::Job '${job}' did not succeed on production tag (got: ${conclusion})"
                 echo "R65 P0-04 / R70 P0-10: production promotion 证据不足,无法晋级"
                 FAIL=1
               fi
@@ -4560,15 +5225,17 @@ jobs:
               fi
             fi
           elif [ "${job}" = "verify-rc-identity" ]; then
-            # R71 P0-11: verify-rc-identity 仅在 production-v* tag 或 workflow_dispatch 触发
+            # R71 P0-11: verify-rc-identity 仅在 production-v* tag 触发
+            # R73 §5.6 (P0-07): workflow_dispatch 不再触发本 job — 晋级逻辑已委托给
+            #   _promote-verified-rc.yml (由 promote-rc-reusable 调用)。
+            #   workflow_dispatch 时本 job 为 skipped,由 promote-rc-reusable 替代。
             # - production-v* tag (PRODUCTION_TAG=true): 必须 success 且 rc_verified=true
             #   (RC 身份核验失败 → production promotion 被阻断,无法 promote 未验证 digest)
-            # - workflow_dispatch: 必须 success 且 rc_verified=true
-            # - master push / rc-v* tag / PR: 允许 skipped(verify-rc-identity 仅在
-            #   production 晋级场景运行,RC/master/PR 不需要核验 RC 身份)
-            if [ "${PRODUCTION_TAG}" = "true" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            # - workflow_dispatch: 允许 skipped(身份核验由 _promote-verified-rc.yml 完成)
+            # - master push / rc-v* tag / PR: 允许 skipped
+            if [ "${PRODUCTION_TAG}" = "true" ]; then
               if [ "${conclusion}" != "success" ]; then
-                echo "::error::Job '${job}' did not succeed on production tag/dispatch (got: ${conclusion})"
+                echo "::error::Job '${job}' did not succeed on production tag (got: ${conclusion})"
                 echo "  R71 P0-11: RC 身份核验失败 — production promotion 被阻断(fail-closed)"
                 FAIL=1
               else
@@ -4578,6 +5245,23 @@ jobs:
                   echo "  R71 P0-11: RC 身份字段与 evidence artifact 不一致"
                   FAIL=1
                 fi
+              fi
+            else
+              if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then
+                echo "::error::Job '${job}' did not succeed (got: ${conclusion})"
+                FAIL=1
+              fi
+            fi
+          elif [ "${job}" = "promote-rc-reusable" ]; then
+            # R73 §5.6 (P0-07): promote-rc-reusable 仅在 workflow_dispatch 触发
+            #   (调用 _promote-verified-rc.yml 完成 production promotion)
+            # - workflow_dispatch: 必须 success(晋级失败 → production promotion 被阻断)
+            # - 其他场景 (push / PR / tag): 允许 skipped
+            if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+              if [ "${conclusion}" != "success" ]; then
+                echo "::error::Job '${job}' did not succeed on workflow_dispatch (got: ${conclusion})"
+                echo "  R73 §5.6 (P0-07): production promotion 失败 — reusable workflow 校验未通过"
+                FAIL=1
               fi
             else
               if [ "${conclusion}" != "success" ] && [ "${conclusion}" != "skipped" ]; then

@@ -244,5 +244,20 @@ infrastructure:
       timeout: 5s
       retries: 3
 
+  # R75 P0-03: CockroachDB 单节点(CI/开发环境专用,生产用外部 CRDB Cloud)
+  # 此服务仅出现在 docker-compose.yml,不进入 `services` 业务清单
+  # (systemd 部署通过外部 CockroachDB Cloud,不通过 systemd unit 管理)
+  cockroachdb:
+    image: cockroachdb/cockroach:v24.1.0@sha256:cc4e3ee67104d6f6434c81b555d69d4eb319f8aa0c5495931ffbe9273adfc4b5
+    restart: unless-stopped
+    # R79 §10.1: v24.1 insecure 约束 listen-addr 必须 loopback:26257;
+    # SQL listener 显式迁移到 0.0.0.0:26258(与 docker-compose.yml 一致)
+    command: start-single-node --insecure --listen-addr=localhost:26257 --sql-addr=0.0.0.0:26258 --http-addr=0.0.0.0:8080 --store=type=mem,size=256MiB
+    volumes:
+      - cockroach_data:/cockroach/cockroach-data
+    ports:
+      - "127.0.0.1:26258:26258"
+      - "127.0.0.1:8080:8080"
+
 volumes:
   redis_data:

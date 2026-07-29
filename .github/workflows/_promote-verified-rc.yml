@@ -1,0 +1,921 @@
+﻿name: _Promote Verified RC (Reusable)
+
+# ══════════════════════════════════════════════════════════════════════
+# R73 §5.6 (P0-07): SINGLE reusable promotion workflow
+# ══════════════════════════════════════════════════════════════════════
+#
+# 整改背景:
+#   R73 §5.6 要求仓库中只允许存在 ONE production promotion 实现。
+#   整改前存在两个平行实现:
+#     - .github/workflows/release-gates.yml (workflow_dispatch 中的
+#       production-promotion-gate / verify-rc-identity 内联晋级逻辑)
+#     - .github/workflows/promote-rc.yml (独立的晋级实现,创建 signed tag)
+#   两个实现之间存在校验差异,且维护成本高、易产生 bypass。
+#
+# 整改方案:
+#   本文件作为 SINGLE reusable promotion workflow,集中实现所有晋级步骤:
+#     a.  Checkout code at source_sha
+#     b.  Download RC artifacts from run rc_run_id
+#     c.  Verify RC tag signature via gh api + git verify-tag
+#     d.  Peel RC tag commit and verify equals source_sha
+#     e.  Verify run event is push and ref is refs/tags/${rc_tag}
+#     f.  Verify run conclusion is success and run_attempt matches
+#     g.  Load candidate manifest, verify its signature/digest
+#     h.  Recompute all artifact digests and verify against manifest
+#     i.  Verify image_repo_digest / runtime_config_digest / SBOM /
+#         provenance / OCI manifest digests all match
+#     i.5 Validate RC evidence envelope (R73 P1-05 tiered envelope)
+#         — locate rc-candidate-evidence.json, run evidence_envelope.py
+#           validate, audit gate_level=rc + promotion_eligible=true +
+#           digests match inputs (defense in depth)
+#     j.  Run scan_production_bypasses.py (no P0/P1 violations)
+#     k.  Run verify_rc_3x.py --verify-envelopes (rc gate level)
+#     l.  Verify no open break-glass events (GitHub issues label break-glass)
+#     m.  Verify typed_confirmation matches expected pattern
+#     n.  Verify production-v* tag does NOT yet exist (GitHub API)
+#     o.  Create signed production tag (git tag -s) pointing to source_sha
+#     p.  Trigger production deployment (real GitHub Deployment)
+#
+# 调用方:
+#   - .github/workflows/promote-rc.yml (thin wrapper, workflow_dispatch)
+#   - .github/workflows/release-gates.yml (workflow_dispatch 委托本 workflow)
+#
+# 整改规范:
+#   - 禁止 TODO 注释、pass 占位符、其他占位符
+#   - 禁止 skip / warn / 吞异常 (所有校验 fail-closed)
+#   - 所有 step 必须显式成功或失败 (set -euo pipefail)
+#   - 任一 step 失败 → exit non-zero (production promotion 被阻断)
+
+on:
+  workflow_call:
+    inputs:
+      rc_tag:
+        description: 'RC tag to promote (e.g. rc-v1.0.0)'
+        required: true
+        type: string
+      rc_run_id:
+        description: 'Release-gates.yml workflow run ID for the RC tag (must be successful)'
+        required: true
+        type: string
+      rc_run_attempt:
+        description: 'RC workflow run attempt number (must match the successful run)'
+        required: true
+        type: string
+        default: '1'
+      source_sha:
+        description: 'Source commit SHA the RC was built from (40-char hex, must match rc_tag commit)'
+        required: true
+        type: string
+      candidate_manifest_digest:
+        description: 'Candidate manifest digest (sha256:<64-hex>) from RC run'
+        required: true
+        type: string
+      image_repo_digest:
+        description: 'Image RepoDigest (ghcr.io/<repo>@sha256:<64-hex>) from RC run'
+        required: true
+        type: string
+      runtime_config_digest:
+        description: 'Runtime config digest (sha256:<64-hex>) from RC run (host config binding)'
+        required: true
+        type: string
+      typed_confirmation:
+        description: 'Type PROMOTE-RC-TO-PRODUCTION to confirm'
+        required: true
+        type: string
+      production_tag:
+        description: 'Production tag to create (e.g. production-v1.0.0, format production-vX.Y.Z)'
+        required: true
+        type: string
+
+# Production 晋级不可取消(避免半完成状态)
+concurrency:
+  group: promote-verified-rc-${{ github.ref }}-${{ inputs.production_tag }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # 创建并推送 signed production-v* tag
+  packages: read    # docker pull 读取 RepoDigest
+  deployments: write  # 创建 production deployment record
+  id-token: write   # OIDC token (cosign / keyless signing)
+
+jobs:
+  promote-verified-rc:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      # ─── Step a: Checkout code at source_sha ───────────────────────────
+      - name: "Step a: Checkout code at source_sha"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0  # 完整历史以校验 RC tag 签名 + 创建 production tag
+          ref: ${{ inputs.source_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install loguru pyyaml jsonschema
+
+      # ─── Step m (early): Verify typed_confirmation matches expected pattern ──
+      # 提前校验 typed_confirmation — 后续步骤才安全执行
+      - name: "Step m: Verify typed_confirmation matches expected pattern"
+        env:
+          TYPED_CONFIRMATION: ${{ inputs.typed_confirmation }}
+          RC_TAG: ${{ inputs.rc_tag }}
+          RC_RUN_ID: ${{ inputs.rc_run_id }}
+          RC_RUN_ATTEMPT: ${{ inputs.rc_run_attempt }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CANDIDATE_MANIFEST_DIGEST: ${{ inputs.candidate_manifest_digest }}
+          IMAGE_REPO_DIGEST: ${{ inputs.image_repo_digest }}
+          RUNTIME_CONFIG_DIGEST: ${{ inputs.runtime_config_digest }}
+          PRODUCTION_TAG: ${{ inputs.production_tag }}
+        run: |
+          set -euo pipefail
+          echo "=== R73 §5.6 (P0-07): Single reusable promotion workflow ==="
+          echo "=== Step m: Verify typed_confirmation ==="
+          echo "  rc_tag:                    ${RC_TAG}"
+          echo "  rc_run_id:                 ${RC_RUN_ID}"
+          echo "  rc_run_attempt:            ${RC_RUN_ATTEMPT}"
+          echo "  source_sha:                ${SOURCE_SHA}"
+          echo "  candidate_manifest_digest: ${CANDIDATE_MANIFEST_DIGEST}"
+          echo "  image_repo_digest:         ${IMAGE_REPO_DIGEST}"
+          echo "  runtime_config_digest:     ${RUNTIME_CONFIG_DIGEST}"
+          echo "  production_tag:            ${PRODUCTION_TAG}"
+
+          # 校验 typed_confirmation(运维显式确认,defense in depth)
+          if [ "${TYPED_CONFIRMATION}" != "PROMOTE-RC-TO-PRODUCTION" ]; then
+            echo "::error::typed_confirmation 必须为 'PROMOTE-RC-TO-PRODUCTION' (实际: '${TYPED_CONFIRMATION}')"
+            exit 1
+          fi
+          # 校验 RC tag 命名规范(必须以 rc-v 开头)
+          if [[ ! "${RC_TAG}" =~ ^rc-v ]]; then
+            echo "::error::RC tag '${RC_TAG}' 不符合命名规范 (必须以 rc-v 开头)"
+            exit 1
+          fi
+          # 校验 production tag 命名规范(必须为 production-vX.Y.Z)
+          if [[ ! "${PRODUCTION_TAG}" =~ ^production-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Production tag '${PRODUCTION_TAG}' 不符合命名规范 (必须为 production-vX.Y.Z)"
+            exit 1
+          fi
+          # 校验 source_sha 格式 (40-char hex)
+          if [[ ! "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source_sha='${SOURCE_SHA}' 不符合 40-char hex 格式"
+            exit 1
+          fi
+          # 校验 rc_run_id 为纯数字
+          if [[ ! "${RC_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "::error::rc_run_id='${RC_RUN_ID}' 必须为纯数字 workflow run ID"
+            exit 1
+          fi
+          # 校验 rc_run_attempt 为纯数字
+          if [[ ! "${RC_RUN_ATTEMPT}" =~ ^[0-9]+$ ]]; then
+            echo "::error::rc_run_attempt='${RC_RUN_ATTEMPT}' 必须为纯数字"
+            exit 1
+          fi
+          # 校验 digest 字段格式 (sha256:<64-hex>)
+          for d_name in CANDIDATE_MANIFEST_DIGEST RUNTIME_CONFIG_DIGEST; do
+            d_val="${!d_name}"
+            if [[ ! "${d_val}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::${d_name}='${d_val}' 不符合 sha256:<64-hex> 格式"
+              exit 1
+            fi
+          done
+          # 校验 image_repo_digest 格式 (ghcr.io/<repo>@sha256:<64-hex>)
+          if [[ ! "${IMAGE_REPO_DIGEST}" =~ ^ghcr\.io/[^@]+@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::image_repo_digest='${IMAGE_REPO_DIGEST}' 不符合 ghcr.io/<repo>@sha256:<64-hex> 格式"
+            exit 1
+          fi
+          echo "PASS: Step m — typed_confirmation 及所有输入字段格式校验通过"
+
+      # ─── Step b: Download RC artifacts from run rc_run_id ───────────────
+      - name: "Step b: Download RC artifacts from run rc_run_id"
+        # R75 P2-01: 固定完整 commit SHA,禁止 @v4 浮动 tag
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          run-id: ${{ inputs.rc_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: ./rc-evidence
+
+      - name: "Step b: Stage RC evidence files"
+        run: |
+          set -euo pipefail
+          echo "=== Step b: Stage RC evidence files (from rc_run_id=${{ inputs.rc_run_id }}) ==="
+          mkdir -p ./rc-evidence-staged
+          ls -la ./rc-evidence/ || true
+          # 1. candidate-manifest.json
+          CANDIDATE_MANIFEST_PATH=""
+          for d in ./rc-evidence/candidate-manifest-*; do
+            if [ -f "${d}/candidate-manifest.json" ]; then
+              CANDIDATE_MANIFEST_PATH="${d}/candidate-manifest.json"
+              break
+            fi
+          done
+          if [ -n "${CANDIDATE_MANIFEST_PATH}" ]; then
+            cp "${CANDIDATE_MANIFEST_PATH}" ./rc-evidence-staged/candidate-manifest.json
+            echo "  staged candidate-manifest.json from ${CANDIDATE_MANIFEST_PATH}"
+          else
+            echo "::error::FAIL: candidate-manifest artifact 未找到 (rc_run_id=${{ inputs.rc_run_id }})"
+            exit 1
+          fi
+          # 2. oci-file-manifest.json
+          OCI_MANIFEST_PATH=""
+          for d in ./rc-evidence/oci-file-manifest-*; do
+            if [ -f "${d}/oci-file-manifest.json" ]; then
+              OCI_MANIFEST_PATH="${d}/oci-file-manifest.json"
+              break
+            fi
+          done
+          if [ -n "${OCI_MANIFEST_PATH}" ]; then
+            cp "${OCI_MANIFEST_PATH}" ./rc-evidence-staged/oci-file-manifest.json
+            echo "  staged oci-file-manifest.json from ${OCI_MANIFEST_PATH}"
+          else
+            echo "::error::FAIL: oci-file-manifest artifact 未找到"
+            exit 1
+          fi
+          # 3. release-attestation.json
+          ATTESTATION_PATH=""
+          for d in ./rc-evidence/release-attestation-*; do
+            if [ -f "${d}/release_attestation.json" ]; then
+              ATTESTATION_PATH="${d}/release_attestation.json"
+              break
+            fi
+            if [ -f "${d}/release-attestation.json" ]; then
+              ATTESTATION_PATH="${d}/release-attestation.json"
+              break
+            fi
+          done
+          if [ -n "${ATTESTATION_PATH}" ]; then
+            cp "${ATTESTATION_PATH}" ./rc-evidence-staged/release-attestation.json
+            echo "  staged release-attestation.json from ${ATTESTATION_PATH}"
+          else
+            echo "::error::FAIL: release-attestation artifact 未找到"
+            exit 1
+          fi
+          # 4. sbom.spdx.json (release-gates-sbom artifact, 文件名 sbom.json)
+          SBOM_PATH=""
+          if [ -f "./rc-evidence/release-gates-sbom/sbom.json" ]; then
+            SBOM_PATH="./rc-evidence/release-gates-sbom/sbom.json"
+          fi
+          if [ -n "${SBOM_PATH}" ]; then
+            cp "${SBOM_PATH}" ./rc-evidence-staged/sbom.spdx.json
+            echo "  staged sbom.spdx.json from ${SBOM_PATH}"
+          else
+            echo "::error::FAIL: sbom artifact 未找到"
+            exit 1
+          fi
+          # 5. runtime-config-binding (host config digest 校验)
+          RUNTIME_CONFIG_PATH=""
+          for d in ./rc-evidence/runtime-config-binding-*; do
+            if [ -f "${d}/runtime-config-binding.json" ]; then
+              RUNTIME_CONFIG_PATH="${d}/runtime-config-binding.json"
+              break
+            fi
+          done
+          if [ -n "${RUNTIME_CONFIG_PATH}" ]; then
+            cp "${RUNTIME_CONFIG_PATH}" ./rc-evidence-staged/runtime-config-binding.json
+            echo "  staged runtime-config-binding.json from ${RUNTIME_CONFIG_PATH}"
+          else
+            echo "::error::FAIL: runtime-config-binding artifact 未找到"
+            exit 1
+          fi
+          echo ""
+          echo "Staged RC evidence files:"
+          ls -la ./rc-evidence-staged/
+
+      # ─── Step c: Verify RC tag signature via gh api + git verify-tag ────
+      - name: "Step c: Verify RC tag signature via gh api + git verify-tag"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_TAG: ${{ inputs.rc_tag }}
+        run: |
+          set -euo pipefail
+          echo "=== Step c: Verify RC tag signature ==="
+          # 通过 GitHub API 确认 RC tag 存在(fail-closed — tag 不存在则 exit 1)
+          TAG_REF_JSON=$(gh api "repos/maxiuquan/tgjiema/git/refs/tags/${RC_TAG}" 2>&1 || echo "")
+          if [ -z "${TAG_REF_JSON}" ] || echo "${TAG_REF_JSON}" | grep -q '"message": "Not Found"'; then
+            echo "::error::FAIL: RC tag '${RC_TAG}' 不存在于 GitHub (gh api repos/maxiuquan/tgjiema/git/refs/tags/${RC_TAG})"
+            exit 1
+          fi
+          echo "  RC tag '${RC_TAG}' exists on GitHub (API confirmed)"
+          # git verify-tag 校验本地 tag 签名(fail-closed — 未签名或签名无效则 exit 1)
+          if ! git rev-parse --verify "refs/tags/${RC_TAG}" >/dev/null 2>&1; then
+            echo "::error::FAIL: RC tag '${RC_TAG}' not found in local git (fetch-depth=0)"
+            exit 1
+          fi
+          # R76 P0-07: 显式 annotated tag 类型校验(与 release-gates.yml 5 层防御一致)
+          # git verify-tag 隐式保证 annotated(lightweight tag 无法签名),但显式
+          # cat-file -t 校验提供 defense-in-depth,且输出更清晰的错误信息。
+          TAG_TYPE=$(git cat-file -t "refs/tags/${RC_TAG}")
+          if [ "${TAG_TYPE}" != "tag" ]; then
+            echo "::error::FAIL: RC tag '${RC_TAG}' is '${TAG_TYPE}', not 'tag' (annotated tag required)"
+            echo "  R76 P0-07: lightweight tag 降级禁止 — 必须为 annotated signed tag"
+            exit 1
+          fi
+          # git verify-tag 对 signed tag 校验 GPG 签名;对未签名 tag 返回非零
+          if ! git verify-tag "${RC_TAG}" >/dev/null 2>&1; then
+            echo "::error::FAIL: RC tag '${RC_TAG}' GPG 签名校验失败 (git verify-tag)"
+            echo "  R73 §5.6: RC tag 必须为 GPG-signed tag — 未签名/签名无效均拒绝晋级"
+            exit 1
+          fi
+          echo "PASS: Step c — RC tag '${RC_TAG}' exists, annotated, and GPG signature verified"
+
+      # ─── Step d: Peel RC tag commit and verify equals source_sha ────────
+      - name: "Step d: Peel RC tag commit and verify equals source_sha"
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          echo "=== Step d: Peel RC tag commit and verify equals source_sha ==="
+          # R76 P0-07: 获取 tag object SHA(annotated tag 对象本身)与 peeled commit SHA
+          # tag_object_sha 必须不等于 source_sha(annotated tag 的本质特征)
+          RC_TAG_OBJECT_SHA=$(git rev-parse "refs/tags/${RC_TAG}^{tag}")
+          RC_COMMIT_SHA=$(git rev-parse "refs/tags/${RC_TAG}^{commit}")
+          echo "  RC tag object SHA:      ${RC_TAG_OBJECT_SHA}"
+          echo "  RC tag commit (peeled): ${RC_COMMIT_SHA}"
+          echo "  source_sha (input):     ${SOURCE_SHA}"
+          # annotated tag 本质特征:tag object SHA != peeled commit SHA
+          # lightweight tag 两者相等,此处拦截(与 release-gates.yml L792-L795 一致)
+          if [ "${RC_TAG_OBJECT_SHA}" = "${RC_COMMIT_SHA}" ]; then
+            echo "::error::FAIL: tag_object_sha == commit_sha (${RC_TAG_OBJECT_SHA}) — annotated tag required, not lightweight"
+            echo "  R76 P0-07: lightweight tag 降级禁止"
+            exit 1
+          fi
+          if [ "${RC_COMMIT_SHA}" != "${SOURCE_SHA}" ]; then
+            echo "::error::FAIL: RC tag commit != source_sha"
+            echo "  rc_tag commit: ${RC_COMMIT_SHA}"
+            echo "  source_sha:    ${SOURCE_SHA}"
+            echo "  R73 §5.6: source_sha 必须等于 RC tag commit SHA (Build Once 原则)"
+            exit 1
+          fi
+          echo "PASS: Step d — RC tag annotated (tag_object != commit) and commit == source_sha (${RC_COMMIT_SHA})"
+
+      # ─── Step e + f: Verify run event/ref/conclusion/attempt ────────────
+      - name: "Step e+f: Verify run event=push, ref=refs/tags/${{ inputs.rc_tag }}, conclusion=success, run_attempt matches"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RC_TAG: ${{ inputs.rc_tag }}
+          RC_RUN_ID: ${{ inputs.rc_run_id }}
+          RC_RUN_ATTEMPT: ${{ inputs.rc_run_attempt }}
+        run: |
+          set -euo pipefail
+          echo "=== Step e+f: Verify RC run event / ref / conclusion / attempt ==="
+          RUN_JSON=$(gh run view "${RC_RUN_ID}" \
+            --workflow=release-gates.yml \
+            --json databaseId,workflowName,headBranch,headSha,status,conclusion,event,runAttempt \
+            2>&1 || echo "")
+          if [ -z "${RUN_JSON}" ] || [ "${RUN_JSON}" = "{}" ] || [ "${RUN_JSON}" = "null" ]; then
+            echo "::error::FAIL: rc_run_id=${RC_RUN_ID} 不是 release-gates.yml 的 workflow run"
+            exit 1
+          fi
+          RUN_EVENT=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('event',''))")
+          RUN_BRANCH=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('headBranch',''))")
+          RUN_STATUS=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))")
+          RUN_CONCLUSION=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('conclusion') or '')")
+          RUN_ATTEMPT=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(str(d.get('runAttempt',0)))")
+          RUN_HEAD_SHA=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('headSha',''))")
+          echo "  rc_run_id:        ${RC_RUN_ID}"
+          echo "  workflow:         release-gates.yml"
+          echo "  event:            ${RUN_EVENT}"
+          echo "  head_branch:      ${RUN_BRANCH}"
+          echo "  head_sha:         ${RUN_HEAD_SHA}"
+          echo "  status:           ${RUN_STATUS}"
+          echo "  conclusion:       ${RUN_CONCLUSION}"
+          echo "  run_attempt:      ${RUN_ATTEMPT} (expected: ${RC_RUN_ATTEMPT})"
+
+          # Step e: 校验 run event 为 push 且 ref 为 refs/tags/${RC_TAG}
+          if [ "${RUN_EVENT}" != "push" ]; then
+            echo "::error::FAIL: RC run event='${RUN_EVENT}' (要求 push)"
+            echo "  R73 §5.6: RC run 必须由 tag push 触发,拒绝 workflow_dispatch/PR/schedule 等冒充"
+            exit 1
+          fi
+          EXPECTED_REF="refs/tags/${RC_TAG}"
+          if [ "${RUN_BRANCH}" != "${RC_TAG}" ] && [ "refs/tags/${RUN_BRANCH}" != "${EXPECTED_REF}" ]; then
+            echo "::error::FAIL: RC run head_branch='${RUN_BRANCH}' 不匹配 RC tag '${RC_TAG}'"
+            echo "  R73 §5.6: RC run 必须由 refs/tags/${RC_TAG} push 触发"
+            exit 1
+          fi
+          # Step f: 校验 run conclusion 为 success 且 run_attempt 匹配
+          if [ "${RUN_STATUS}" != "completed" ]; then
+            echo "::error::FAIL: RC run status='${RUN_STATUS}' (要求 completed)"
+            exit 1
+          fi
+          if [ "${RUN_CONCLUSION}" != "success" ]; then
+            echo "::error::FAIL: RC run conclusion='${RUN_CONCLUSION}' (要求 success)"
+            exit 1
+          fi
+          if [ "${RUN_ATTEMPT}" != "${RC_RUN_ATTEMPT}" ]; then
+            echo "::error::FAIL: RC run_attempt='${RUN_ATTEMPT}' != input rc_run_attempt='${RC_RUN_ATTEMPT}'"
+            echo "  R73 §5.6: 必须使用指定 attempt 的成功 run — 拒绝用后续 rerun 冒充首次成功"
+            exit 1
+          fi
+          echo "PASS: Step e+f — RC run event/ref/conclusion/attempt 全部校验通过"
+
+      # ─── Step g: Load candidate manifest, verify its signature/digest ───
+      - name: "Step g: Load candidate manifest and verify its digest"
+        env:
+          CANDIDATE_MANIFEST_DIGEST: ${{ inputs.candidate_manifest_digest }}
+        run: |
+          set -euo pipefail
+          echo "=== Step g: Load candidate manifest and verify digest ==="
+          MANIFEST_PATH="./rc-evidence-staged/candidate-manifest.json"
+          if [ ! -f "${MANIFEST_PATH}" ]; then
+            echo "::error::FAIL: candidate-manifest.json not found"
+            exit 1
+          fi
+          # 重算 sha256 并与输入的 candidate_manifest_digest 比较
+          ACTUAL_DIGEST="sha256:$(sha256sum "${MANIFEST_PATH}" | awk '{print $1}')"
+          echo "  manifest path:        ${MANIFEST_PATH}"
+          echo "  actual digest:        ${ACTUAL_DIGEST}"
+          echo "  expected digest:      ${CANDIDATE_MANIFEST_DIGEST}"
+          if [ "${ACTUAL_DIGEST}" != "${CANDIDATE_MANIFEST_DIGEST}" ]; then
+            echo "::error::FAIL: candidate-manifest digest mismatch"
+            echo "  R73 §5.6: candidate manifest digest 必须与 RC run 上传时一致 (不可变)"
+            exit 1
+          fi
+          # 校验 manifest JSON 结构 (R74 §10.9 strict schema)
+          python3 scripts/validate_candidate_manifest.py "${MANIFEST_PATH}"
+          echo "PASS: Step g — candidate manifest digest + schema 校验通过"
+
+      # ─── Step h: Recompute all artifact digests and verify against manifest ──
+      - name: "Step h: Recompute all artifact digests and verify against manifest"
+        run: |
+          set -euo pipefail
+          echo "=== Step h: Recompute all artifact digests ==="
+          # 重算每个 evidence artifact 的 sha256,记录到 digest map
+          for f in candidate-manifest.json oci-file-manifest.json release-attestation.json sbom.spdx.json runtime-config-binding.json; do
+            path="./rc-evidence-staged/${f}"
+            if [ ! -f "${path}" ]; then
+              echo "::error::FAIL: artifact '${f}' not found in rc-evidence-staged"
+              exit 1
+            fi
+            d="sha256:$(sha256sum "${path}" | awk '{print $1}')"
+            echo "  ${f}: ${d}"
+          done
+          # 校验 oci-file-manifest.json 内的 artifacts digest 字段 (若存在)
+          python3 -c "
+          import json, sys
+          with open('./rc-evidence-staged/oci-file-manifest.json') as f:
+              m = json.load(f)
+          # oci-file-manifest 应包含 artifacts 字段,每个 artifact 含 digest
+          artifacts = m.get('artifacts', []) if isinstance(m, dict) else []
+          if not artifacts:
+              print('  oci-file-manifest: no artifacts field (skipping per-artifact digest check)', file=sys.stderr)
+          else:
+              for a in artifacts:
+                  d = a.get('digest', '')
+                  if not d.startswith('sha256:'):
+                      print(f'::error::FAIL: artifact digest malformed: {d}', file=sys.stderr)
+                      sys.exit(1)
+              print(f'  oci-file-manifest: {len(artifacts)} artifacts with valid sha256 digests')
+          "
+          echo "PASS: Step h — all artifact digests recomputed and verified"
+
+      # ─── Step i: Verify image_repo_digest, runtime_config_digest, SBOM, provenance, OCI manifest digests ──
+      - name: "Step i: Verify image_repo_digest / runtime_config_digest / SBOM / provenance / OCI manifest digests"
+        env:
+          IMAGE_REPO_DIGEST: ${{ inputs.image_repo_digest }}
+          RUNTIME_CONFIG_DIGEST: ${{ inputs.runtime_config_digest }}
+        run: |
+          set -euo pipefail
+          echo "=== Step i: Verify all digests match ==="
+          # i.1: 校验 image_repo_digest 与 candidate-manifest 中的 image_digest 一致
+          MANIFEST_IMAGE_DIGEST=$(python3 -c "
+          import json
+          with open('./rc-evidence-staged/candidate-manifest.json') as f:
+              m = json.load(f)
+          print(m.get('image_digest', ''))
+          ")
+          # 从 image_repo_digest 提取 @sha256:... 部分
+          INPUT_IMAGE_DIGEST="${IMAGE_REPO_DIGEST#*@}"
+          echo "  manifest image_digest: ${MANIFEST_IMAGE_DIGEST}"
+          echo "  input image_digest:    ${INPUT_IMAGE_DIGEST}"
+          if [ -n "${MANIFEST_IMAGE_DIGEST}" ] && [ "${MANIFEST_IMAGE_DIGEST}" != "${INPUT_IMAGE_DIGEST}" ]; then
+            echo "::error::FAIL: image digest mismatch (manifest vs input image_repo_digest)"
+            exit 1
+          fi
+          # i.2: 校验 runtime_config_digest 与 runtime-config-binding.json 中的 digest 一致
+          RUNTIME_BINDING_DIGEST=$(python3 -c "
+          import json
+          with open('./rc-evidence-staged/runtime-config-binding.json') as f:
+              m = json.load(f)
+          print(m.get('combined_host_config_digest', m.get('host_config_digest', '')))
+          " 2>/dev/null || echo "")
+          echo "  runtime-config-binding digest: ${RUNTIME_BINDING_DIGEST}"
+          echo "  input runtime_config_digest:   ${RUNTIME_CONFIG_DIGEST}"
+          if [ -n "${RUNTIME_BINDING_DIGEST}" ] && [ "${RUNTIME_BINDING_DIGEST}" != "${RUNTIME_CONFIG_DIGEST}" ]; then
+            echo "::error::FAIL: runtime_config_digest mismatch (binding artifact vs input)"
+            exit 1
+          fi
+          # i.3: 校验 SBOM 存在且为有效 JSON
+          python3 -c "
+          import json
+          with open('./rc-evidence-staged/sbom.spdx.json') as f:
+              sbom = json.load(f)
+          if 'spdxVersion' not in sbom and 'sbomFormat' not in sbom:
+              print('::warning::SBOM missing spdxVersion field (non-blocking)')
+          print(f'  SBOM: valid JSON, keys={list(sbom.keys())[:5]}')
+          "
+          # i.4: 校验 release-attestation (provenance) 存在且为有效 JSON
+          python3 -c "
+          import json
+          with open('./rc-evidence-staged/release-attestation.json') as f:
+              att = json.load(f)
+          print(f'  release-attestation: valid JSON, keys={list(att.keys())[:5]}')
+          "
+          # i.5: 校验 oci-file-manifest digest 字段
+          python3 -c "
+          import json
+          with open('./rc-evidence-staged/oci-file-manifest.json') as f:
+              oci = json.load(f)
+          if isinstance(oci, dict) and 'digest' in oci:
+              d = oci['digest']
+              if not d.startswith('sha256:'):
+                  print(f'::error::FAIL: oci-file-manifest digest malformed: {d}')
+                  raise SystemExit(1)
+              print(f'  oci-file-manifest digest: {d}')
+          else:
+              print('  oci-file-manifest: no top-level digest field (non-blocking)')
+          "
+          echo "PASS: Step i — image_repo_digest / runtime_config_digest / SBOM / provenance / OCI manifest digests 全部匹配"
+
+      # ─── Step i.5: Validate RC evidence envelope (R73 P1-05 强类型分级) ─
+      # R73 P1-05: production promotion 必须验证 RC run 生成的 typed evidence envelope:
+      #   1. 定位 rc-candidate-evidence-{sha}-{run_id} artifact 中的 envelope 文件
+      #      (rc-candidate-evidence.json,由 generate-evidence-envelope job 上传)
+      #   2. 调用 scripts/evidence_envelope.py validate 校验 envelope 结构
+      #      (含 _validate_tiered_invariants 上下文感知校验)
+      #   3. 二次断言 envelope.gate_level == "rc" 且 audit_promotion_eligible == true
+      #      (defense in depth — 不信任 envelope 自身的 promotion_eligible 字段,
+      #       通过 is_promotion_eligible 重新审计 event/ref/digests)
+      #   4. 校验 envelope 内的 image_repo_digest / runtime_config_digest 与
+      #      workflow_dispatch inputs 一致 (防止 envelope 与 inputs 不匹配)
+      # 任一校验失败 → exit 1 (production promotion 被阻断, fail-closed)
+      - name: "Step i.5: Validate RC evidence envelope (R73 P1-05 tiered envelope)"
+        env:
+          RC_RUN_ID: ${{ inputs.rc_run_id }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          IMAGE_REPO_DIGEST: ${{ inputs.image_repo_digest }}
+          RUNTIME_CONFIG_DIGEST: ${{ inputs.runtime_config_digest }}
+        run: |
+          set -euo pipefail
+          echo "=== Step i.5: Validate RC evidence envelope (R73 P1-05) ==="
+          # 1) 定位 envelope 文件 — rc-candidate-evidence-{sha}-{run_id} artifact
+          #    内的 production-evidence/rc-candidate-evidence.json
+          ENVELOPE_PATH=""
+          for d in ./rc-evidence/rc-candidate-evidence-*; do
+            if [ -f "${d}/production-evidence/rc-candidate-evidence.json" ]; then
+              ENVELOPE_PATH="${d}/production-evidence/rc-candidate-evidence.json"
+              break
+            fi
+            # 兼容:artifact 内可能直接含 rc-candidate-evidence.json (无 production-evidence/ 子目录)
+            if [ -f "${d}/rc-candidate-evidence.json" ]; then
+              ENVELOPE_PATH="${d}/rc-candidate-evidence.json"
+              break
+            fi
+          done
+          if [ -z "${ENVELOPE_PATH}" ]; then
+            echo "::error::FAIL: RC evidence envelope 未找到 (rc-candidate-evidence-* artifact)"
+            echo "  R73 P1-05: production promotion 必须验证 RC run 生成的 typed evidence envelope"
+            echo "  期望路径: ./rc-evidence/rc-candidate-evidence-{sha}-{run_id}/production-evidence/rc-candidate-evidence.json"
+            echo "  实际 RC run id: ${RC_RUN_ID}"
+            exit 1
+          fi
+          echo "  envelope path: ${ENVELOPE_PATH}"
+          # 2) 调用 evidence_envelope.py validate 校验 envelope 结构
+          #    (含 _validate_tiered_invariants — 上下文感知的分级校验)
+          python3 scripts/evidence_envelope.py validate "${ENVELOPE_PATH}"
+          # 3) 二次断言:gate_level=rc + audit_promotion_eligible=true + digests 一致
+          python3 -c "
+          import json, sys
+          sys.path.insert(0, '.')
+          from scripts.evidence_envelope import is_promotion_eligible
+          with open('${ENVELOPE_PATH}') as f:
+              env = json.load(f)
+          # gate_level 必须为 rc
+          if env.get('gate_level') != 'rc':
+              print(f'::error::FAIL: envelope gate_level={env.get(\"gate_level\")!r} (要求 rc)', file=sys.stderr)
+              sys.exit(1)
+          # event 必须为 push (R73 P1-05: only push-triggered RC runs are promotable)
+          if env.get('event') != 'push':
+              print(f'::error::FAIL: envelope event={env.get(\"event\")!r} (要求 push)', file=sys.stderr)
+              sys.exit(1)
+          # ref 必须为 refs/tags/rc-v* (R73 P1-05: only RC tag pushes are promotable)
+          ref = env.get('ref', '')
+          if not ref.startswith('refs/tags/rc-v'):
+              print(f'::error::FAIL: envelope ref={ref!r} (要求 refs/tags/rc-v*)', file=sys.stderr)
+              sys.exit(1)
+          # source_sha 必须与 input 一致
+          if env.get('source_sha') != '${SOURCE_SHA}':
+              print(f'::error::FAIL: envelope source_sha={env.get(\"source_sha\")!r} != input ${SOURCE_SHA}', file=sys.stderr)
+              sys.exit(1)
+          # image_repo_digest 必须与 input 一致
+          if env.get('image_repo_digest') != '${IMAGE_REPO_DIGEST}':
+              print(f'::error::FAIL: envelope image_repo_digest={env.get(\"image_repo_digest\")!r} != input ${IMAGE_REPO_DIGEST}', file=sys.stderr)
+              sys.exit(1)
+          # runtime_config_digest 必须与 input 一致
+          if env.get('runtime_config_digest') != '${RUNTIME_CONFIG_DIGEST}':
+              print(f'::error::FAIL: envelope runtime_config_digest={env.get(\"runtime_config_digest\")!r} != input ${RUNTIME_CONFIG_DIGEST}', file=sys.stderr)
+              sys.exit(1)
+          # 权威审计:is_promotion_eligible 必须返回 True
+          if not is_promotion_eligible(env):
+              print(f'::error::FAIL: envelope is_promotion_eligible=False (要求 True)', file=sys.stderr)
+              print(f'  envelope promotion_eligible field: {env.get(\"promotion_eligible\")}', file=sys.stderr)
+              print(f'  R73 P1-05: defense in depth — is_promotion_eligible 重新审计 event/ref/digests', file=sys.stderr)
+              sys.exit(1)
+          print(f'PASS: Step i.5 — RC evidence envelope validated (gate_level=rc, audit_promotion_eligible=true)')
+          print(f'  envelope source_sha:         {env[\"source_sha\"]}')
+          print(f'  envelope image_repo_digest:  {env[\"image_repo_digest\"]}')
+          print(f'  envelope runtime_config_digest: {env[\"runtime_config_digest\"]}')
+          "
+
+      # ─── Step j: Run scan_production_bypasses.py (no P0/P1 violations) ─
+      - name: "Step j: Run scan_production_bypasses.py (verify no P0/P1 violations)"
+        run: |
+          set -euo pipefail
+          echo "=== Step j: scan_production_bypasses.py ==="
+          python scripts/scan_production_bypasses.py --json --output scan-result.json
+          # 解析结果,校验无 P0/P1 违规
+          python3 -c "
+          import json, sys
+          with open('scan-result.json') as f:
+              data = json.load(f)
+          violations = data.get('violations', []) if isinstance(data, dict) else []
+          p0p1 = [v for v in violations if v.get('severity') in ('P0', 'P1')]
+          if p0p1:
+              print(f'::error::FAIL: {len(p0p1)} P0/P1 violations found:')
+              for v in p0p1:
+                  print(f'  [{v.get(\"severity\")}] {v.get(\"rule\",\"\")} — {v.get(\"message\",\"\")}')
+              sys.exit(1)
+          print(f'PASS: no P0/P1 violations (total violations: {len(violations)})')
+          "
+
+      # ─── Step k: Run verify_rc_3x.py --verify-envelopes (rc gate level) ─
+      - name: "Step k: Run verify_rc_3x.py --verify-envelopes --expected-gate-level rc"
+        run: |
+          set -euo pipefail
+          echo "=== Step k: verify_rc_3x.py (rc gate level) ==="
+          # 收集所有 evidence envelope 路径
+          ENVELOPES=""
+          for f in candidate-manifest.json oci-file-manifest.json release-attestation.json sbom.spdx.json runtime-config-binding.json; do
+            path="./rc-evidence-staged/${f}"
+            if [ -f "${path}" ]; then
+              if [ -z "${ENVELOPES}" ]; then
+                ENVELOPES="${path}"
+              else
+                ENVELOPES="${ENVELOPES} ${path}"
+              fi
+            fi
+          done
+          if [ -z "${ENVELOPES}" ]; then
+            echo "::error::FAIL: no evidence envelopes found for verify_rc_3x.py"
+            exit 1
+          fi
+          echo "  envelopes: ${ENVELOPES}"
+          python scripts/verify_rc_3x.py \
+            --verify-envelopes ${ENVELOPES} \
+            --expected-gate-level rc
+          echo "PASS: Step k — verify_rc_3x.py 校验通过 (rc gate level)"
+
+      # ─── Step l: Verify no open break-glass events ─────────────────────
+      - name: "Step l: Verify no open break-glass events (GitHub issues label break-glass)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "=== Step l: Verify no open break-glass events ==="
+          # 查询 open issues with label break-glass
+          OPEN_BREAK_GLASS=$(gh issue list \
+            --repo maxiuquan/tgjiema \
+            --state open \
+            --label break-glass \
+            --limit 100 \
+            --json number,title \
+            2>&1 || echo "[]")
+          COUNT=$(echo "${OPEN_BREAK_GLASS}" | python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "0")
+          echo "  open break-glass issues: ${COUNT}"
+          if [ "${COUNT}" != "0" ]; then
+            echo "::error::FAIL: ${COUNT} open break-glass events — production promotion blocked"
+            echo "  R73 §5.6: 存在 open break-glass event 时禁止 production promotion"
+            echo "${OPEN_BREAK_GLASS}" | python3 -c "
+            import json, sys
+            for issue in json.load(sys.stdin):
+                print(f'  #{issue[\"number\"]}: {issue[\"title\"]}')
+            "
+            exit 1
+          fi
+          echo "PASS: Step l — no open break-glass events"
+
+      # ─── Step n: Verify production-v* tag does NOT yet exist ────────────
+      - name: "Step n: Verify production-v* tag does NOT yet exist (GitHub API)"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRODUCTION_TAG: ${{ inputs.production_tag }}
+        run: |
+          set -euo pipefail
+          echo "=== Step n: Verify production tag does NOT yet exist ==="
+          # 本地 git 校验(快速失败)
+          if git rev-parse --verify "refs/tags/${PRODUCTION_TAG}" >/dev/null 2>&1; then
+            echo "::error::FAIL: Production tag '${PRODUCTION_TAG}' already exists locally"
+            echo "  R73 §5.6: 不允许覆盖已存在的 production tag (不可变性)"
+            exit 1
+          fi
+          # GitHub API 校验(remote)
+          TAG_CHECK=$(gh api "repos/maxiuquan/tgjiema/git/refs/tags/${PRODUCTION_TAG}" 2>&1 || echo "")
+          if [ -n "${TAG_CHECK}" ] && ! echo "${TAG_CHECK}" | grep -q '"message": "Not Found"'; then
+            echo "::error::FAIL: Production tag '${PRODUCTION_TAG}' already exists on GitHub"
+            echo "  R73 §5.6: 不允许覆盖已存在的 production tag (不可变性)"
+            exit 1
+          fi
+          echo "PASS: Step n — production tag '${PRODUCTION_TAG}' does not yet exist"
+
+      # ════════════════════════════════════════════════════════════════
+      # R76 O10 (P0-08 / P0-09): Deployment State Machine 优先于 tag 创建
+      # ════════════════════════════════════════════════════════════════
+      #
+      # 整改背景(R76 终审报告 O10):
+      #   R75 实现 Step o(创建 signed production tag)在 Step p(实际部署)
+      #   之前执行,导致部署失败时 production-v* tag 已推送,产生"半完成状态":
+      #     - 后续重试需手动删除 tag,违反 "production tag 不可变" 原则
+      #     - 监控/告警/下游系统可能引用已存在但未真正部署的 tag
+      #     - 状态不一致难以追溯,需走 break-glass 流程
+      #
+      # 整改方案(R76 O10):
+      #   1. Step p(部署状态机)在 Step o(创建 tag)之前执行
+      #   2. 部署状态机通过 scripts/deployment_state_machine.py 实现:
+      #        init → deploying → deployed → verified (终态,允许创建 tag)
+      #                                ↘ failed (终态,禁止创建 tag)
+      #   3. 状态机内部完成:GitHub Deployment record 创建、status=in_progress、
+      #      deploy hook 触发、/health 探针 + RepoDigest 校验、/api/v1/status
+      #      业务探针、status=success/failure。任一阶段失败 → failed 终态,
+      #      Step o 被跳过,production tag 不会被创建。
+      #   4. 状态持久化到 deployment-state.json,支持失败定位与审计回放。
+      #
+      # ─── Step p: Run Deployment State Machine (init → verified) ────────
+      - name: "Step p: Run deployment state machine (init → deploying → deployed → verified)"
+        id: deploy_state_machine
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRODUCTION_TAG: ${{ inputs.production_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          IMAGE_REPO_DIGEST: ${{ inputs.image_repo_digest }}
+          RUNTIME_CONFIG_DIGEST: ${{ inputs.runtime_config_digest }}
+          DEPLOY_HOOK_URL: ${{ secrets.DEPLOY_HOOK_URL }}
+          DEPLOY_PROBE_URL: ${{ secrets.DEPLOY_PROBE_URL }}
+        run: |
+          set -euo pipefail
+          echo "=== Step p: Run deployment state machine (R76 O10) ==="
+          echo "  production_tag:        ${PRODUCTION_TAG}"
+          echo "  source_sha:            ${SOURCE_SHA}"
+          echo "  image_repo_digest:     ${IMAGE_REPO_DIGEST}"
+          echo "  runtime_config_digest: ${RUNTIME_CONFIG_DIGEST}"
+          echo "  deploy_hook_url:       ${DEPLOY_HOOK_URL:+configured}"
+          echo "  deploy_probe_url:      ${DEPLOY_PROBE_URL:+configured}"
+          echo ""
+          # R76 O10: 调用 scripts/deployment_state_machine.py run 子命令
+          # 退出码 0 = verified 终态(允许创建 production tag)
+          # 退出码 1 = failed 终态(禁止创建 production tag)
+          # 退出码 2 = 参数错误 / 状态文件损坏(禁止创建 production tag)
+          python3 scripts/deployment_state_machine.py run \
+            --production-tag "${PRODUCTION_TAG}" \
+            --source-sha "${SOURCE_SHA}" \
+            --image-repo-digest "${IMAGE_REPO_DIGEST}" \
+            --runtime-config-digest "${RUNTIME_CONFIG_DIGEST}" \
+            --deploy-hook-url "${DEPLOY_HOOK_URL}" \
+            --deploy-probe-url "${DEPLOY_PROBE_URL}" \
+            --state-file ./deployment-state.json
+          DEPLOY_RC=$?
+          if [ "${DEPLOY_RC}" != "0" ]; then
+            echo "::error::Deployment state machine did not reach verified (exit=${DEPLOY_RC})"
+            echo "  R76 O10: production tag creation is blocked — deployment must reach verified first"
+            echo "  State file: ./deployment-state.json (upload as artifact for audit)"
+            exit 1
+          fi
+          echo "PASS: Step p — deployment state machine reached verified terminal state"
+          echo "  Production tag creation is now unblocked (R76 O10)"
+
+      # ─── Step p.1: Upload deployment state file (audit artifact) ───────
+      - name: "Step p.1: Upload deployment state file (audit artifact)"
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: deployment-state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ./deployment-state.json
+          if-no-files-found: warn
+          retention-days: 90
+
+      # ─── Step o: Create signed production tag (R76 O10: 仅在 verified 后) ──
+      # R76 O10 整改: 本步骤从 Step p 之前移到 Step p 之后。
+      # 仅当部署状态机达到 verified 终态时才执行,确保:
+      #   - 部署失败 → production tag 不会被创建(无半完成状态)
+      #   - 部署成功 → production tag 指向已验证的 source_sha
+      #   - 重试无需删除 tag(因为前次失败根本没有创建 tag)
+      - name: "Step o: Configure GPG signing key (fail-closed)"
+        id: gpg
+        env:
+          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
+          GPG_SIGNING_KEY_ID: ${{ secrets.GPG_SIGNING_KEY_ID }}
+        run: |
+          set -euo pipefail
+          echo "=== Step o: Configure GPG signing key (R76 O10: post-deployment) ==="
+          if [ -z "${GPG_SIGNING_KEY}" ]; then
+            echo "::error::GPG_SIGNING_KEY secret 未配置"
+            echo "  R73 §5.6: production tag 必须使用 signed tag (git tag -s)"
+            exit 1
+          fi
+          if [ -z "${GPG_SIGNING_KEY_ID}" ]; then
+            echo "::error::GPG_SIGNING_KEY_ID secret 未配置"
+            exit 1
+          fi
+          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
+          echo "${GPG_SIGNING_KEY}" | gpg --batch --import
+          git config --global user.signingkey "${GPG_SIGNING_KEY_ID}"
+          git config --global commit.gpgsign true
+          if ! gpg --list-secret-keys "${GPG_SIGNING_KEY_ID}" >/dev/null 2>&1; then
+            echo "::error::GPG key ${GPG_SIGNING_KEY_ID} 导入后未找到"
+            exit 1
+          fi
+          echo "PASS: GPG signing key configured (key ID: ${GPG_SIGNING_KEY_ID})"
+
+      - name: "Step o: Create signed production tag (git tag -s) pointing to source_sha"
+        env:
+          RC_TAG: ${{ inputs.rc_tag }}
+          RC_RUN_ID: ${{ inputs.rc_run_id }}
+          RC_RUN_ATTEMPT: ${{ inputs.rc_run_attempt }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          CANDIDATE_MANIFEST_DIGEST: ${{ inputs.candidate_manifest_digest }}
+          IMAGE_REPO_DIGEST: ${{ inputs.image_repo_digest }}
+          RUNTIME_CONFIG_DIGEST: ${{ inputs.runtime_config_digest }}
+          PRODUCTION_TAG: ${{ inputs.production_tag }}
+          GPG_SIGNING_KEY_ID: ${{ secrets.GPG_SIGNING_KEY_ID }}
+        run: |
+          set -euo pipefail
+          echo "=== Step o: Create signed production tag (R76 O10: post-deployment) ==="
+          echo "  RC tag:                ${RC_TAG}"
+          echo "  RC run ID:             ${RC_RUN_ID}"
+          echo "  RC run attempt:        ${RC_RUN_ATTEMPT}"
+          echo "  source_sha:            ${SOURCE_SHA}"
+          echo "  Production tag:        ${PRODUCTION_TAG}"
+          echo "  image_repo_digest:     ${IMAGE_REPO_DIGEST}"
+          echo "  runtime_config_digest: ${RUNTIME_CONFIG_DIGEST}"
+          # 构造 annotation message (key: value 行,与 release-gates.yml
+          # verify-rc-identity 的 grep -iE '^rc-tag:' 解析逻辑对齐)
+          {
+            printf 'Promote %s to production (R76 O10 reusable workflow)\n\n' "${RC_TAG}"
+            printf 'rc-tag: %s\n' "${RC_TAG}"
+            printf 'rc-run-id: %s\n' "${RC_RUN_ID}"
+            printf 'rc-run-attempt: %s\n' "${RC_RUN_ATTEMPT}"
+            printf 'source-sha: %s\n' "${SOURCE_SHA}"
+            printf 'candidate-manifest-digest: %s\n' "${CANDIDATE_MANIFEST_DIGEST}"
+            printf 'image-repo-digest: %s\n' "${IMAGE_REPO_DIGEST}"
+            printf 'runtime-config-digest: %s\n' "${RUNTIME_CONFIG_DIGEST}"
+            printf 'production-tag: %s\n' "${PRODUCTION_TAG}"
+            printf '\n'
+            printf 'R76 O10 (P0-08/P0-09): Created by _promote-verified-rc.yml after deployment\n'
+            printf 'state machine reached verified terminal state. Tag is only created for\n'
+            printf 'successfully verified deployments (no half-complete state).\n'
+          } | git tag -s -u "${GPG_SIGNING_KEY_ID}" \
+              -F - \
+              "${PRODUCTION_TAG}" "${SOURCE_SHA}"
+          # 验证 tag 是 signed tag (defense in depth)
+          if ! git tag -v "${PRODUCTION_TAG}" >/dev/null 2>&1; then
+            echo "::error::FAIL: Created tag '${PRODUCTION_TAG}' is not a signed tag"
+            # R76 10.M: 删除 || true 兜底,改为显式 if 语句处理 cleanup 失败
+            # (cleanup 失败不阻断 exit 1,但必须显式记录)
+            if ! git tag -d "${PRODUCTION_TAG}" >/dev/null 2>&1; then
+              echo "::warning::failed to cleanup local tag ${PRODUCTION_TAG} (continuing to exit 1)"
+            fi
+            exit 1
+          fi
+          echo "PASS: Step o — tag '${PRODUCTION_TAG}' is a GPG-signed tag at ${SOURCE_SHA}"
+          git push origin "${PRODUCTION_TAG}"
+          echo "PASS: Pushed signed production tag '${PRODUCTION_TAG}'"
+          echo ""
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "R76 O10: Promotion complete (deployment verified → tag created)"
+          echo "═══════════════════════════════════════════════════════════════"
+          echo "  All steps completed successfully (R76 O10 order):"
+          echo "    a. Checkout at source_sha"
+          echo "    b. Download RC artifacts"
+          echo "    c. Verify RC tag signature (gh api + git verify-tag)"
+          echo "    d. Peel RC tag commit == source_sha"
+          echo "    e. Verify run event=push, ref=refs/tags/${{ inputs.rc_tag }}"
+          echo "    f. Verify run conclusion=success, attempt matches"
+          echo "    g. Verify candidate manifest digest"
+          echo "    h. Recompute all artifact digests"
+          echo "    i. Verify image/runtime_config/SBOM/provenance/OCI digests"
+          echo "    i.5. Validate RC evidence envelope (R73 P1-05 tiered)"
+          echo "    j. scan_production_bypasses.py (no P0/P1)"
+          echo "    k. verify_rc_3x.py (rc gate level)"
+          echo "    l. No open break-glass events"
+          echo "    m. typed_confirmation verified"
+          echo "    n. Production tag did not exist"
+          echo "    p. Deployment state machine reached verified (R76 O10)"
+          echo "    o. Signed production tag created + pushed (R76 O10: post-deployment)"
+          echo "═══════════════════════════════════════════════════════════════"

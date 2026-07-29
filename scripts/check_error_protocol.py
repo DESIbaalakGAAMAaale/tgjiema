@@ -285,8 +285,8 @@ def _has_str_return_annotation(
         dump = ast.dump(ret)
         if "id='str'" in dump:
             return True
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _has_str_return_annotation: ast.dump failed: {_e}", file=sys.stderr)
     return False
 
 

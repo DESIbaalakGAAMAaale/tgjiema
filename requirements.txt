@@ -24,3 +24,5 @@ tzdata>=2024.1
 # R61 P1-06: Babel/ICU 标准库 — 提供 CLDR plural/ordinal 规则(不再自维护 CLDR 数据)
 # services/i18n.py 惰性导入,Babel 缺失时回退到自维护的 en/ru/zh 规则
 Babel>=2.12,<3
+# R83 Step 14: candidate manifest JSON Schema validation is a required gate.
+jsonschema>=4.23,<5

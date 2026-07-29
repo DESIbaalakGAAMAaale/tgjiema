@@ -22,36 +22,33 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
-import os
 import sys
-import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-import pytest_asyncio
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from services.backup_dr_validate import (  # type: ignore  # noqa: E402
+from services.backup_dr_validate import (  # type: ignore
     COMPLETE_SUFFIX,
     MANIFEST_SUFFIX,
     PAYLOAD_SUFFIX,
     REQUIRED_MANIFEST_FIELDS,
-    BackupValidationResult,
+    ExactBackupContract,
     atomic_restore_to_staging,
     build_complete_marker,
     get_complete_key,
     get_manifest_key,
     get_payload_key,
     validate_backup_completeness,
+    validate_backup_for_restore,
     validate_backup_manifest,
     validate_backup_payload,
-    validate_backup_for_restore,
+    validate_exact_backup_contract,
     validate_schema_compatibility,
 )
-
 
 # ── R59 P0-04 / R60 P0-04 测试辅助函数 ──────────────────────────
 # R59 P0-04: 强制参数,不再允许 fail-open — 测试需提供真实签名与解密器
@@ -320,6 +317,24 @@ class TestValidateManifest:
         assert result.error_code == "BACKUP.RESTORE.MANIFEST_INVALID"
         assert "encryption.key_id" in result.error_message
 
+    @pytest.mark.asyncio
+    async def test_explicit_manifest_key_is_used_without_derivation(self):
+        """显式 manifest key 必须原样用于下载。"""
+        manifest = self._build_valid_manifest()
+        exact_key = "contracts/run-1/manifest.json"
+        mock_r2 = AsyncMock()
+        mock_r2.download = AsyncMock(return_value=json.dumps(manifest).encode())
+
+        result = await validate_backup_manifest(
+            "20260716",
+            "full",
+            mock_r2,
+            expected_manifest_key=exact_key,
+        )
+
+        assert result.valid is True
+        mock_r2.download.assert_awaited_once_with(exact_key)
+
     def test_required_manifest_fields_complete(self):
         """REQUIRED_MANIFEST_FIELDS 应包含所有 §8 要求的字段。"""
         # 报告 §8: "manifest 绑定 ciphertext hash、schema version、KEK key id、覆盖范围、创建版本"
@@ -436,6 +451,34 @@ class TestValidatePayload:
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.PAYLOAD_INVALID"
 
+    @pytest.mark.asyncio
+    async def test_payload_uses_authoritative_three_field_aad_and_exact_key(self):
+        """payload validator 必须使用 backup_once 的三字段 AAD 和显式 key。"""
+        ciphertext = b"encrypted_payload_content"
+        plaintext = b"decrypted_plaintext_content"
+        expected_sha = hashlib.sha256(ciphertext).hexdigest()
+        pt_sha = hashlib.sha256(plaintext).hexdigest()
+        exact_key = "contracts/run-1/payload-copy.enc"
+        decryptor = _make_decryptor(plaintext)
+        mock_r2 = AsyncMock()
+        mock_r2.download = AsyncMock(return_value=ciphertext)
+
+        result = await validate_backup_payload(
+            "20260716",
+            "full",
+            expected_sha,
+            pt_sha,
+            mock_r2,
+            schema_version="3.0",
+            decryptor=decryptor,
+            key_id="kek_v1",
+            expected_payload_key=exact_key,
+        )
+
+        assert result.valid is True
+        mock_r2.download.assert_awaited_once_with(exact_key)
+        assert decryptor.decrypt.call_args.kwargs["aad"] == b"20260716|3.0|kek_v1"
+
 
 # ════════════════════════════════════════════════════════════════
 # 6. staging 原子切换
@@ -450,7 +493,7 @@ class TestAtomicRestoreToStaging:
         staging = tmp_path / "staging.json"
         final = tmp_path / "final.json"
         data = {"users": [{"id": 1}], "files": []}
-        ok, msg = atomic_restore_to_staging(staging, final, data)
+        ok, _msg = atomic_restore_to_staging(staging, final, data)
         assert ok is True
         assert final.exists()
         assert not staging.exists()  # staging 应被 rename 掉
@@ -734,30 +777,7 @@ class TestFaultMatrix:
     @pytest.mark.asyncio
     async def test_no_silent_recovery_on_partial_backup(self):
         """部分备份(无 COMPLETE)不应被静默恢复。"""
-        # 场景:备份写到一半中断(有 payload + manifest,但无 COMPLETE)
-        # R60 P0-04: build_complete_marker 改为 signing_key(内部计算签名),不再接受 signature 参数
-        marker = build_complete_marker(
-            "20260716", "manifest_key",
-            manifest_sha256="a" * 64,
-            payload_key="payload_key",
-            payload_sha256="b" * 64,
-            signing_key=b"signing_key",
-        )
-        manifest = {
-            "version": "3.0",
-            "schema_version": "3.0",
-            "plaintext_sha256": "a" * 64,
-            "ciphertext_sha256": "b" * 64,
-            "backup_id": "20260716",
-            "encryption": {"encrypted": True, "key_id": "kek_v1"},
-            "commit_sha": "abc",
-            "content_size_bytes": 100,
-            "backup_started_at": "2026-07-16T12:00:00Z",
-            "backup_finished_at": "2026-07-16T12:01:00Z",
-            "table_stats": {},
-            "backup_type": "full",
-        }
-        # 第一次下载返回 None(COMPLETE 缺失)
+        # 场景:备份写到一半中断，第一条读取即返回 None(COMPLETE 缺失)。
         mock_r2 = AsyncMock()
         mock_r2.download = AsyncMock(return_value=None)
         # R59 P0-04: 强制参数必填(原为可选,现 fail-closed)
@@ -771,6 +791,166 @@ class TestFaultMatrix:
         # 应在 COMPLETE 检查阶段就拒绝,不读取 manifest/payload
         assert result.valid is False
         assert result.error_code == "BACKUP.RESTORE.COMPLETE_MARKER_MISSING"
+
+
+class TestExactBackupContract:
+    """R83: exact object keys + 真实 backup_crypto AAD 信任链。"""
+
+    @staticmethod
+    def _build_bundle(*, corrupt_payload: bool = False):
+        from services.backup_crypto import encrypt_payload
+
+        backup_id = "20260716_120000_deadbeef_00112233"
+        backup_type = "full"
+        payload_key = f"contract/payload-{backup_id}.enc"
+        manifest_key = f"contract/manifest-{backup_id}.json"
+        complete_key = f"contract/complete-{backup_id}.COMPLETE"
+        signing_key = b"r83-test-signing-key"
+        kek = bytes(range(32))
+        plaintext = json.dumps(
+            {
+                "backup_time": "2026-07-16T12:00:00+00:00",
+                "tables": {"users": [{"id": 1}]},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        enc = encrypt_payload(
+            plaintext,
+            kek=kek,
+            backup_id=backup_id,
+            schema_version="3.0",
+        )
+        ciphertext = enc["ciphertext"]
+        manifest = {
+            "version": "3.0",
+            "commit_sha": "a" * 40,
+            "schema_version": "3.0",
+            "plaintext_sha256": hashlib.sha256(plaintext).hexdigest(),
+            "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+            "backup_id": backup_id,
+            "content_size_bytes": len(plaintext),
+            "backup_started_at": "2026-07-16T12:00:00+00:00",
+            "backup_finished_at": "2026-07-16T12:01:00+00:00",
+            "table_stats": {"users": {"row_count": 1, "source": "crdb"}},
+            "backup_type": backup_type,
+            "encryption": {
+                "encrypted": True,
+                "algorithm": enc["algorithm"],
+                "wrapped_dek": enc["wrapped_dek"],
+                "nonce": enc["nonce"],
+                "key_id": enc["key_id"],
+            },
+            "source_sha": "b" * 40,
+            "source_database_identity": "source-db-identity",
+            "schema_fingerprint": "schema-fingerprint",
+            "payload_key": payload_key,
+            "manifest_key": manifest_key,
+        }
+        manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode()
+        marker = build_complete_marker(
+            backup_id,
+            manifest_key,
+            manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+            payload_key=payload_key,
+            payload_sha256=manifest["ciphertext_sha256"],
+            signing_key=signing_key,
+        )
+        objects = {
+            complete_key: marker,
+            manifest_key: manifest_bytes,
+            payload_key: ciphertext + (b"corrupt" if corrupt_payload else b""),
+        }
+        storage = AsyncMock()
+        storage.download = AsyncMock(side_effect=lambda key: objects.get(key))
+        return {
+            "backup_id": backup_id,
+            "backup_type": backup_type,
+            "payload_key": payload_key,
+            "manifest_key": manifest_key,
+            "complete_key": complete_key,
+            "signing_key": signing_key,
+            "kek": kek,
+            "plaintext": plaintext,
+            "storage": storage,
+        }
+
+    @pytest.mark.asyncio
+    async def test_exact_contract_validates_real_backup_crypto_payload(self):
+        bundle = self._build_bundle()
+
+        result = await validate_exact_backup_contract(
+            backup_id=bundle["backup_id"],
+            payload_key=bundle["payload_key"],
+            manifest_key=bundle["manifest_key"],
+            complete_key=bundle["complete_key"],
+            backup_type=bundle["backup_type"],
+            r2_storage=bundle["storage"],
+            signing_key=bundle["signing_key"],
+            current_schema_version="3.0",
+            kek=bundle["kek"],
+        )
+
+        assert isinstance(result, ExactBackupContract)
+        assert result.valid is True
+        assert result.plaintext_bytes == bundle["plaintext"]
+        assert result.source_database_identity == "source-db-identity"
+        assert list(result.manifest.keys())
+        assert [call.args[0] for call in bundle["storage"].download.await_args_list] == [
+            bundle["complete_key"],
+            bundle["manifest_key"],
+            bundle["payload_key"],
+        ]
+
+    @pytest.mark.asyncio
+    async def test_corruption_copy_fails_with_integrity_error(self):
+        bundle = self._build_bundle()
+        corruption_key = f"corruption/{bundle['backup_id']}.enc"
+        original_download = bundle["storage"].download.side_effect
+
+        def download_with_corruption_copy(key):
+            if key == corruption_key:
+                return b"CORRUPTED_COPY_ONLY"
+            return original_download(key)
+
+        bundle["storage"].download.side_effect = download_with_corruption_copy
+
+        result = await validate_exact_backup_contract(
+            backup_id=bundle["backup_id"],
+            payload_key=bundle["payload_key"],
+            manifest_key=bundle["manifest_key"],
+            complete_key=bundle["complete_key"],
+            backup_type=bundle["backup_type"],
+            r2_storage=bundle["storage"],
+            signing_key=bundle["signing_key"],
+            current_schema_version="3.0",
+            kek=bundle["kek"],
+            payload_read_key=corruption_key,
+        )
+
+        assert result.valid is False
+        assert result.payload_key == bundle["payload_key"]
+        assert result.error_code == "BACKUP.RESTORE.CIPHERTEXT_HASH_MISMATCH"
+        assert bundle["storage"].download.await_args_list[-1].args[0] == corruption_key
+
+    @pytest.mark.asyncio
+    async def test_complete_marker_rejects_wrong_explicit_payload_key(self):
+        bundle = self._build_bundle()
+
+        result = await validate_backup_completeness(
+            bundle["backup_id"],
+            bundle["backup_type"],
+            bundle["storage"],
+            expected_manifest_key=bundle["manifest_key"],
+            signing_key=bundle["signing_key"],
+            expected_backup_id=bundle["backup_id"],
+            expected_complete_key=bundle["complete_key"],
+            expected_payload_key="contract/wrong-payload.enc",
+        )
+
+        assert result.valid is False
+        assert result.error_code == "BACKUP.RESTORE.COMPLETE_MARKER_INVALID"
+        assert "payload_key mismatch" in result.error_message
 
 
 if __name__ == "__main__":

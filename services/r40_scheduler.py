@@ -346,8 +346,13 @@ async def run_scheduler() -> None:
                 continue
             try:
                 await _task
-            except (asyncio.CancelledError, Exception):
-                pass
+            except (asyncio.CancelledError, Exception) as e:
+                # R73 §5.24: 记录日志而非静默 pass(cleanup 阶段取消子协程的预期异常)
+                logger.bind(
+                    component="r40_scheduler",
+                    event="subtask_cleanup_exception_expected",
+                    error=str(e),
+                ).debug("")
 
 
 if __name__ == "__main__":

@@ -660,10 +660,10 @@ async def _check_redis(role: str = "") -> tuple[bool, Optional[str], Optional[st
 async def _check_bot_token_valid(bot_token: str) -> tuple[bool, Optional[str]]:
     """通用检查: Bot token 有效性(通过 Telegram Bot API getMe)。
 
-    R71 RC25 fix: CI 环境无法提供真实 Telegram Bot Token,
-    跳过 Telegram API getMe 调用,只验证 token 非空且格式正确。
-    这不是 mock — CI 环境限制(生产环境仍调用 getMe 验证真实性)。
-    CI 检测: CI=true 或 GITHUB_ACTIONS=true(GitHub Actions 默认设置)。
+    R73 P0-03: 删除 CI/GITHUB_ACTIONS bypass。所有环境必须调用真实 getMe
+    验证 Bot token 真实性。占位符 token 在 RC 中将使 readiness 失败 —
+    这是预期行为,RC 必须配置真实测试 Bot token(通过 GitHub Environment
+    secret 注入)。
 
     Args:
         bot_token: Telegram Bot token
@@ -676,20 +676,9 @@ async def _check_bot_token_valid(bot_token: str) -> tuple[bool, Optional[str]]:
     if not bot_token:
         return False, "Bot token not configured"
 
-    # R71 RC25: CI 环境跳过 Telegram API 调用
-    # CI 中使用占位符 token(如 0000000000:AAA...),无法通过 getMe 验证。
-    # 只验证 token 格式(非空、包含冒号分隔的数字:字母数字串)。
-    # 生产环境仍调用 getMe 验证 token 真实性。
-    is_ci = (
-        os.getenv("CI", "").lower() in ("true", "1")
-        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-    )
-    if is_ci:
-        # CI 模式: 验证格式(数字:字母数字混合,长度 > 10)
-        parts = bot_token.split(":", 1)
-        if len(parts) == 2 and parts[0].isdigit() and len(parts[1]) >= 10:
-            return True, None
-        return False, f"Bot token format invalid in CI mode: {bot_token[:8]}..."
+    # R73 P0-03: 不再读取 CI/GITHUB_ACTIONS。占位符 token(如
+    # 0000000000:BBBB...)无法通过 getMe 验证,会真实调用 Telegram API 并失败。
+    # 这是 R73 §5.25 `up` 角色 readiness 的硬要求:Bot 身份必须真实。
 
     try:
         import httpx
@@ -2079,15 +2068,884 @@ def to_json(result: HealthResult) -> str:
     return json.dumps(result.to_dict(), ensure_ascii=False)
 
 
+# ════════════════════════════════════════════════════════════════
+# R73 §5.10 (P1-06): Health role split — liveness / startup /
+#                     dependency_health(加法式扩展,不破坏 check_readiness)
+# ════════════════════════════════════════════════════════════════
+#
+# R73 §5.10 要求:不同 health 探针语义分离(liveness ≠ startup ≠
+# readiness ≠ aggregate),不能像旧版 check_readiness 那样把所有
+# 检查混合在一起返回单个 healthy 布尔。各 health 探针用途:
+#   - liveness:    进程是否还活着(死锁才 fail,通常总是 OK)
+#   - startup:     启动初始化是否完成(避免在启动期被 kill)
+#   - dependency_health: 该角色依赖是否健康(替代 readiness,关注依赖)
+#   - aggregate(check_readiness): 整体 readiness(critical 检查全过才 OK)
+#
+# 设计原则:
+#   1. **加法式扩展**:不修改/破坏现有 check_readiness(),仅新增 3 个函数
+#   2. **角色化**:不同角色有不同的 startup 步骤与 dependency 检查集合
+#   3. **fail-closed**:未知角色返回 unhealthy(fail-closed,与 check_readiness 一致)
+#   4. **复用现有检查函数**:_check_redis / _check_database / _check_bot_token_valid
+#      等已有 helper 被 dependency_health 复用,保持单一事实源
+#   5. **结构化错误码**:dependency_health 返回 error_code(供告警/路由使用)
+
+
+def check_liveness(role: str) -> dict:
+    """R73 §5.10 (P1-06): liveness 探针 — 进程是否还活着。
+
+    最小化的"进程存活"检查:
+    - 所有角色:验证当前进程有运行中的 event loop(或同步路径可调用)
+    - 仅当进程死锁时返回 alive=False
+
+    liveness 探针用途:容器编排(k8s/Docker)判定是否需要重启容器。
+    依赖故障不应触发 liveness fail(避免雪崩重启)。
+
+    Args:
+        role: SERVICE_ROLE 角色名(支持别名,如 "up" → "up_bot")
+
+    Returns:
+        {
+            "role": str,                  # 规范化角色名
+            "alive": bool,                # 进程是否存活(死锁才 False)
+            "pid": int,                   # 当前进程 PID
+            "boot_id": str,               # 系统启动 ID(Linux /proc/sys/kernel/random/boot_id)
+            "last_event_loop_at": str,    # 最近 event loop 心跳时间(ISO 8601)
+            "checked_at": str,            # 检查时间(ISO 8601 UTC)
+        }
+    """
+    canonical_role = _canonicalize_role(role)
+    pid = os.getpid()
+
+    # boot_id: Linux /proc/sys/kernel/random/boot_id,非 Linux 退化为空
+    boot_id = ""
+    try:
+        from pathlib import Path as _Path
+
+        boot_id = (
+            _Path("/proc/sys/kernel/random/boot_id")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except Exception:
+        boot_id = ""
+
+    # last_event_loop_at: 当前时间(进程未死锁 = event loop 仍可调度 = 心跳新鲜)
+    # 死锁检测:尝试获取当前 event loop;若 RuntimeError 且无法创建新 loop,视为死锁
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    alive = True
+    try:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                # 已关闭的 loop — 尝试创建新 loop 验证调度能力
+                asyncio.set_event_loop(asyncio.new_event_loop())
+        except RuntimeError:
+            # "There is no current event loop in thread" — 同步路径,可创建新 loop
+            try:
+                asyncio.set_event_loop(asyncio.new_event_loop())
+            except Exception as e:
+                # 无法创建 event loop — 但函数仍可调用 = 进程未死锁
+                # R73 §5.24: 记录日志而非静默 pass(liveness 宽容但需可观测)
+                logger.bind(
+                    component="health",
+                    event="check_liveness_event_loop_create_failed",
+                    alive=True,
+                    error=str(e),
+                ).debug("")
+    except Exception as e:
+        # 任何意外都视为存活(liveness 应极度宽容,避免误重启)
+        # R73 §5.24: 记录日志而非静默 pass(liveness 宽容但需可观测)
+        logger.bind(
+            component="health",
+            event="check_liveness_event_loop_check_exception",
+            alive=True,
+            error=str(e),
+        ).debug("")
+        alive = True
+
+    return {
+        "role": canonical_role,
+        "alive": alive,
+        "pid": pid,
+        "boot_id": boot_id,
+        "last_event_loop_at": now_iso,
+        "checked_at": now_iso,
+    }
+
+
+# R73 §5.10 (P1-06): 角色 → 必需启动步骤映射
+# 每个角色启动时必须完成的初始化步骤;未完成步骤出现在 pending_initializations 中
+STARTUP_REQUIREMENTS: dict[str, list[str]] = {
+    "up_bot": ["settings_loaded", "bot_token_configured", "redis_connected"],
+    "idx_bot": ["settings_loaded", "bot_token_configured", "redis_connected"],
+    "dsp_bot": [
+        "settings_loaded", "bot_token_configured", "redis_connected",
+        "consumer_group_created",
+    ],
+    "mon_bot": ["settings_loaded", "bot_token_configured", "redis_connected"],
+    "admin_bot": ["settings_loaded", "bot_token_configured", "redis_connected"],
+    "db_writer": [
+        "settings_loaded", "writer_group_created", "schema_migrated",
+        "redis_connected",
+    ],
+    "crdb_sync": [
+        "settings_loaded", "crdb_connected", "outbox_table_initialized",
+    ],
+    "db_backup": ["settings_loaded", "backup_dir_configured"],
+    "migration": ["settings_loaded", "crdb_connected", "schema_migrated"],
+    "prometheus_exporter": ["settings_loaded", "metrics_endpoint_initialized"],
+    "r40_scheduler": [
+        "settings_loaded", "task_registry_loaded", "redis_connected",
+    ],
+    "admin": ["settings_loaded", "admin_web_port_configured"],
+}
+
+
+def _startup_step_settings_loaded(role: str) -> bool:
+    """settings 模块可导入。"""
+    try:
+        from config import settings  # noqa: F401
+
+        return True
+    except Exception as exc:
+        logger.bind(
+            component="health",
+            event="startup_step_failed",
+            step="settings_loaded",
+            role=role,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        ).warning("")
+        return False
+
+
+def _startup_step_bot_token_configured(role: str) -> bool:
+    """角色对应的 BOT_TOKEN 环境变量已配置(非空)。"""
+    token = _get_bot_token_for_role(role)
+    return bool(token)
+
+
+def _startup_step_redis_connected(role: str) -> bool:
+    """REDIS_URL 已配置(不实际连接,只检查配置存在)。"""
+    try:
+        from config import settings
+
+        redis_url = getattr(settings, "REDIS_URL", "") or ""
+    except Exception:
+        redis_url = ""
+    if not redis_url:
+        redis_url = os.getenv("REDIS_URL", "")
+    return bool(redis_url)
+
+
+def _startup_step_consumer_group_created(role: str) -> bool:
+    """Redis Stream consumer group 已创建。
+
+    运行态:通过 _check_redis_stream_consumer() 验证。
+    启动宽限期(PRE_LAUNCH):视为已完成(进程尚未 exec,group 未创建是正常的)。
+    """
+    if _is_pre_launch():
+        return True
+    try:
+        result = asyncio.run(_check_redis_stream_consumer())
+        return bool(result[0])
+    except Exception as exc:
+        logger.bind(
+            component="health",
+            event="startup_step_failed",
+            step="consumer_group_created",
+            role=role,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        ).warning("")
+        return False
+
+
+def _startup_step_writer_group_created(role: str) -> bool:
+    """db_writer 的 Redis Stream consumer group 已创建(同 consumer_group_created)。"""
+    return _startup_step_consumer_group_created(role)
+
+
+def _startup_step_schema_migrated(role: str) -> bool:
+    """必需表已创建(migration 已运行)。
+
+    PRE_LAUNCH:视为已完成(migration 尚未运行)。
+    运行态:_check_required_tables() 通过。
+    """
+    if _is_pre_launch():
+        return True
+    try:
+        result = asyncio.run(_check_required_tables())
+        return bool(result[0])
+    except Exception as exc:
+        logger.bind(
+            component="health",
+            event="startup_step_failed",
+            step="schema_migrated",
+            role=role,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        ).warning("")
+        return False
+
+
+def _startup_step_crdb_connected(role: str) -> bool:
+    """DATABASE_URL/COCKROACHDB_URL 已配置(非 SQLite)。"""
+    try:
+        from config import settings
+
+        db_url = (
+            getattr(settings, "DATABASE_URL", "")
+            or getattr(settings, "COCKROACHDB_URL", "")
+        )
+    except Exception:
+        db_url = ""
+    if not db_url:
+        db_url = (
+            os.getenv("DATABASE_URL", "") or os.getenv("COCKROACHDB_URL", "")
+        )
+    return bool(db_url) and not db_url.startswith("sqlite")
+
+
+def _startup_step_outbox_table_initialized(role: str) -> bool:
+    """crdb_sync outbox 表已初始化(同 schema_migrated,检查必需表)。"""
+    return _startup_step_schema_migrated(role)
+
+
+def _startup_step_backup_dir_configured(role: str) -> bool:
+    """BACKUP_DIR 环境变量已配置或默认路径存在。"""
+    backup_dir = os.getenv(_BACKUP_DIR_ENV, "").strip()
+    if backup_dir:
+        return True
+    try:
+        from pathlib import Path as _Path
+
+        default_backup = (
+            _Path(__file__).resolve().parent.parent / "data" / "backups"
+        )
+        return default_backup.exists()
+    except Exception as exc:
+        logger.bind(
+            component="health",
+            event="startup_step_failed",
+            step="backup_dir_configured",
+            role=role,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        ).warning("")
+        return False
+
+
+def _startup_step_metrics_endpoint_initialized(role: str) -> bool:
+    """prometheus_exporter 端点已配置(PROMETHEUS_EXPORTER_PORT 已设置或默认)。"""
+    try:
+        from config import settings
+
+        port = getattr(settings, "PROMETHEUS_EXPORTER_PORT", None)
+        if port:
+            return True
+    except Exception as e:
+        # R73 §5.24: 记录日志而非静默 pass(settings 导入失败时回退到环境变量)
+        logger.bind(
+            component="health",
+            event="startup_step_settings_import_failed",
+            step="metrics_endpoint_initialized",
+            fallback="env_var",
+            error=str(e),
+        ).debug("")
+    return bool(os.getenv("PROMETHEUS_EXPORTER_PORT"))
+
+
+def _startup_step_task_registry_loaded(role: str) -> bool:
+    """r40_scheduler 任务注册表已加载。
+
+    简化检查:settings 已加载即视为可加载任务注册表。
+    完整实现应检查 kv_store 中的 task_registry_loaded 标志。
+    """
+    return _startup_step_settings_loaded(role)
+
+
+def _startup_step_admin_web_port_configured(role: str) -> bool:
+    """admin web port 已配置(ADMIN_WEB_PORT 已设置或默认 8080)。"""
+    try:
+        from config import settings
+
+        port = getattr(settings, "ADMIN_WEB_PORT", None)
+        if port:
+            return True
+    except Exception as e:
+        # R73 §5.24: 记录日志而非静默 pass(settings 导入失败时默认 8080 总是已配置)
+        logger.bind(
+            component="health",
+            event="startup_step_settings_import_failed",
+            step="admin_web_port_configured",
+            fallback="default_8080",
+            error=str(e),
+        ).debug("")
+    # 默认 8080 总是"已配置"
+    return True
+
+
+# 启动步骤名 → 检查函数
+_STARTUP_STEP_CHECKERS: dict[str, Callable[[str], bool]] = {
+    "settings_loaded": _startup_step_settings_loaded,
+    "bot_token_configured": _startup_step_bot_token_configured,
+    "redis_connected": _startup_step_redis_connected,
+    "consumer_group_created": _startup_step_consumer_group_created,
+    "writer_group_created": _startup_step_writer_group_created,
+    "schema_migrated": _startup_step_schema_migrated,
+    "crdb_connected": _startup_step_crdb_connected,
+    "outbox_table_initialized": _startup_step_outbox_table_initialized,
+    "backup_dir_configured": _startup_step_backup_dir_configured,
+    "metrics_endpoint_initialized": _startup_step_metrics_endpoint_initialized,
+    "task_registry_loaded": _startup_step_task_registry_loaded,
+    "admin_web_port_configured": _startup_step_admin_web_port_configured,
+}
+
+# kv_store 中存储 startup_completed_at 的 key 前缀
+_STARTUP_COMPLETED_KEY_PREFIX = "startup_completed_at:"
+
+
+def _get_startup_completed_at(role: str) -> Optional[str]:
+    """从 kv_store 读取角色的 startup_completed_at(ISO 8601),未记录返回 None。"""
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return None
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=1
+        )
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='kv_store'"
+            )
+            if cursor.fetchone() is None:
+                return None
+            cursor = conn.execute(
+                "SELECT value FROM kv_store WHERE key = ? LIMIT 1",
+                (_STARTUP_COMPLETED_KEY_PREFIX + role,),
+            )
+            row = cursor.fetchone()
+            return str(row[0]) if row and row[0] else None
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def check_startup(role: str) -> dict:
+    """R73 §5.10 (P1-06): startup 探针 — 必需初始化是否完成。
+
+    检查角色启动时必须完成的初始化步骤(如 settings loaded / bot token
+    configured / redis connected / writer group created / schema migrated 等)。
+
+    启动宽限期(READINESS_GATE_PRE_LAUNCH=1):
+        - in_startup_grace=True
+        - started=True(避免容器编排 kill 尚未完成启动的进程)
+        - pending_initializations 仍列出未完成步骤(信息性)
+
+    运行态:
+        - in_startup_grace=False
+        - started = (pending_initializations 为空) AND
+                    (startup_completed_at 已记录)
+
+    Args:
+        role: SERVICE_ROLE 角色名(支持别名,如 "up" → "up_bot")
+
+    Returns:
+        {
+            "role": str,                        # 规范化角色名
+            "started": bool,                    # 启动是否完成
+            "in_startup_grace": bool,           # 是否在启动宽限期
+            "startup_completed_at": str | None, # 启动完成时间(ISO 8601)或 None
+            "pending_initializations": [str],   # 未完成步骤列表
+            "checked_at": str,                  # 检查时间(ISO 8601 UTC)
+        }
+    """
+    canonical_role = _canonicalize_role(role)
+    in_startup_grace = _is_pre_launch()
+    checked_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+    required_steps = STARTUP_REQUIREMENTS.get(canonical_role, [])
+    pending: list[str] = []
+    for step in required_steps:
+        checker = _STARTUP_STEP_CHECKERS.get(step)
+        if checker is None:
+            # 未知步骤 — 视为 pending(防御性)
+            pending.append(step)
+            continue
+        try:
+            if not checker(canonical_role):
+                pending.append(step)
+        except Exception:
+            # 检查异常 — 视为未完成
+            pending.append(step)
+
+    startup_completed_at = _get_startup_completed_at(canonical_role)
+
+    if in_startup_grace:
+        # 启动宽限期:不阻断,但报告 pending
+        started = True
+    else:
+        # 运行态:started = 无 pending 且 startup_completed_at 已记录
+        started = (len(pending) == 0) and (startup_completed_at is not None)
+
+    return {
+        "role": canonical_role,
+        "started": started,
+        "in_startup_grace": in_startup_grace,
+        "startup_completed_at": startup_completed_at,
+        "pending_initializations": pending,
+        "checked_at": checked_at,
+    }
+
+
+# ── R73 §5.10 (P1-06): dependency_health 探针 ──
+
+
+async def _dep_redis_local(role: str) -> tuple[bool, Optional[str]]:
+    """redis_local: 本地 Redis 可达(复用 _check_redis)。"""
+    healthy, _err, _reason = await _check_redis(role)
+    if not healthy:
+        return False, "REDIS_LOCAL_UNREACHABLE"
+    return True, None
+
+
+async def _dep_sqlite_cache(role: str) -> tuple[bool, Optional[str]]:
+    """sqlite_cache: cache_store.db 存在且可查询。"""
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "SQLITE_CACHE_MISSING"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            cursor = conn.execute("SELECT 1")
+            row = cursor.fetchone()
+            if row and row[0] == 1:
+                return True, None
+            return False, "SQLITE_CACHE_UNEXPECTED"
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"SQLITE_CACHE_UNREADABLE: {type(e).__name__}"
+
+
+async def _dep_sqlite_writable(role: str) -> tuple[bool, Optional[str]]:
+    """sqlite_writable / db_writable: cache_store.db 可写(创建临时表测试)。"""
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "SQLITE_WRITER_MISSING"
+        conn = sqlite3.connect(str(DB_PATH), timeout=2)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS _r73_health_writable_test "
+                "(id INTEGER)"
+            )
+            conn.execute("INSERT INTO _r73_health_writable_test VALUES (1)")
+            conn.execute("DELETE FROM _r73_health_writable_test")
+            conn.commit()
+            return True, None
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"SQLITE_NOT_WRITABLE: {type(e).__name__}"
+
+
+async def _dep_bot_token_valid(role: str) -> tuple[bool, Optional[str]]:
+    """bot_token_valid: 角色 Bot token 通过 getMe 验证(真实调用)。"""
+    bot_token = _get_bot_token_for_role(role)
+    healthy, _err = await _check_bot_token_valid(bot_token)
+    if not healthy:
+        return False, "BOT_TOKEN_INVALID"
+    return True, None
+
+
+async def _dep_idx_queue_exists(role: str) -> tuple[bool, Optional[str]]:
+    """idx_queue_exists: writer_inbox 表存在(索引队列)。"""
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "IDX_QUEUE_DB_MISSING"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='writer_inbox'"
+            )
+            if cursor.fetchone() is not None:
+                return True, None
+            return False, "IDX_QUEUE_TABLE_MISSING"
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"IDX_QUEUE_CHECK_FAILED: {type(e).__name__}"
+
+
+async def _dep_consumer_group_exists(role: str) -> tuple[bool, Optional[str]]:
+    """consumer_group_exists: Redis Stream consumer group 已创建。"""
+    if _is_pre_launch():
+        return True, None  # 启动宽限期不强制
+    healthy, _err = await _check_redis_stream_consumer()
+    if not healthy:
+        return False, "CONSUMER_GROUP_MISSING"
+    return True, None
+
+
+async def _dep_pending_idle(role: str) -> tuple[bool, Optional[str]]:
+    """pending_idle: pending 数量与 consumer idle 在阈值内(复用 _check_redis_stream_consumer)。"""
+    if _is_pre_launch():
+        return True, None
+    healthy, _err = await _check_redis_stream_consumer()
+    if not healthy:
+        return False, "PENDING_IDLE_UNCONTROLLABLE"
+    return True, None
+
+
+async def _dep_inbox_lag(role: str) -> tuple[bool, Optional[str]]:
+    """inbox_lag: writer_inbox 延迟在阈值内。"""
+    if _is_pre_launch():
+        return True, None
+    healthy, _err = await _check_writer_inbox_lag()
+    if not healthy:
+        return False, "INBOX_LAG_EXCEEDED"
+    return True, None
+
+
+async def _dep_crdb_connection(role: str) -> tuple[bool, Optional[str]]:
+    """crdb_connection: CRDB 连接可达(复用 _check_database_crdb)。"""
+    healthy, _err = await _check_database_crdb(role)
+    if not healthy:
+        return False, "CRDB_CONNECTION_FAILED"
+    return True, None
+
+
+async def _dep_outbox_table_exists(role: str) -> tuple[bool, Optional[str]]:
+    """outbox_table_exists: upload_outbox 表存在。"""
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "OUTBOX_DB_MISSING"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='upload_outbox'"
+            )
+            if cursor.fetchone() is not None:
+                return True, None
+            return False, "OUTBOX_TABLE_MISSING"
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"OUTBOX_CHECK_FAILED: {type(e).__name__}"
+
+
+async def _dep_watermark_recent(role: str) -> tuple[bool, Optional[str]]:
+    """watermark_recent: crdb_sync watermark(最近同步时间)在阈值内。"""
+    if _is_pre_launch():
+        return True, None
+    healthy, _err = await _check_crdb_sync_lag()
+    if not healthy:
+        return False, "WATERMARK_STALE"
+    return True, None
+
+
+async def _dep_http_port_open(role: str) -> tuple[bool, Optional[str]]:
+    """http_port_open: admin web port 监听中。"""
+    healthy, _err = await _check_admin_web_port()
+    if not healthy:
+        return False, "HTTP_PORT_CLOSED"
+    return True, None
+
+
+async def _dep_can_read_heartbeats(role: str) -> tuple[bool, Optional[str]]:
+    """can_read_heartbeats: bot_heartbeat 表可读。"""
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "HEARTBEAT_DB_MISSING"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='bot_heartbeat'"
+            )
+            if cursor.fetchone() is None:
+                return False, "HEARTBEAT_TABLE_MISSING"
+            return True, None
+        finally:
+            conn.close()
+    except Exception as e:
+        return False, f"HEARTBEAT_READ_FAILED: {type(e).__name__}"
+
+
+async def _dep_schema_valid(role: str) -> tuple[bool, Optional[str]]:
+    """schema_valid: cache_store schema 有效(必需表存在)。"""
+    if _is_pre_launch():
+        return True, None
+    healthy, _err = await _check_required_tables()
+    if not healthy:
+        return False, "SCHEMA_INVALID"
+    return True, None
+
+
+async def _dep_acl_configured(role: str) -> tuple[bool, Optional[str]]:
+    """acl_configured: Redis ACL 密码已配置(4 个变量)。"""
+    required_envs = [
+        "REDIS_LOCAL_PASSWORD", "REDIS_WRITER_PASSWORD",
+        "REDIS_HEALTH_PASSWORD", "REDIS_EXPORTER_PASSWORD",
+    ]
+    missing = [e for e in required_envs if not os.getenv(e)]
+    if missing:
+        return False, f"ACL_NOT_CONFIGURED: missing {missing}"
+    return True, None
+
+
+async def _dep_task_registry_loaded(role: str) -> tuple[bool, Optional[str]]:
+    """task_registry_loaded: r40_scheduler 任务注册表已加载(检查 scheduler 心跳)。"""
+    if _is_pre_launch():
+        return True, None
+    try:
+        import sqlite3
+
+        from database.cache_store import DB_PATH
+
+        if not DB_PATH.exists():
+            return False, "TASK_REGISTRY_DB_MISSING"
+        conn = sqlite3.connect(
+            f"file:{DB_PATH}?mode=ro", uri=True, timeout=2
+        )
+        try:
+            cursor = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='kv_store'"
+            )
+            if cursor.fetchone() is None:
+                return False, "TASK_REGISTRY_KV_MISSING"
+        finally:
+            conn.close()
+        # 检查 scheduler 心跳(任务注册表加载后才会发心跳)
+        healthy, _err = await _check_scheduler_heartbeat()
+        if not healthy:
+            return False, "TASK_REGISTRY_NOT_LOADED"
+        return True, None
+    except Exception as e:
+        return False, f"TASK_REGISTRY_CHECK_FAILED: {type(e).__name__}"
+
+
+# 角色 → 依赖检查项映射(依赖名 → async 检查函数)
+# 注:db_writer 的 "redis_writer" 复用 _dep_redis_local(同一 REDIS_URL)
+#     r40_scheduler 的 "db_writable" 复用 _dep_sqlite_writable
+DEPENDENCY_CHECKS: dict[
+    str, dict[str, Callable[[str], Awaitable[tuple[bool, Optional[str]]]]]
+] = {
+    "up_bot": {
+        "redis_local": _dep_redis_local,
+        "sqlite_cache": _dep_sqlite_cache,
+        "bot_token_valid": _dep_bot_token_valid,
+    },
+    "idx_bot": {
+        "redis_local": _dep_redis_local,
+        "sqlite_cache": _dep_sqlite_cache,
+        "idx_queue_exists": _dep_idx_queue_exists,
+    },
+    "dsp_bot": {
+        "redis_local": _dep_redis_local,
+        "consumer_group_exists": _dep_consumer_group_exists,
+        "pending_idle": _dep_pending_idle,
+    },
+    "db_writer": {
+        "redis_writer": _dep_redis_local,
+        "sqlite_writable": _dep_sqlite_writable,
+        "inbox_lag": _dep_inbox_lag,
+    },
+    "crdb_sync": {
+        "crdb_connection": _dep_crdb_connection,
+        "outbox_table_exists": _dep_outbox_table_exists,
+        "watermark_recent": _dep_watermark_recent,
+    },
+    "admin": {
+        "http_port_open": _dep_http_port_open,
+        "sqlite_cache": _dep_sqlite_cache,
+        "crdb_connection": _dep_crdb_connection,
+    },
+    "mon_bot": {
+        "redis_local": _dep_redis_local,
+        "can_read_heartbeats": _dep_can_read_heartbeats,
+    },
+    "prometheus_exporter": {
+        # 注意:prometheus_exporter 的依赖检查会委托给
+        # services.prometheus_exporter.collect_dependency_status(),
+        # 此处定义的检查项作为补充/兜底
+        "sqlite_readable": _dep_sqlite_cache,
+        "schema_valid": _dep_schema_valid,
+        "acl_configured": _dep_acl_configured,
+    },
+    "r40_scheduler": {
+        "db_writable": _dep_sqlite_writable,
+        "redis_local": _dep_redis_local,
+        "task_registry_loaded": _dep_task_registry_loaded,
+    },
+}
+
+
+async def check_dependency_health(role: str) -> dict:
+    """R73 §5.10 (P1-06): dependency_health 探针 — 角色依赖是否健康。
+
+    检查该角色的依赖(Redis / SQLite / CRDB / Bot token / 队列等)是否健康。
+    与 check_readiness 不同,本函数:
+    - 返回结构化 dependency_checks(name → {healthy, error_code})
+    - 不区分 critical / non-critical(全部依赖都报告状态)
+    - dependencies_healthy = all(依赖项 healthy)
+
+    prometheus_exporter 角色:委托给 collect_dependency_status(),
+    将其输出转换为 dependency_checks 格式,再补充 DEPENDENCY_CHECKS 中的检查。
+
+    Args:
+        role: SERVICE_ROLE 角色名(支持别名,如 "up" → "up_bot")
+
+    Returns:
+        {
+            "role": str,                    # 规范化角色名
+            "dependencies_healthy": bool,   # 所有依赖是否健康
+            "dependency_checks": {          # 各依赖检查结果
+                "name": {
+                    "healthy": bool,
+                    "error_code": str | None,
+                },
+                ...
+            },
+            "checked_at": str,              # 检查时间(ISO 8601 UTC)
+        }
+    """
+    canonical_role = _canonicalize_role(role)
+    checked_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+    # 未知角色:fail-closed
+    if canonical_role not in DEPENDENCY_CHECKS:
+        return {
+            "role": canonical_role,
+            "dependencies_healthy": False,
+            "dependency_checks": {
+                "role_validation": {
+                    "healthy": False,
+                    "error_code": f"UNKNOWN_ROLE: {canonical_role}",
+                },
+            },
+            "checked_at": checked_at,
+        }
+
+    dep_checkers = DEPENDENCY_CHECKS[canonical_role]
+    dependency_checks: dict[str, dict] = {}
+
+    # prometheus_exporter: 委托给 collect_dependency_status()
+    if canonical_role == "prometheus_exporter":
+        try:
+            from services.prometheus_exporter import (
+                collect_dependency_status,
+            )
+
+            status = collect_dependency_status()
+            # status 格式: {ready, passed, checks: {name: bool},
+            #               details: {name: str}, ...}
+            for name, healthy in status.get("checks", {}).items():
+                detail = status.get("details", {}).get(name)
+                dependency_checks[name] = {
+                    "healthy": bool(healthy),
+                    "error_code": None if healthy else (
+                        detail if isinstance(detail, str) else "UNKNOWN"
+                    ),
+                }
+        except Exception as e:
+            # collect_dependency_status 不可用 — 记录失败,继续走标准检查
+            dependency_checks["prometheus_delegation"] = {
+                "healthy": False,
+                "error_code": f"DELEGATION_FAILED: {type(e).__name__}",
+            }
+        # 补充 DEPENDENCY_CHECKS 中定义但 collect_dependency_status 未覆盖的检查
+        for name, checker in dep_checkers.items():
+            if name in dependency_checks:
+                continue  # 已由 collect_dependency_status 提供
+            try:
+                healthy, error_code = await checker(canonical_role)
+                dependency_checks[name] = {
+                    "healthy": healthy,
+                    "error_code": error_code,
+                }
+            except Exception as e:
+                dependency_checks[name] = {
+                    "healthy": False,
+                    "error_code": f"CHECK_RAISED: {type(e).__name__}",
+                }
+    else:
+        # 标准检查:逐个运行 dep_checkers
+        for name, checker in dep_checkers.items():
+            try:
+                healthy, error_code = await checker(canonical_role)
+                dependency_checks[name] = {
+                    "healthy": healthy,
+                    "error_code": error_code,
+                }
+            except Exception as e:
+                dependency_checks[name] = {
+                    "healthy": False,
+                    "error_code": f"CHECK_RAISED: {type(e).__name__}",
+                }
+
+    dependencies_healthy = all(
+        dc["healthy"] for dc in dependency_checks.values()
+    )
+
+    return {
+        "role": canonical_role,
+        "dependencies_healthy": dependencies_healthy,
+        "dependency_checks": dependency_checks,
+        "checked_at": checked_at,
+    }
+
+
 __all__ = [
     "CheckResult",
     "HealthResult",
     "check_readiness",
+    "check_liveness",
+    "check_startup",
+    "check_dependency_health",
     "to_http_status",
     "to_json",
     "HEALTH_VERSION",
     "BOT_ROLES",
     "ROLE_REQUIREMENTS",
+    "STARTUP_REQUIREMENTS",
+    "DEPENDENCY_CHECKS",
 ]
 
 

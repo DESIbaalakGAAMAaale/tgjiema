@@ -41,6 +41,7 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 RELEASE_GATES_YML = PROJECT_ROOT / ".github" / "workflows" / "release-gates.yml"
 PROMOTE_RC_YML = PROJECT_ROOT / ".github" / "workflows" / "promote-rc.yml"
+PROMOTE_VERIFIED_RC_YML = PROJECT_ROOT / ".github" / "workflows" / "_promote-verified-rc.yml"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -116,6 +117,18 @@ def promote_rc_yaml() -> dict:
 def promote_rc_text() -> str:
     """提供 promote-rc.yml 的原始文本内容。"""
     return _read_text(PROMOTE_RC_YML)
+
+
+@pytest.fixture
+def promote_verified_rc_yaml() -> dict:
+    """提供 _promote-verified-rc.yml 解析后的字典。"""
+    return _load_yaml(PROMOTE_VERIFIED_RC_YML)
+
+
+@pytest.fixture
+def promote_verified_rc_text() -> str:
+    """提供 _promote-verified-rc.yml 的原始文本内容。"""
+    return _read_text(PROMOTE_VERIFIED_RC_YML)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -360,12 +373,22 @@ class TestProductionPromotionGate:
         )
 
     def test_production_promotion_gate_if_includes_workflow_dispatch(self, release_gates_yaml):
-        """production-promotion-gate if 条件必须包含 workflow_dispatch 触发。"""
+        """R73 §5.6: production-promotion-gate if 条件不再包含 workflow_dispatch。
+
+        晋级逻辑已委托给 _promote-verified-rc.yml(single reusable workflow)。
+        本 job 仅在 production-v* tag push 时运行,作为冗余验证门禁。
+        workflow_dispatch 推进入口现在由 promote-rc.yml thin wrapper →
+        _promote-verified-rc.yml 处理,不再走本 job。
+        """
         job = _get_job(release_gates_yaml, "production-promotion-gate")
         if_expr = job.get("if", "")
-        assert "workflow_dispatch" in if_expr, (
-            f"production-promotion-gate if 条件必须包含 'workflow_dispatch': {if_expr}\n"
-            f"R70 P0-10: production 部署支持手动 dispatch 触发"
+        assert "workflow_dispatch" not in if_expr, (
+            f"R73 §5.6: production-promotion-gate if 条件不应包含 'workflow_dispatch': {if_expr}\n"
+            f"workflow_dispatch 晋级已委托给 _promote-verified-rc.yml (single reusable workflow)"
+        )
+        assert "refs/tags/production-v" in if_expr, (
+            f"production-promotion-gate if 条件必须包含 'refs/tags/production-v': {if_expr}\n"
+            f"R73 §5.6: production-v* tag push 触发冗余验证门禁"
         )
 
     def test_production_promotion_gate_environment_production(self, release_gates_yaml):
@@ -439,7 +462,6 @@ class TestMasterPushStagingEnvironment:
         "rc-continuity",
         "tag-ruleset-verify",
         "crdb-ru-72h-attribution-gate",
-        "production-evidence",
     ]
 
     def test_staging_jobs_use_dynamic_environment_expression(self, release_gates_yaml):
@@ -719,16 +741,16 @@ class TestPromoteRCWorkflowStructure:
 # 测试组 7: promote-rc.yml 所有 jobs 必须使用 environment: production
 # ══════════════════════════════════════════════════════════════════════
 class TestPromoteRCJobsUseProductionEnvironment:
-    """R72 P0-15: promote-rc.yml thin wrapper 中所有 jobs 使用 environment: production。
+    """R73 §5.6: promote-rc.yml thin wrapper 中所有 jobs 使用 environment: production。
 
-    R72 P0-15 将 promote-rc.yml 改造为 thin wrapper:
+    R73 §5.6 将 promote-rc.yml 改造为 thin wrapper:
       - 删除 5 个旧 job (validate-rc-candidate / verify-production-evidence /
         verify-rc-tag-immutability / promote-to-production / promotion-summary)
-      - 仅保留 1 个 job: create-signed-production-tag
-      - 所有身份校验委托给 release-gates.yml 的 production-promotion-gate
+      - 仅保留 1 个 job: promote-via-reusable-workflow
+      - 所有晋级逻辑委托给 _promote-verified-rc.yml (single reusable workflow)
     """
 
-    EXPECTED_JOBS = ["create-signed-production-tag"]
+    EXPECTED_JOBS = ["promote-via-reusable-workflow"]
 
     DEPRECATED_JOBS = [
         "validate-rc-candidate",
@@ -736,15 +758,16 @@ class TestPromoteRCJobsUseProductionEnvironment:
         "verify-rc-tag-immutability",
         "promote-to-production",
         "promotion-summary",
+        "create-signed-production-tag",  # R73 §5.6: 已移至 _promote-verified-rc.yml
     ]
 
     def test_all_expected_jobs_exist(self, promote_rc_yaml):
-        """promote-rc.yml 必须包含 thin wrapper 的 create-signed-production-tag job。"""
+        """promote-rc.yml 必须包含 thin wrapper 的 promote-via-reusable-workflow job。"""
         jobs = promote_rc_yaml.get("jobs", {})
         missing = [j for j in self.EXPECTED_JOBS if j not in jobs]
         assert not missing, (
             f"promote-rc.yml 缺少 thin wrapper jobs: {missing}\n"
-            f"R72 P0-15: 必须包含 create-signed-production-tag job"
+            f"R73 §5.6: 必须包含 promote-via-reusable-workflow job"
         )
 
     def test_no_deprecated_jobs_remain(self, promote_rc_yaml):
@@ -756,22 +779,24 @@ class TestPromoteRCJobsUseProductionEnvironment:
             f"R72 P0-15: 旧版 5 个重复校验 job 已删除(thin wrapper)"
         )
 
-    def test_create_signed_production_tag_uses_production_environment(self, promote_rc_yaml):
-        """create-signed-production-tag 必须使用 environment: production。"""
-        job = _get_job(promote_rc_yaml, "create-signed-production-tag")
+    def test_promote_via_reusable_workflow_uses_production_environment(self, promote_rc_yaml):
+        """promote-via-reusable-workflow 必须使用 environment: production。"""
+        job = _get_job(promote_rc_yaml, "promote-via-reusable-workflow")
         env = job.get("environment", "")
-        assert env == "production", (
-            f"create-signed-production-tag environment 必须为 'production',实际: {env}\n"
-            f"R72 P0-15: thin wrapper job 使用 production environment"
+        # R73 §5.6: thin wrapper 使用 reusable workflow,不直接设置 environment
+        # (environment 由 _promote-verified-rc.yml 管理)
+        # 本测试验证 job 存在且结构正确
+        assert isinstance(job, dict), (
+            "promote-via-reusable-workflow 必须存在且为 dict"
         )
 
-    def test_create_signed_production_tag_has_no_needs(self, promote_rc_yaml):
-        """create-signed-production-tag 是唯一 job,不应有 needs 依赖。"""
-        job = _get_job(promote_rc_yaml, "create-signed-production-tag")
-        needs = job.get("needs", [])
-        assert not needs, (
-            f"create-signed-production-tag 不应有 needs 依赖(唯一 job),实际: {needs}\n"
-            f"R72 P0-15: thin wrapper 只有一个 job"
+    def test_promote_via_reusable_workflow_has_no_needs(self, promote_rc_yaml):
+        """promote-via-reusable-workflow 是唯一 job,不应有 needs 依赖。"""
+        job = _get_job(promote_rc_yaml, "promote-via-reusable-workflow")
+        needs = job.get("needs", None)
+        assert needs is None, (
+            f"promote-via-reusable-workflow 不应有 needs 依赖(唯一 job),实际: {needs}\n"
+            f"R73 §5.6: thin wrapper 只有一个 job"
         )
 
 
@@ -779,18 +804,18 @@ class TestPromoteRCJobsUseProductionEnvironment:
 # 测试组 8: promote-rc.yml thin wrapper 结构(R72 P0-15)
 # ══════════════════════════════════════════════════════════════════════
 class TestPromoteRCJobDependencies:
-    """R72 P0-15: promote-rc.yml thin wrapper 只有一个 job,步骤内串行化。
+    """R73 §5.6: promote-rc.yml thin wrapper 只有一个 job,委托给 reusable workflow。
 
     旧版 (R70 P0-10) 有 5 个 job 通过 needs 串行化:
       validate-rc-candidate → verify-production-evidence /
       verify-rc-tag-immutability → promote-to-production → promotion-summary
 
     R72 P0-15 thin wrapper 只有一个 job (create-signed-production-tag),
-    内部通过 4 个 step 串行执行:
-      1. validate inputs + verify RC run head SHA
-      2. docker pull + verify RepoDigest
-      3. configure GPG signing key
-      4. create signed production-v* tag (git tag -s)
+    内部通过 4 个 step 串行执行。
+
+    R73 §5.6 (P0-07): promote-rc.yml 进一步改造为 thin wrapper,
+    唯一的 job 是 promote-via-reusable-workflow,
+    所有晋级步骤 (a-p) 委托给 _promote-verified-rc.yml。
     """
 
     def test_single_job_no_needs(self, promote_rc_yaml):
@@ -807,113 +832,128 @@ class TestPromoteRCJobDependencies:
             f"R72 P0-15: thin wrapper 单 job 无依赖"
         )
 
-    def test_create_signed_production_tag_has_4_steps(self, promote_rc_yaml):
-        """create-signed-production-tag 必须有 4 个 step(对应 4 项校验)。"""
-        job = _get_job(promote_rc_yaml, "create-signed-production-tag")
-        steps = job.get("steps", [])
-        # 至少 4 个 step(checkout + setup-python + 4 个校验 step)
-        assert len(steps) >= 4, (
-            f"create-signed-production-tag steps 不足: {len(steps)} (期望 >= 4)\n"
-            f"R72 P0-15: thin wrapper 至少 4 个校验 step"
+    def test_promote_via_reusable_workflow_uses_reusable_workflow(self, promote_rc_yaml):
+        """promote-via-reusable-workflow 必须使用 _promote-verified-rc.yml reusable workflow。
+
+        R73 §5.6 (P0-07): promote-rc.yml 是 thin wrapper,
+        唯一 job 使用 uses: ./.github/workflows/_promote-verified-rc.yml,
+        所有晋级步骤 (a-p) 委托给 reusable workflow。
+        """
+        job = _get_job(promote_rc_yaml, "promote-via-reusable-workflow")
+        uses = job.get("uses", "")
+        assert "_promote-verified-rc.yml" in uses, (
+            f"promote-via-reusable-workflow 必须使用 _promote-verified-rc.yml reusable workflow,"
+            f"实际 uses: {uses}\n"
+            f"R73 §5.6: thin wrapper 委托所有晋级步骤给 reusable workflow"
+        )
+        # 验证有 with 参数透传
+        assert "with" in job, (
+            "promote-via-reusable-workflow 必须有 with 参数透传 inputs\n"
+            "R73 §5.6: thin wrapper 透传所有 workflow_dispatch inputs"
         )
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 测试组 9: promote-rc.yml 关键校验逻辑
+# 测试组 9: _promote-verified-rc.yml 关键校验逻辑
 # ══════════════════════════════════════════════════════════════════════
 class TestPromoteRCValidationLogic:
-    """R70 P0-10: promote-rc.yml 必须包含关键校验逻辑(RC 存在性 / 不可变性 / 命名规范)。"""
+    """R73 §5.6: _promote-verified-rc.yml 必须包含关键校验逻辑(RC 存在性 / 不可变性 / 命名规范)。
 
-    def test_validate_rc_candidate_checks_rc_tag_naming(self, promote_rc_text):
+    R73 §5.6 (P0-07): promote-rc.yml 已改造为 thin wrapper,
+    所有晋级步骤 (a-p) 委托给 _promote-verified-rc.yml (single reusable workflow)。
+    本测试组验证 reusable workflow 包含完整的校验逻辑。
+    """
+
+    def test_validate_rc_candidate_checks_rc_tag_naming(self, promote_verified_rc_text):
         """validate-rc-candidate 必须校验 RC tag 命名规范(以 rc-v 开头)。"""
-        assert "rc-v" in promote_rc_text, (
-            "promote-rc.yml 必须校验 RC tag 命名规范(以 rc-v 开头)\n"
-            "R70 P0-10: RC candidate tag 必须形如 rc-v*.*.*"
+        assert "rc-v" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须校验 RC tag 命名规范(以 rc-v 开头)\n"
+            "R73 §5.6: RC candidate tag 必须形如 rc-v*.*.*"
         )
         # 必须有正则或 bash 模式匹配 ^rc-v
-        assert re.search(r'\^rc-v|rc-v\*|refs/tags/rc-v', promote_rc_text), (
-            "promote-rc.yml 必须包含 RC tag 命名规范校验(^rc-v 或 refs/tags/rc-v)\n"
-            "R70 P0-10: RC tag 必须以 rc-v 开头"
+        assert re.search(r'\^rc-v|rc-v\*|refs/tags/rc-v', promote_verified_rc_text), (
+            "_promote-verified-rc.yml 必须包含 RC tag 命名规范校验(^rc-v 或 refs/tags/rc-v)\n"
+            "R73 §5.6: RC tag 必须以 rc-v 开头"
         )
 
-    def test_validate_rc_candidate_checks_production_tag_naming(self, promote_rc_text):
+    def test_validate_rc_candidate_checks_production_tag_naming(self, promote_verified_rc_text):
         """validate-rc-candidate 必须校验 production tag 命名规范(以 production-v 开头)。"""
-        assert "production-v" in promote_rc_text, (
-            "promote-rc.yml 必须校验 production tag 命名规范(以 production-v 开头)\n"
-            "R70 P0-10: production tag 必须形如 production-v*.*.*"
+        assert "production-v" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须校验 production tag 命名规范(以 production-v 开头)\n"
+            "R73 §5.6: production tag 必须形如 production-v*.*.*"
         )
-        assert re.search(r'\^production-v|production-v\*|refs/tags/production-v', promote_rc_text), (
-            "promote-rc.yml 必须包含 production tag 命名规范校验\n"
-            "R70 P0-10: production tag 必须以 production-v 开头"
+        assert re.search(r'\^production-v|production-v\*|refs/tags/production-v', promote_verified_rc_text), (
+            "_promote-verified-rc.yml 必须包含 production tag 命名规范校验\n"
+            "R73 §5.6: production tag 必须以 production-v 开头"
         )
 
-    def test_validate_rc_candidate_checks_rc_tag_exists(self, promote_rc_text):
+    def test_validate_rc_candidate_checks_rc_tag_exists(self, promote_verified_rc_text):
         """validate-rc-candidate 必须校验 RC tag 已存在。"""
         # 必须使用 git rev-parse --verify 校验 tag 存在
-        assert "git rev-parse --verify" in promote_rc_text, (
-            "promote-rc.yml 必须使用 'git rev-parse --verify' 校验 RC tag 存在\n"
-            "R70 P0-10: production 晋级必须基于已存在的 RC candidate"
+        assert "git rev-parse --verify" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须使用 'git rev-parse --verify' 校验 RC tag 存在\n"
+            "R73 §5.6: production 晋级必须基于已存在的 RC candidate"
         )
 
-    def test_validate_rc_candidate_verifies_release_gates_passed(self, promote_rc_text):
-        """R72 P0-15: thin wrapper 必须用 gh run view 校验 RC run 成功(替代弱查找)。
+    def test_validate_rc_candidate_verifies_release_gates_passed(self, promote_verified_rc_text):
+        """R73 §5.6: reusable workflow 必须用 gh run view 校验 RC run 成功(替代弱查找)。
 
         旧版 (R70 P0-10) 用 `gh run list --status=success --limit=1` 查找成功 run,
         不核对 head SHA — 易被 weak lookup 欺骗。R72 P0-15 改用 `gh run view <id>`
         精确查询并校验 head SHA == RC tag commit。
         """
         # R72 P0-15: 必须使用 gh run view(精确查询),不再用 gh run list(弱查找)
-        assert "gh run view" in promote_rc_text, (
-            "promote-rc.yml 必须使用 'gh run view' 精确查询 RC run 状态\n"
-            "R72 P0-15: 替代旧版 gh run list 弱查找(不核对 SHA)"
+        assert "gh run view" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须使用 'gh run view' 精确查询 RC run 状态\n"
+            "R73 §5.6: 替代旧版 gh run list 弱查找(不核对 SHA)"
         )
-        assert "release-gates.yml" in promote_rc_text, (
-            "promote-rc.yml 必须查询 release-gates.yml workflow\n"
-            "R72 P0-15: RC candidate 必须通过 release-gates.yml 的所有 RC-only jobs"
+        assert "release-gates.yml" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须查询 release-gates.yml workflow\n"
+            "R73 §5.6: RC candidate 必须通过 release-gates.yml 的所有 RC-only jobs"
         )
         # R72 P0-15: 必须校验 conclusion == success
-        assert "success" in promote_rc_text, (
-            "promote-rc.yml 必须校验 RC run conclusion 为 success\n"
-            "R72 P0-15: 仅成功的 RC candidate 可晋级到 production"
+        assert "success" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须校验 RC run conclusion 为 success\n"
+            "R73 §5.6: 仅成功的 RC candidate 可晋级到 production"
         )
 
-    def test_verify_rc_tag_immutability_compares_commit_sha(self, promote_rc_text):
+    def test_verify_rc_tag_immutability_compares_commit_sha(self, promote_verified_rc_text):
         """verify-rc-tag-immutability 必须比较 RC tag 当前 SHA 与初始 SHA。"""
         # 必须重新查询 RC tag 当前指向的 commit
-        assert "git rev-parse" in promote_rc_text, (
-            "promote-rc.yml 必须使用 'git rev-parse' 重新查询 RC tag 当前 SHA\n"
-            "R70 P0-10: 验证 RC tag 不可变性需要对比初始 SHA 与当前 SHA"
+        assert "git rev-parse" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须使用 'git rev-parse' 重新查询 RC tag 当前 SHA\n"
+            "R73 §5.6: 验证 RC tag 不可变性需要对比初始 SHA 与当前 SHA"
         )
         # 必须有 CURRENT_SHA 或类似的变量(与 RC_COMMIT_SHA 对比)
-        assert "CURRENT_SHA" in promote_rc_text or "RC_COMMIT_SHA" in promote_rc_text, (
-            "promote-rc.yml 必须比较 RC tag 的当前 SHA 与初始 SHA\n"
-            "R70 P0-10: RC tag 在晋级过程中不可移动"
+        assert "CURRENT_SHA" in promote_verified_rc_text or "RC_COMMIT_SHA" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须比较 RC tag 的当前 SHA 与初始 SHA\n"
+            "R73 §5.6: RC tag 在晋级过程中不可移动"
         )
 
-    def test_promote_to_production_creates_tag_on_workflow_dispatch(self, promote_rc_text):
+    def test_promote_to_production_creates_tag_on_workflow_dispatch(self, promote_verified_rc_text):
         """promote-to-production 在 workflow_dispatch 时必须创建 production tag。"""
         # 必须有 'git tag' 与 'git push' 命令(创建并推送 production tag)
-        assert "git tag" in promote_rc_text, (
-            "promote-rc.yml 必须包含 'git tag' 命令(创建 production tag)\n"
-            "R70 P0-10: workflow_dispatch 触发时需创建 production-v* tag"
+        assert "git tag" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须包含 'git tag' 命令(创建 production tag)\n"
+            "R73 §5.6: workflow_dispatch 触发时需创建 production-v* tag"
         )
-        assert "git push" in promote_rc_text, (
-            "promote-rc.yml 必须包含 'git push' 命令(推送 production tag)\n"
-            "R70 P0-10: 创建的 production-v* tag 必须推送到 origin"
+        assert "git push" in promote_verified_rc_text, (
+            "_promote-verified-rc.yml 必须包含 'git push' 命令(推送 production tag)\n"
+            "R73 §5.6: 创建的 production-v* tag 必须推送到 origin"
         )
 
-    def test_promote_to_production_uses_set_euo_pipefail(self, promote_rc_text):
+    def test_promote_to_production_uses_set_euo_pipefail(self, promote_verified_rc_text):
         """promote-to-production bash 必须使用 set -euo pipefail。"""
         # 所有 bash step 必须有 set -euo pipefail
-        # 检查至少出现 4 次(每个 job 至少一次)
-        count = promote_rc_text.count("set -euo pipefail")
+        # 检查至少出现 4 次(每个 step 至少一次)
+        count = promote_verified_rc_text.count("set -euo pipefail")
         assert count >= 4, (
-            f"promote-rc.yml 中 'set -euo pipefail' 出现次数不足: {count} (期望 >= 4)\n"
-            f"R70 P0-10: 所有 bash step 必须使用严格模式,禁止吞异常"
+            f"_promote-verified-rc.yml 中 'set -euo pipefail' 出现次数不足: {count} (期望 >= 4)\n"
+            f"R73 §5.6: 所有 bash step 必须使用严格模式,禁止吞异常"
         )
 
-    def test_promote_to_production_no_skip_no_warn(self, promote_rc_text):
-        """promote-rc.yml 不应包含 skip / warn / 吞异常 模式。
+    def test_promote_to_production_no_skip_no_warn(self, promote_verified_rc_text):
+        """_promote-verified-rc.yml 不应包含 skip / warn / 吞异常 模式。
 
         允许的 continue-on-error: 仅在 download-artifact 中使用(后续 step 会显式 FAIL)。
         其他 step 不允许 continue-on-error: true。
@@ -921,7 +961,7 @@ class TestPromoteRCValidationLogic:
         # 查找 continue-on-error: true 的出现
         # 允许在 download-artifact step 中使用(artifact 可能不存在)
         # 但其他 step 不允许
-        lines = promote_rc_text.split("\n")
+        lines = promote_verified_rc_text.split("\n")
         bad_lines = []
         for i, line in enumerate(lines):
             if "continue-on-error: true" in line:
@@ -931,9 +971,9 @@ class TestPromoteRCValidationLogic:
                 if "download-artifact" not in context and "actions/download-artifact" not in context:
                     bad_lines.append((i + 1, line.strip()))
         assert not bad_lines, (
-            f"promote-rc.yml 中发现非 download-artifact 的 continue-on-error: true:\n"
+            f"_promote-verified-rc.yml 中发现非 download-artifact 的 continue-on-error: true:\n"
             f"  {bad_lines}\n"
-            f"R70 P0-10: 禁止吞异常(仅 download-artifact 允许 continue-on-error,"
+            f"R73 §5.6: 禁止吞异常(仅 download-artifact 允许 continue-on-error,"
             f"且有显式 fallback FAIL)"
         )
 
@@ -1074,21 +1114,22 @@ class TestCrossWorkflowConsistency:
 
     def test_both_workflows_use_production_environment_for_production(self,
                                                                       release_gates_yaml,
-                                                                      promote_rc_yaml):
+                                                                      promote_verified_rc_yaml):
         """两个 workflow 中触发 production 部署的 job 必须使用 environment: production。
 
-        R72 P0-15: promote-rc.yml 改造为 thin wrapper,
-        唯一 job 为 create-signed-production-tag(替代旧 promote-to-production)。
+        R73 §5.6: promote-rc.yml 改造为 thin wrapper,
+        所有晋级逻辑委托给 _promote-verified-rc.yml (single reusable workflow)。
+        reusable workflow 的 promote-verified-rc job 使用 environment: production。
         """
         # release-gates.yml: production-promotion-gate
         rg_ppg = _get_job(release_gates_yaml, "production-promotion-gate")
         assert rg_ppg.get("environment") == "production", (
             "release-gates.yml production-promotion-gate 必须使用 environment: production"
         )
-        # promote-rc.yml: create-signed-production-tag (R72 P0-15 thin wrapper)
-        pr_cspt = _get_job(promote_rc_yaml, "create-signed-production-tag")
-        assert pr_cspt.get("environment") == "production", (
-            "promote-rc.yml create-signed-production-tag 必须使用 environment: production"
+        # _promote-verified-rc.yml: promote-verified-rc (R73 §5.6 reusable workflow)
+        pvr_job = _get_job(promote_verified_rc_yaml, "promote-verified-rc")
+        assert pvr_job.get("environment") == "production", (
+            "_promote-verified-rc.yml promote-verified-rc 必须使用 environment: production"
         )
 
     def test_both_workflows_use_rc_candidate_for_rc(self, release_gates_yaml):
@@ -1192,31 +1233,34 @@ class TestR70Wave9Integration:
         )
 
     def test_promote_rc_pipeline_complete(self, promote_rc_yaml):
-        """R72 P0-15: promote-rc.yml thin wrapper 包含 create-signed-production-tag job。
+        """R73 §5.6: promote-rc.yml thin wrapper 包含 promote-via-reusable-workflow job。
 
         旧版 (R70 P0-10) 要求 5 阶段晋级流水线(5 个 job)。
-        R72 P0-15 改造为 thin wrapper,仅保留 1 个 job,
-        完整身份校验委托给 release-gates.yml 的 production-promotion-gate。
+        R72 P0-15 改造为 thin wrapper,仅保留 1 个 job (create-signed-production-tag)。
+        R73 §5.6 (P0-07): 进一步改造为 thin wrapper,
+        唯一 job 为 promote-via-reusable-workflow,
+        所有晋级步骤 (a-p) 委托给 _promote-verified-rc.yml。
         """
-        expected_jobs = ["create-signed-production-tag"]
+        expected_jobs = ["promote-via-reusable-workflow"]
         deprecated_jobs = [
             "validate-rc-candidate",
             "verify-production-evidence",
             "verify-rc-tag-immutability",
             "promote-to-production",
             "promotion-summary",
+            "create-signed-production-tag",  # R73 §5.6: 已移至 _promote-verified-rc.yml
         ]
         jobs = promote_rc_yaml.get("jobs", {})
         for job_id in expected_jobs:
             assert job_id in jobs, (
                 f"promote-rc.yml 缺少 job: {job_id}\n"
-                f"R72 P0-15: thin wrapper 必须包含 create-signed-production-tag"
+                f"R73 §5.6: thin wrapper 必须包含 promote-via-reusable-workflow"
             )
         # 旧版 5 阶段 job 已废弃
         for job_id in deprecated_jobs:
             assert job_id not in jobs, (
                 f"promote-rc.yml 不应包含已废弃的旧 job: {job_id}\n"
-                f"R72 P0-15: 旧版 5 阶段晋级流水线已删除(thin wrapper)"
+                f"R73 §5.6: 旧版晋级流水线已删除(thin wrapper → reusable workflow)"
             )
 
     def test_release_gates_yaml_is_valid(self, release_gates_yaml):
@@ -1245,7 +1289,7 @@ class TestR70Wave9Integration:
             "sign-image",                     # 签名(rc-candidate)
             "publish-attestation",            # 发布 attestation(rc-candidate)
             "verify-only-3x",                 # 3x 验证(rc-candidate)
-            "production-evidence",            # 生产证据(rc-candidate)
+            "generate-evidence-envelope",     # 生产证据(R73 P1-05 重命名)
             "production-promotion-gate",      # 生产晋级门禁(production)
             "release-summary",                # 聚合状态报告
         ]

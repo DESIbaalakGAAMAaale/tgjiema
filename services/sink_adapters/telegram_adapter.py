@@ -20,10 +20,23 @@ from __future__ import annotations
 
 from typing import Any, Optional, Union
 
+from services.error_codes import AppError, ErrorCodes
 from services.user_message import (
     ErrorEnvelope,
     UserMessage,
     render_for_send,
+)
+
+# R81 §10.9: 重新导出 telegram.error 异常类型,使业务模块(bots/)无需
+# 直接 import telegram.error(sink import boundary Rule 1 违规)。
+# 业务代码应 ``from services.sink_adapters.telegram_adapter import
+# BadRequest, NetworkError, RetryAfter, TimedOut`` 来引用这些类型。
+from telegram.error import (  # noqa: F401 — 重新导出供业务模块使用
+    BadRequest,
+    Forbidden,
+    NetworkError,
+    RetryAfter,
+    TimedOut,
 )
 
 
@@ -335,3 +348,92 @@ async def safe_answer_callback_query(
         kwargs.setdefault("text", text)
     kwargs.setdefault("show_alert", show_alert)
     return await query.answer(**kwargs)
+
+
+# ════════════════════════════════════════════════════════════════
+# R76 O2: Provider 工厂 — 统一 backend 选择入口
+# ════════════════════════════════════════════════════════════════
+def build_provider_client(settings: Any, token: str, **kwargs: Any) -> Any:
+    """R76 O2: 根据配置构造 ProviderClient(统一 backend 选择入口)。
+
+    整改背景(R76 终审报告 10.O-O2):
+        业务模块(bots/、services/)此前直接 ``Application.builder().token(...)``
+        构造 Telegram Bot,在测试中通过 monkey patch 冒充真实 Provider。本工厂
+        根据 ``settings.PROVIDER_BACKEND`` 选择具体实现:
+
+            - ``"telegram"``: 返回 ``telegram.Bot`` 实例(生产真实使用);
+            - ``"contract"``: 返回 ``ContractProviderClient`` 实例(CI/本地 secretless 测试)。
+
+    业务层通过本工厂获取 ProviderClient,不再直接 ``Application.builder().token()``
+    或 ``from telegram import Bot``。``ProviderClient`` 协议定义见
+    ``services/sink_adapters/provider_protocol.py``。
+
+    Args:
+        settings: ``config.settings.Settings`` 实例(提供 ``PROVIDER_BACKEND`` /
+            ``PROVIDER_BASE_URL`` / ``PROVIDER_CONTRACT_TOKEN`` 等字段)
+        token: Bot token(telegram: 真实 BotFather token;contract: ``ci-local-token``)
+        **kwargs: 透传给具体 backend 的额外参数
+
+    Returns:
+        ``ProviderClient`` 实例:
+            - telegram backend → ``telegram.Bot`` 实例(未初始化,调用方需 ``await bot.initialize()``)
+            - contract backend → ``ContractProviderClient`` 实例
+
+    Raises:
+        ValueError: ``settings.PROVIDER_BACKEND`` 不在 ``VALID_PROVIDER_BACKENDS`` 中
+        ValueError: contract 模式下 ``PROVIDER_BASE_URL`` 或 ``PROVIDER_CONTRACT_TOKEN`` 为空
+
+    安全:
+        - telegram backend 不需要 ``PROVIDER_CONTRACT_TOKEN``;
+        - contract backend 不需要真实 Bot Token,只需 CI 临时令牌;
+        - 工厂不打印/不记录 token 明文。
+    """
+    from services.sink_adapters.provider_protocol import (
+        PROVIDER_BACKEND_CONTRACT,
+        PROVIDER_BACKEND_TELEGRAM,
+        VALID_PROVIDER_BACKENDS,
+    )
+
+    backend = getattr(settings, "PROVIDER_BACKEND", PROVIDER_BACKEND_TELEGRAM)
+    if backend not in VALID_PROVIDER_BACKENDS:
+        raise ValueError(
+            f"[build_provider_client] R76-O2: 不支持的 PROVIDER_BACKEND={backend!r}, "
+            f"合法值: {sorted(VALID_PROVIDER_BACKENDS)}"
+        )
+
+    if backend == PROVIDER_BACKEND_TELEGRAM:
+        # 生产路径:返回 telegram.Bot 实例
+        # telegram.Bot 已结构化满足 ProviderClient 协议(get_me/get_file/
+        # download_file/send_message/send_document 方法签名一致)
+        return build_bot(token, **kwargs)
+
+    # contract 路径:延迟导入避免 telegram_adapter 加载时拉起 httpx 依赖
+    from services.sink_adapters.contract_adapter import ContractProviderClient
+
+    base_url = getattr(settings, "PROVIDER_BASE_URL", "")
+    contract_token = getattr(settings, "PROVIDER_CONTRACT_TOKEN", "")
+
+    if not base_url:
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"reason": "[build_provider_client] R76-O2: contract 模式要求 PROVIDER_BASE_URL 非空"},
+        )
+    if not contract_token:
+        raise AppError(
+            ErrorCodes.VALIDATION_FAILED,
+            params={"reason": "[build_provider_client] R76-O2: contract 模式要求 PROVIDER_CONTRACT_TOKEN 非空"},
+        )
+
+    # 透传 timeout / trace_id 等可选参数
+    # R80 Step 11: 默认 4s — provider-sim 正常响应 <100ms;
+    # 故障注入 timeout 场景 delay_ms=5000 需要触发 client ReadTimeout。
+    timeout = kwargs.pop("timeout", 4.0)
+    trace_id = kwargs.pop("trace_id", None)
+
+    return ContractProviderClient(
+        base_url=base_url,
+        token=token,
+        contract_token=contract_token,
+        timeout=timeout,
+        trace_id=trace_id,
+    )

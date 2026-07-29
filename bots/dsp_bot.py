@@ -5,6 +5,11 @@
 from __future__ import annotations
 from services.sink_adapters.telegram_adapter import (
     safe_reply_text, safe_send_message, safe_edit_message_text,
+    build_provider_client,
+)
+from services.sink_adapters.provider_protocol import (
+    PROVIDER_BACKEND_TELEGRAM as _PROVIDER_BACKEND_TELEGRAM,
+    PROVIDER_BACKEND_CONTRACT as _PROVIDER_BACKEND_CONTRACT,
 )
 from services.sink_adapters.telegram_helpers import (
     Update,
@@ -2143,30 +2148,61 @@ async def _async_main():
 
     logger.info("[Dsp] 启动发送机器人 (Dsp Bot)...")
 
-    # R71 RC31: CI 模式跳过 Application.builder().token(TOKEN).build()
-    # CI 中 settings.SENDER_BOT_TOKEN 为空占位符 → .build() 抛 InvalidToken
-    # → 进程崩溃 → Docker restart loop → docker compose exec 失败。
-    # CI 模式跳过整个 Application 构建 + handler 注册 + bg_tasks,
-    # 直接等待 stop 信号(与 up_bot/idx_bot/admin_bot RC31 一致)。
-    _is_ci = (
-        os.getenv("CI", "").lower() in ("true", "1")
-        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-    )
-    if _is_ci:
+    # R76 O2: 通过 build_provider_client 工厂统一选择 backend
+    # - telegram backend: 返回 telegram.Bot 实例(生产真实使用)
+    # - contract backend: 返回 ContractProviderClient 实例(secretless CI/本地测试)
+    # 工厂内部校验 PROVIDER_BACKEND / PROVIDER_BASE_URL / PROVIDER_CONTRACT_TOKEN,
+    # 业务层不再直接 Application.builder().token(...) 或 from telegram import Bot。
+    _provider_backend = getattr(settings, "PROVIDER_BACKEND", _PROVIDER_BACKEND_TELEGRAM)
+
+    if _provider_backend == _PROVIDER_BACKEND_CONTRACT:
+        # R76 O2: contract 模式 — 不构建 Application,updates 由 web_adapter
+        # /internal/contract/update 端点接收并 dispatch(O5 实现)。
+        # bot 由 build_provider_client 构造为 ContractProviderClient,
+        # 业务函数(process_queue 等)接收兼容 client,逻辑不变。
+        bot = build_provider_client(settings, TOKEN)
+        logger.info(
+            "[Dsp] R76-O2 contract 模式: bot 由 build_provider_client 构造,"
+            "process_queue 作为自然消费者启动"
+        )
+
         from run_all import _set_stop_event
         stop_event = asyncio.Event()
         _set_stop_event(stop_event)
-        logger.warning("[Dsp] CI 模式: 跳过 Application 构建(占位符 token)")
+
+        # 启动后台任务(与 telegram 模式一致,process_queue 作为自然消费者)
+        async def _contract_health_ping():
+            while True:
+                await metrics.ping_bot("dsp_bot")
+                await report_bot_heartbeat("dsp_bot")
+                await asyncio.sleep(30)
+
+        create_safe_task(_contract_health_ping(), name="health-ping")
+        # R76 O2: process_queue(bot) 由正常进程启动,不允许测试脚本直接调用
+        create_safe_task(process_queue(bot), name="process-queue")
+        create_safe_task(_cleanup_page_states(), name="cleanup-page-states")
+        create_safe_task(_cleanup_channel_failures(), name="cleanup-channel-failures")
+        create_safe_task(_cleanup_channel_limiter_loop(), name="cleanup-channel-limiter")
+        create_safe_task(_retry_dead_jobs(), name="retry-dead-jobs")
+
         try:
             await stop_event.wait()
         except asyncio.CancelledError:
             pass
         finally:
-            logger.info("[Dsp] CI 模式关闭完成")
+            logger.info("[Dsp] contract 模式收到停止信号,正在优雅关闭...")
+            try:
+                from utils.redis_client import close_redis
+                await asyncio.wait_for(close_redis(), timeout=5.0)
+            except Exception as e:
+                logger.debug(f"[Dsp] Redis close failed during shutdown: {e}")
+            logger.info("[Dsp] contract 模式关闭完成")
         return
 
+    # telegram backend(生产路径)— 通过工厂构造 bot,但仍需 Application 注册 handler
+    bot = build_provider_client(settings, TOKEN)
     app = Application.builder().token(TOKEN).build()
-    bot = app.bot
+    bot = app.bot  # 使用 app.bot 作为 bot(Application 集成需要)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
@@ -2323,58 +2359,41 @@ async def _async_main():
     from database.cache import dump_cache_to_disk_loop
     create_safe_task(dump_cache_to_disk_loop(), name="dump-cache")
 
-    # R71 RC28: CI 模式跳过 async with app: — app.start() → bot.initialize()
-    # → get_me() 会用占位符 token 调用 Telegram API → 401 → 崩溃 → restart loop。
-    _is_ci = (
-        os.getenv("CI", "").lower() in ("true", "1")
-        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-    )
+    # R76 O2: contract 模式已在上方 return;此处为 telegram backend(生产路径),
+    # 必须运行完整 Application 生命周期(start_polling)。
+    # 若 TOKEN 为空,Application.start() 会失败 — 这是 fail-closed 行为,
+    # CI 应使用 contract 模式而非空 token 占位。
     from run_all import _set_stop_event
     stop_event = asyncio.Event()
     _set_stop_event(stop_event)
 
-    if _is_ci:
-        logger.warning("[Dsp] CI 模式: 跳过 Application 启动(占位符 token)")
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
         try:
             await stop_event.wait()
         except asyncio.CancelledError:
             pass
         finally:
-            logger.info("[Dsp] 收到停止信号,正在优雅关闭...")
+            logger.info("[Dsp] 收到停止信号,正在优雅关闭 polling...")
+            try:
+                await asyncio.wait_for(app.updater.stop(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Dsp] polling 关闭超时(15s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Dsp] polling 关闭异常: {e}")
+            try:
+                await asyncio.wait_for(app.stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Dsp] app.stop 超时(10s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Dsp] app.stop 异常: {e}")
             try:
                 from utils.redis_client import close_redis
                 await asyncio.wait_for(close_redis(), timeout=5.0)
             except Exception as e:
-                logger.debug(f"[Dsp] Redis close failed during shutdown: {e}")
+                logger.debug(f"[Dsp] close_redis 异常: {e}")
             logger.info("[Dsp] 优雅关闭完成")
-    else:
-        async with app:
-            await app.start()
-            await app.updater.start_polling()
-            try:
-                await stop_event.wait()
-            except asyncio.CancelledError:
-                pass
-            finally:
-                logger.info("[Dsp] 收到停止信号,正在优雅关闭 polling...")
-                try:
-                    await asyncio.wait_for(app.updater.stop(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    logger.warning("[Dsp] polling 关闭超时(15s),强制继续")
-                except Exception as e:
-                    logger.warning(f"[Dsp] polling 关闭异常: {e}")
-                try:
-                    await asyncio.wait_for(app.stop(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    logger.warning("[Dsp] app.stop 超时(10s),强制继续")
-                except Exception as e:
-                    logger.warning(f"[Dsp] app.stop 异常: {e}")
-                try:
-                    from utils.redis_client import close_redis
-                    await asyncio.wait_for(close_redis(), timeout=5.0)
-                except Exception as e:
-                    logger.debug(f"[Dsp] close_redis 异常: {e}")
-                logger.info("[Dsp] 优雅关闭完成")
 
 
 def run():

@@ -170,7 +170,13 @@ class TestServiceConsistency:
         # 读取 docker-compose.yml
         dc_path = Path(__file__).parent.parent / "docker-compose.yml"
         dc_data = yaml.safe_load(dc_path.read_text(encoding="utf-8"))
-        dc_names = set(dc_data.get("services", {}).keys()) - {"redis", "redis-acl-init"}  # 排除基础设施 + init container
+        # 排除基础设施(redis / redis-acl-init / cockroachdb) — 这些是 compose 专用,
+        # 在 services.yaml 的 `infrastructure` 节点定义,不参与 services 业务清单比对。
+        # R75 P0-03: cockroachdb 作为 CI/开发环境单节点 CRDB 基础设施加入 compose,
+        # 但不进入 services.yaml 的业务服务清单(systemd 通过外部 CRDB Cloud 部署)。
+        dc_names = set(dc_data.get("services", {}).keys()) - {
+            "redis", "redis-acl-init", "cockroachdb"
+        }
 
         assert sy_names == dc_names, (
             f"服务清单不一致: services.yaml={sy_names}, docker-compose={dc_names}"

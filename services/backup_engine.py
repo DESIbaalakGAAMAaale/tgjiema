@@ -99,15 +99,16 @@ def _compute_sha256(content: bytes) -> str:
 class BackupEngine:
     """R40 P0-7 + R42 P1-2/P1-3/P1-7/P1-9: 统一备份引擎。
 
-    所有方法均为 async。R2 storage、CRDB/SQLite 通过依赖注入或 lazy import,
-    便于测试时 mock。
+    R76 O7 / 10.G: 所有方法均为 async。统一对象存储(R2 或 MinIO)、CRDB/SQLite
+    通过依赖注入或 lazy import,便于测试时 mock。存储后端由
+    ``OBJECT_STORAGE_BACKEND`` 控制,生产用 R2,CI/测试用 MinIO。
     """
 
     def __init__(self, storage=None, cache_store=None):
         """初始化 BackupEngine。
 
         Args:
-            storage: R2Storage 实例(可选,测试时注入 mock;生产 None 时从 storage.r2 取单例)
+            storage: R2Storage 实例(可选,测试时注入 mock;生产 None 时从 storage.r2 取统一单例)
             cache_store: CacheStore 实例(可选,测试时注入 mock;生产 None 时从 database.cache_store 取单例)
         """
         self._storage = storage
@@ -116,11 +117,18 @@ class BackupEngine:
     # ─── 依赖懒加载 ─────────────────────────────────────────
 
     def _get_storage(self):
-        """获取 R2 storage 单例(测试时返回注入的 mock)。"""
+        """获取统一对象存储单例(测试时返回注入的 mock)。
+
+        R76 O7 / 10.G: 返回的 ``_r2`` 单例由 ``configure_storage_from_settings()``
+        根据 ``OBJECT_STORAGE_BACKEND`` 配置(R2 或 MinIO)统一注入。
+        - 生产(``r2``): Cloudflare R2,HTTPS,virtual-hosted
+        - CI/测试(``minio``): MinIO,HTTP,path-style
+        两者均使用 S3 兼容 SigV4 协议,业务层无感知。
+        """
         if self._storage is not None:
             return self._storage
-        from storage.r2 import _r2 as r2_storage
-        return r2_storage
+        from storage.r2 import get_r2
+        return get_r2()
 
     def _get_cache_store(self):
         """获取 CacheStore 单例(测试时返回注入的 mock)。"""

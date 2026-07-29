@@ -145,20 +145,28 @@ class TestStepEnvBackupSigningKeyReference:
     """R72 RC69: step env 块必须声明 BACKUP_SIGNING_KEY 引用。"""
 
     def test_step_env_block_contains_backup_signing_key(self):
-        """Generate minimal secrets placeholders step 的 env 块必须包含 BACKUP_SIGNING_KEY。"""
+        """Generate secretless CI credentials step 的 env 块必须包含 BACKUP_SIGNING_KEY。
+
+        R76 §10.F: 步骤名从 'Generate minimal secrets placeholders' 重命名为
+        'Generate secretless CI credentials (single-run temporary)',但 env 块
+        仍需声明 BACKUP_SIGNING_KEY(非 secretless 模式从 secrets 读取,
+        secretless 模式由脚本生成 CI_BACKUP_SIGNING_KEY 覆盖)。
+        """
         workflow = _parse_workflow()
         job = workflow["jobs"]["compose-runtime-e2e"]
         steps = job["steps"]
         generate_step = None
         for step in steps:
-            if step.get("name") == "Generate minimal secrets placeholders":
+            name = step.get("name", "")
+            if "Generate secretless CI credentials" in name:
                 generate_step = step
                 break
         assert generate_step is not None, (
-            "R72 RC69: 未找到 'Generate minimal secrets placeholders' step"
+            "R72 RC69 / R76 §10.F: 未找到 'Generate secretless CI credentials' step "
+            "(替代 R72 RC64 'Generate minimal secrets placeholders')"
         )
         assert "env" in generate_step, (
-            "R72 RC69: 'Generate minimal secrets placeholders' step 必须有 env 块"
+            "R72 RC69: 'Generate secretless CI credentials' step 必须有 env 块"
         )
         env_block = generate_step["env"]
         assert REQUIRED_RC69_SECRET in env_block, (
@@ -173,7 +181,8 @@ class TestStepEnvBackupSigningKeyReference:
         steps = job["steps"]
         generate_step = None
         for step in steps:
-            if step.get("name") == "Generate minimal secrets placeholders":
+            name = step.get("name", "")
+            if "Generate secretless CI credentials" in name:
                 generate_step = step
                 break
         assert generate_step is not None
@@ -191,7 +200,8 @@ class TestStepEnvBackupSigningKeyReference:
         steps = job["steps"]
         generate_step = None
         for step in steps:
-            if step.get("name") == "Generate minimal secrets placeholders":
+            name = step.get("name", "")
+            if "Generate secretless CI credentials" in name:
                 generate_step = step
                 break
         assert generate_step is not None

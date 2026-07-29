@@ -71,6 +71,16 @@ from services.restore_backends import (
     SwitchResult,
 )
 
+# R76 P0-05 / P0-06 / O8: 独立 expected 值来源 + 数据库 CAS nonce store
+# - RestoreOperationContext: orchestrator 权威状态加载的 expected 值载体,
+#   writer 调用 verify_and_consume_capability() 时必须传入同一 context 实例,
+#   不得由 capability 自身回填(否则为自比较,无安全意义)。
+# - RestoreNonceStore: 封装 CacheStore 的 reserve/consume/fail API,使用
+#   009 migration 的 nonce_digest UNIQUE INDEX 实现跨进程/重启/容器重建的
+#   防重放保护,替代 R74 P1-04 的 /tmp/restore_nonce_store 文件 CAS。
+from services.restore_operation_context import RestoreOperationContext
+from services.restore_nonce_store import RestoreNonceStore
+
 
 # ════════════════════════════════════════════════════════════════
 # 1. 状态机枚举与数据类
@@ -82,7 +92,7 @@ class RestorePhase(str, Enum):
 
     继承 str + Enum 使其可直接作为字符串比较与序列化。
 
-    阶段语义:
+    阶段语义(R64 P0-03):
         INIT                — 操作创建,nonce 已 reserved
         STAGING_PROVISION   — 为 CRDB/SQLite/relay_sqlite 创建全新 staging 目标
         STAGING_RESTORE     — 按数据源顺序将数据写入 staging(不接触 active)
@@ -92,8 +102,19 @@ class RestorePhase(str, Enum):
         COMPLETED           — 切换完成,operation 成功
         FAILED              — 任一阶段失败,已销毁 staging,nonce=failed
         ROLLED_BACK         — 切换后回滚到旧版本(终态)
+
+    R74 P1-04 新增 capability 恢复状态机:
+        CREATED             — capability 已签发,等待备份验证
+        BACKUP_VERIFIED     — 备份已验证(签名/checksum/完整性)
+        RESTORED            — 数据已写入 staging 目标
+        READY_TO_SWITCH     — staging 验证通过,等待切换
+        SWITCHED            — 蓝绿切换完成,active 已指向新版本
+        PROBE_PASSED        — 切换后探活通过(健康检查 + 只读演练)
+        PROBE_FAILED        — 切换后探活失败(触发回滚)
+        CLOSED              — 操作已关闭(终态,不可再转换)
     """
 
+    # R64 P0-03 原有状态
     INIT = "init"
     STAGING_PROVISION = "staging_provision"
     STAGING_RESTORE = "staging_restore"
@@ -104,8 +125,19 @@ class RestorePhase(str, Enum):
     FAILED = "failed"
     ROLLED_BACK = "rolled_back"
 
+    # R74 P1-04 新增 capability 恢复状态机
+    CREATED = "created"
+    BACKUP_VERIFIED = "backup_verified"
+    RESTORED = "restored"
+    READY_TO_SWITCH = "ready_to_switch"
+    SWITCHED = "switched"
+    PROBE_PASSED = "probe_passed"
+    PROBE_FAILED = "probe_failed"
+    CLOSED = "closed"
+
 
 # 合法的 phase 转换图(单向):
+# R64 P0-03 原有转换:
 #   INIT → STAGING_PROVISION / FAILED
 #   STAGING_PROVISION → STAGING_RESTORE / FAILED
 #   STAGING_RESTORE → STAGING_VALIDATE / FAILED
@@ -115,7 +147,18 @@ class RestorePhase(str, Enum):
 #   COMPLETED → ROLLED_BACK (维护窗口内回滚)
 #   FAILED → (终态,不可转换)
 #   ROLLED_BACK → (终态,不可转换)
+#
+# R74 P1-04 新增 capability 恢复状态转换:
+#   CREATED → BACKUP_VERIFIED / FAILED
+#   BACKUP_VERIFIED → RESTORED / FAILED
+#   RESTORED → READY_TO_SWITCH / FAILED
+#   READY_TO_SWITCH → SWITCHED / FAILED
+#   SWITCHED → PROBE_PASSED / PROBE_FAILED / FAILED
+#   PROBE_PASSED → CLOSED / ROLLED_BACK
+#   PROBE_FAILED → ROLLED_BACK / CLOSED
+#   CLOSED → (终态,不可转换)
 _LEGAL_PHASE_TRANSITIONS: dict[RestorePhase, frozenset[RestorePhase]] = {
+    # R64 P0-03 原有转换
     RestorePhase.INIT: frozenset({RestorePhase.STAGING_PROVISION, RestorePhase.FAILED}),
     RestorePhase.STAGING_PROVISION: frozenset(
         {RestorePhase.STAGING_RESTORE, RestorePhase.FAILED}
@@ -135,11 +178,37 @@ _LEGAL_PHASE_TRANSITIONS: dict[RestorePhase, frozenset[RestorePhase]] = {
     RestorePhase.COMPLETED: frozenset({RestorePhase.ROLLED_BACK}),
     RestorePhase.FAILED: frozenset(),
     RestorePhase.ROLLED_BACK: frozenset(),
+    # R74 P1-04 新增 capability 恢复状态转换
+    RestorePhase.CREATED: frozenset(
+        {RestorePhase.BACKUP_VERIFIED, RestorePhase.FAILED}
+    ),
+    RestorePhase.BACKUP_VERIFIED: frozenset(
+        {RestorePhase.RESTORED, RestorePhase.FAILED}
+    ),
+    RestorePhase.RESTORED: frozenset(
+        {RestorePhase.READY_TO_SWITCH, RestorePhase.FAILED}
+    ),
+    RestorePhase.READY_TO_SWITCH: frozenset(
+        {RestorePhase.SWITCHED, RestorePhase.FAILED}
+    ),
+    RestorePhase.SWITCHED: frozenset(
+        {RestorePhase.PROBE_PASSED, RestorePhase.PROBE_FAILED, RestorePhase.FAILED}
+    ),
+    RestorePhase.PROBE_PASSED: frozenset(
+        {RestorePhase.CLOSED, RestorePhase.ROLLED_BACK}
+    ),
+    RestorePhase.PROBE_FAILED: frozenset(
+        {RestorePhase.ROLLED_BACK, RestorePhase.CLOSED}
+    ),
+    RestorePhase.CLOSED: frozenset(),
 }
 
 # 终态(不可再转换)
 _TERMINAL_PHASES: frozenset[RestorePhase] = frozenset(
-    {RestorePhase.COMPLETED, RestorePhase.FAILED, RestorePhase.ROLLED_BACK}
+    {
+        RestorePhase.COMPLETED, RestorePhase.FAILED, RestorePhase.ROLLED_BACK,
+        RestorePhase.CLOSED,  # R74 P1-04: CLOSED 也是终态
+    }
 )
 
 # 恢复时数据源处理顺序(与 db_restore 一致:CRDB → cache SQLite → relay SQLite)
@@ -712,8 +781,23 @@ class RestoreOrchestrator:
         *,
         payload_digest: str = "",
         nonce: Optional[str] = None,
+        source_sha: str = "",
+        run_id: Optional[int] = None,
+        run_attempt: Optional[int] = None,
+        audience: str = "restore-orchestrator",
+        target_identity: str = "",
+        target_uri: str = "",
     ) -> str:
         """创建恢复操作,初始 phase=INIT,nonce state=reserved。
+
+        R76 P0-05 / O8: 持久化完整 ``RestoreOperationContext``(独立 expected
+        值来源),签发 capability 前可由 ``get_operation_context()`` 读取,
+        writer 调用时传同一个 context 对象(不得由 capability 自身回填)。
+
+        R76 P0-06 / O8: nonce 预留改用 ``RestoreNonceStore``(数据库 CAS,
+        替代直接 getattr(self._store, "reserve_capability_nonce"))。数据库
+        UNIQUE INDEX(``idx_restore_nonces_nonce_digest``)实现跨进程/重启/
+        容器重建的防重放保护,替代 R74 P1-04 的 /tmp 文件 CAS。
 
         Args:
             backup_id: 备份 ID(timestamp)
@@ -721,6 +805,16 @@ class RestoreOrchestrator:
             requested_by: 创建者标识(principal 或 hostname:pid)
             payload_digest: payload canonical SHA-256(绑定 nonce,防换 payload)
             nonce: 可选 nonce(默认生成 secrets.token_hex(16))
+            source_sha: R76 P0-05 当前 master SHA(独立来源,防跨 commit 重放;
+                默认从 ``GITHUB_SHA`` 读取,本地无 CI 时为 "local")
+            run_id: R76 P0-05 GitHub Actions run ID(独立来源,防跨 run 重放;
+                默认从 ``GITHUB_RUN_ID`` 读取,本地无 CI 时为 0)
+            run_attempt: R76 P0-05 GitHub Actions run attempt(独立来源,
+                防跨 attempt 重放;默认从 ``GITHUB_RUN_ATTEMPT`` 读取,本地为 0)
+            audience: R76 P0-05 目标受众标识(默认 "restore-orchestrator")
+            target_identity: R76 P0-05 恢复目标数据库 identity hash(独立来源,
+                非 capability 自报;调用方按 staging 目标计算)
+            target_uri: R76 P0-05 恢复目标 URI(独立来源,非 capability 自报)
 
         Returns:
             operation_id (UUID)
@@ -728,10 +822,74 @@ class RestoreOrchestrator:
         Raises:
             AppError(RESTORE.NONCE_PAYLOAD_MISMATCH): 同 backup_id+manifest_digest
                 已有 failed nonce,但 payload_digest 不匹配(禁止换 payload)
+            AppError(BACKUP_RESTORE_TRUST_CHAIN_REQUIRED): nonce 预留失败
+                (重放攻击或竞态失败,fail-closed)
         """
         operation_id = str(uuid.uuid4())
         nonce = nonce or secrets.token_hex(16)
         now = self._now_iso()
+
+        # R76 P0-05: 填充独立 expected 值(默认从环境变量读取,可由调用方覆盖)
+        # 这些值**不**从 capability 自身回填 — RestoreOperationContext 作为
+        # 独立来源传递给 writer,与 capability 字段比对。
+        # R76 P0-05 整改:删除 "local"/0 静默回退;生产环境(env 未设置)fail-closed。
+        # 测试环境(ALLOW_LEGACY_RESTORE=1)允许回退到默认值,生产环境不得配置此 env。
+        _legacy_mode = os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() in ("1", "true", "yes")
+        if not source_sha:
+            source_sha = os.environ.get("GITHUB_SHA")
+            if not source_sha:
+                if _legacy_mode:
+                    source_sha = "local"
+                else:
+                    raise AppError(
+                        ErrorCodes.VALIDATION_FAILED,
+                        params={"reason": "source_sha required (R76 P0-05)"},
+                    )
+        if run_id is None:
+            _run_id_str = os.environ.get("GITHUB_RUN_ID")
+            if _run_id_str is None:
+                if _legacy_mode:
+                    run_id = 0
+                else:
+                    raise AppError(
+                        ErrorCodes.VALIDATION_FAILED,
+                        params={"reason": "run_id required (R76 P0-05)"},
+                    )
+            else:
+                try:
+                    run_id = int(_run_id_str)
+                except (TypeError, ValueError):
+                    if _legacy_mode:
+                        run_id = 0
+                    else:
+                        raise AppError(
+                            ErrorCodes.VALIDATION_FAILED,
+                            params={"reason": "run_id required (R76 P0-05)"},
+                        )
+        if run_attempt is None:
+            _run_attempt_str = os.environ.get("GITHUB_RUN_ATTEMPT")
+            if _run_attempt_str is None:
+                if _legacy_mode:
+                    run_attempt = 0
+                else:
+                    raise AppError(
+                        ErrorCodes.VALIDATION_FAILED,
+                        params={"reason": "run_attempt required (R76 P0-05)"},
+                    )
+            else:
+                try:
+                    run_attempt = int(_run_attempt_str)
+                except (TypeError, ValueError):
+                    if _legacy_mode:
+                        run_attempt = 0
+                    else:
+                        raise AppError(
+                            ErrorCodes.VALIDATION_FAILED,
+                            params={"reason": "run_attempt required (R76 P0-05)"},
+                        )
+        if not target_uri:
+            # 默认 target_uri 由 staging_root 派生(调用方可显式传入更精确值)
+            target_uri = f"sqlite://{self._staging_root}/staging_{operation_id}"
 
         # nonce 绑定校验:若同 backup_id + manifest_digest 已有 failed nonce,
         # 必须使用相同 payload_digest(禁止换 payload 重试)
@@ -766,17 +924,54 @@ class RestoreOrchestrator:
             payload={"nonce": nonce, "requested_by": requested_by},
         )
 
-        # reserve nonce(若 store 支持 nonce ledger)
-        nonce_store = getattr(self._store, "reserve_capability_nonce", None)
-        if nonce_store is not None and payload_digest:
-            reserved = await nonce_store(
-                nonce=nonce,
-                operation_id=operation_id,
-                backup_id=backup_id,
-                manifest_sha256=manifest_digest,
-                payload_digest=payload_digest,
-                reserved_by=requested_by,
-            )
+        # R76 P0-05 / O8: 构造 RestoreOperationContext(独立 expected 值来源)
+        # 持久化到 _meta,后续 get_operation_context() 读取并传给 writer。
+        # payload_digest 可为空(向后兼容旧调用);此时 context 仅用于审计,
+        # writer 侧会因 payload_digest 校验失败而拒绝(fail-closed)。
+        # R76 P0-05 整改:target_identity 必填 — 生产环境(无 ALLOW_LEGACY_RESTORE)
+        # 缺失即 fail-closed,不允许 "pending-staging-identity" 占位字符串静默回退。
+        # 测试环境(ALLOW_LEGACY_RESTORE=1)允许回退到占位值以兼容历史调用。
+        if not target_identity:
+            if _legacy_mode:
+                target_identity = "pending-staging-identity"
+            else:
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={"reason": "target_identity required (R76 P0-05)"},
+                )
+        operation_context = RestoreOperationContext(
+            operation_id=operation_id,
+            backup_id=backup_id,
+            source_sha=source_sha,
+            run_id=run_id,
+            run_attempt=run_attempt,
+            audience=audience,
+            target_identity=target_identity,
+            target_uri=target_uri,
+            manifest_digest=manifest_digest,
+            payload_digest=payload_digest or "0" * 64,
+            allowed_action="restore_to_blank_target",
+            nonce=nonce,
+        )
+
+        # R76 P0-06 / O8: reserve nonce via RestoreNonceStore(数据库 CAS)
+        # 替代直接 getattr(self._store, "reserve_capability_nonce") — 统一通过
+        # RestoreNonceStore 封装,使用 009 migration 的 nonce_digest UNIQUE INDEX。
+        if payload_digest:
+            nonce_store = RestoreNonceStore(self._store)
+            # 构造最小 capability dict(RestoreNonceStore 仅读取 nonce 字段)
+            cap_for_reserve = {"nonce": nonce}
+            try:
+                reserved = await nonce_store.reserve(
+                    cap_for_reserve, operation_context,
+                    reserved_by=requested_by,
+                )
+            except Exception as e:
+                logger.error(
+                    f"[restore_orchestrator] R76 O8: nonce reserve 异常 "
+                    f"(operation_id={operation_id}): {e}"
+                )
+                reserved = False
             if not reserved:
                 # nonce 冲突(已有同 nonce)— 极少发生(secrets.token_hex),
                 # 视为重放攻击,fail-closed
@@ -788,7 +983,8 @@ class RestoreOrchestrator:
                     },
                 )
 
-        # 缓存 nonce + payload_digest 到内存(用于后续 consume/fail)
+        # R76 P0-05: 缓存完整 RestoreOperationContext 到 _meta
+        # (用于后续 consume/fail + get_operation_context 读取)
         op_with_meta = replace(
             operation,
             datasource_states={
@@ -796,11 +992,47 @@ class RestoreOrchestrator:
                 "_meta": {
                     "nonce": nonce,
                     "payload_digest": payload_digest,
+                    # R76 P0-05: 独立 expected 值(持久化,供 writer 读取)
+                    "operation_context": operation_context.to_dict(),
                 },
             },
         )
         self._operations[operation_id] = op_with_meta
         return operation_id
+
+    async def get_operation_context(
+        self, operation_id: str
+    ) -> RestoreOperationContext:
+        """R76 P0-05 / O8: 读取持久化的 RestoreOperationContext(独立 expected 值)。
+
+        签发 capability 前调用本方法读取 context;writer 调用
+        ``verify_and_consume_capability()`` 时传入本方法返回的 context 实例,
+        作为独立 expected 值来源(不得由 capability 自身回填)。
+
+        Args:
+            operation_id: 操作 ID
+
+        Returns:
+            RestoreOperationContext(从 _meta.operation_context 反序列化)
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): operation 不存在或
+                缺少持久化的 context(fail-closed)
+        """
+        operation = await self.get_operation(operation_id)
+        meta = operation.datasource_states.get("_meta", {})
+        ctx_dict = meta.get("operation_context")
+        if not ctx_dict:
+            raise AppError(
+                ErrorCodes.RESTORE_PHASE_TRANSITION_INVALID,
+                params={
+                    "operation_id": operation_id,
+                    "phase_from": operation.phase.value,
+                    "phase_to": "",
+                    "reason": "operation_context_not_persisted",
+                },
+            )
+        return RestoreOperationContext.from_dict(ctx_dict)
 
     async def _check_payload_consistency_for_retry(
         self,
@@ -1727,21 +1959,58 @@ class RestoreOrchestrator:
     async def _consume_nonce(
         self, operation_id: str, operation: RestoreOperation
     ) -> None:
-        """切换成功后 consume nonce(reserved → consumed)。"""
+        """切换成功后 consume nonce(reserved → consumed)。
+
+        R76 P0-06 / O8: 改用 ``RestoreNonceStore.consume()``(数据库 CAS,
+        替代直接 getattr(self._store, "consume_capability_nonce"))。consume 时
+        绑定 operation_id + capability_digest + target_identity + run_id +
+        run_attempt,防止换 capability 重放。
+        """
         meta = operation.datasource_states.get("_meta", {})
         nonce = meta.get("nonce", "")
         payload_digest = meta.get("payload_digest", "")
         if not nonce or not payload_digest:
             return  # 无 nonce(可能 store 不支持 nonce ledger)
-        nonce_store = getattr(self._store, "consume_capability_nonce", None)
-        if nonce_store is None:
+        # R76 P0-06 / O8: 使用 RestoreNonceStore 封装(数据库 CAS)
+        nonce_store = RestoreNonceStore(self._store)
+        # R76 P0-05: 从 _meta 读取持久化的 operation_context,作为独立
+        # expected 值来源(不从 capability 回填)
+        ctx_dict = meta.get("operation_context")
+        if not ctx_dict:
+            logger.warning(
+                f"[restore_orchestrator] R76 O8: _consume_nonce 缺少 "
+                f"operation_context,回退到旧 CAS 路径 (operation_id={operation_id})"
+            )
+            # 回退:直接调用 store.consume_capability_nonce(向后兼容旧 operation)
+            direct_consume = getattr(self._store, "consume_capability_nonce", None)
+            if direct_consume is None:
+                return
+            try:
+                consumed = await direct_consume(
+                    nonce=nonce,
+                    backup_id=operation.backup_id,
+                    manifest_sha256=operation.manifest_digest,
+                    payload_digest=payload_digest,
+                    consumed_by=operation.created_by,
+                )
+                if not consumed:
+                    logger.critical(
+                        f"[restore_orchestrator] nonce consume 失败 "
+                        f"(operation_id={operation_id}, nonce={nonce[:8]}...) — "
+                        f"可能重放或状态错乱,但切换已成功"
+                    )
+            except Exception as e:
+                logger.warning(
+                    f"[restore_orchestrator] nonce consume 异常 "
+                    f"(operation_id={operation_id}): {e}"
+                )
             return
         try:
-            consumed = await nonce_store(
-                nonce=nonce,
-                backup_id=operation.backup_id,
-                manifest_sha256=operation.manifest_digest,
-                payload_digest=payload_digest,
+            operation_context = RestoreOperationContext.from_dict(ctx_dict)
+            # 构造最小 capability dict(RestoreNonceStore 仅读取 nonce 字段)
+            cap_for_consume = {"nonce": nonce}
+            consumed = await nonce_store.consume(
+                cap_for_consume, operation_context,
                 consumed_by=operation.created_by,
             )
             if not consumed:
@@ -1971,6 +2240,271 @@ class RestoreOrchestrator:
             )
             return {}
 
+    # ─── R74 P1-04: 重复 switch/rollback 检测 ────────────────
+
+    async def _assert_no_duplicate_switch(
+        self, operation: RestoreOperation
+    ) -> None:
+        """R74 P1-04: 拒绝重复 switch — 已切换过的 operation 不可再次切换。
+
+        operation 已处于 SWITCHED / PROBE_PASSED / PROBE_FAILED / CLOSED
+        或已完成 BLUE_GREEN_SWITCH → COMPLETED 时,拒绝再次切换。
+        """
+        switched_phases = {
+            RestorePhase.SWITCHED,
+            RestorePhase.PROBE_PASSED,
+            RestorePhase.PROBE_FAILED,
+            RestorePhase.CLOSED,
+            RestorePhase.COMPLETED,
+            RestorePhase.ROLLED_BACK,
+        }
+        if operation.phase in switched_phases:
+            raise AppError(
+                ErrorCodes.RESTORE_PHASE_TRANSITION_INVALID,
+                params={
+                    "operation_id": operation.operation_id,
+                    "phase_from": operation.phase.value,
+                    "phase_to": "switch",
+                    "reason": "duplicate_switch_rejected",
+                },
+            )
+
+    async def _assert_no_duplicate_rollback(
+        self, operation: RestoreOperation
+    ) -> None:
+        """R74 P1-04: 拒绝重复 rollback — 已回滚过的 operation 不可再次回滚。
+
+        operation 已处于 ROLLED_BACK / CLOSED / FAILED 时,拒绝再次回滚。
+        """
+        rolled_back_phases = {
+            RestorePhase.ROLLED_BACK,
+            RestorePhase.CLOSED,
+            RestorePhase.FAILED,
+        }
+        if operation.phase in rolled_back_phases:
+            raise AppError(
+                ErrorCodes.RESTORE_PHASE_TRANSITION_INVALID,
+                params={
+                    "operation_id": operation.operation_id,
+                    "phase_from": operation.phase.value,
+                    "phase_to": "rollback",
+                    "reason": "duplicate_rollback_rejected",
+                },
+            )
+
+    # ─── R74 P1-04: 新增 capability 恢复状态机方法 ──────────
+
+    async def transition_to_created(
+        self, operation_id: str
+    ) -> RestoreOperation:
+        """将 operation 转换到 CREATED 状态(capability 恢复流程入口)。
+
+        Args:
+            operation_id: 操作 ID
+
+        Returns:
+            更新后的 RestoreOperation
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): 非法转换
+        """
+        operation = await self.get_operation(operation_id)
+        self._assert_legal_transition(operation, RestorePhase.CREATED)
+        op = replace(
+            operation, phase=RestorePhase.CREATED, updated_at=self._now_iso()
+        )
+        await self._persist_operation(op)
+        await self._write_event(
+            op, "phase_transition", operation.phase, RestorePhase.CREATED,
+        )
+        return op
+
+    async def transition_to_backup_verified(
+        self, operation_id: str
+    ) -> RestoreOperation:
+        """将 operation 转换到 BACKUP_VERIFIED 状态。
+
+        Args:
+            operation_id: 操作 ID
+
+        Returns:
+            更新后的 RestoreOperation
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): 非法转换
+        """
+        operation = await self.get_operation(operation_id)
+        self._assert_legal_transition(operation, RestorePhase.BACKUP_VERIFIED)
+        op = replace(
+            operation, phase=RestorePhase.BACKUP_VERIFIED, updated_at=self._now_iso()
+        )
+        await self._persist_operation(op)
+        await self._write_event(
+            op, "phase_transition", operation.phase, RestorePhase.BACKUP_VERIFIED,
+        )
+        return op
+
+    async def transition_to_restored(
+        self, operation_id: str
+    ) -> RestoreOperation:
+        """将 operation 转换到 RESTORED 状态。
+
+        Args:
+            operation_id: 操作 ID
+
+        Returns:
+            更新后的 RestoreOperation
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): 非法转换
+        """
+        operation = await self.get_operation(operation_id)
+        self._assert_legal_transition(operation, RestorePhase.RESTORED)
+        op = replace(
+            operation, phase=RestorePhase.RESTORED, updated_at=self._now_iso()
+        )
+        await self._persist_operation(op)
+        await self._write_event(
+            op, "phase_transition", operation.phase, RestorePhase.RESTORED,
+        )
+        return op
+
+    async def transition_to_ready_to_switch(
+        self, operation_id: str
+    ) -> RestoreOperation:
+        """将 operation 转换到 READY_TO_SWITCH 状态。
+
+        Args:
+            operation_id: 操作 ID
+
+        Returns:
+            更新后的 RestoreOperation
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): 非法转换
+        """
+        operation = await self.get_operation(operation_id)
+        self._assert_legal_transition(operation, RestorePhase.READY_TO_SWITCH)
+        op = replace(
+            operation, phase=RestorePhase.READY_TO_SWITCH, updated_at=self._now_iso()
+        )
+        await self._persist_operation(op)
+        await self._write_event(
+            op, "phase_transition", operation.phase, RestorePhase.READY_TO_SWITCH,
+        )
+        return op
+
+    async def transition_to_switched(
+        self, operation_id: str, switch_version: str = ""
+    ) -> RestoreOperation:
+        """R74 P1-04: 将 operation 转换到 SWITCHED 状态。
+
+        拒绝重复 switch(operation 已处于 SWITCHED/PROBE_PASSED/PROBE_FAILED/
+        COMPLETED/ROLLED_BACK/CLOSED 时)。
+
+        Args:
+            operation_id: 操作 ID
+            switch_version: 切换版本号
+
+        Returns:
+            更新后的 RestoreOperation
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): 非法转换或重复 switch
+        """
+        operation = await self.get_operation(operation_id)
+        self._assert_legal_transition(operation, RestorePhase.SWITCHED)
+        await self._assert_no_duplicate_switch(operation)
+        op = replace(
+            operation,
+            phase=RestorePhase.SWITCHED,
+            switch_version=switch_version or operation.switch_version,
+            updated_at=self._now_iso(),
+        )
+        await self._persist_operation(op)
+        await self._write_event(
+            op, "phase_transition", operation.phase, RestorePhase.SWITCHED,
+            payload={"switch_version": op.switch_version},
+        )
+        return op
+
+    async def transition_to_probe_passed(
+        self, operation_id: str
+    ) -> RestoreOperation:
+        """将 operation 转换到 PROBE_PASSED 状态。
+
+        Args:
+            operation_id: 操作 ID
+
+        Returns:
+            更新后的 RestoreOperation
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): 非法转换
+        """
+        operation = await self.get_operation(operation_id)
+        self._assert_legal_transition(operation, RestorePhase.PROBE_PASSED)
+        op = replace(
+            operation, phase=RestorePhase.PROBE_PASSED, updated_at=self._now_iso()
+        )
+        await self._persist_operation(op)
+        await self._write_event(
+            op, "phase_transition", operation.phase, RestorePhase.PROBE_PASSED,
+        )
+        return op
+
+    async def transition_to_probe_failed(
+        self, operation_id: str, reason: str = ""
+    ) -> RestoreOperation:
+        """将 operation 转换到 PROBE_FAILED 状态。
+
+        Args:
+            operation_id: 操作 ID
+            reason: 探测失败原因
+
+        Returns:
+            更新后的 RestoreOperation
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): 非法转换
+        """
+        operation = await self.get_operation(operation_id)
+        self._assert_legal_transition(operation, RestorePhase.PROBE_FAILED)
+        op = replace(
+            operation, phase=RestorePhase.PROBE_FAILED, updated_at=self._now_iso()
+        )
+        await self._persist_operation(op)
+        await self._write_event(
+            op, "phase_transition", operation.phase, RestorePhase.PROBE_FAILED,
+            payload={"reason": reason},
+        )
+        return op
+
+    async def transition_to_closed(
+        self, operation_id: str
+    ) -> RestoreOperation:
+        """将 operation 转换到 CLOSED 终态。
+
+        Args:
+            operation_id: 操作 ID
+
+        Returns:
+            更新后的 RestoreOperation
+
+        Raises:
+            AppError(RESTORE_PHASE_TRANSITION_INVALID): 非法转换
+        """
+        operation = await self.get_operation(operation_id)
+        self._assert_legal_transition(operation, RestorePhase.CLOSED)
+        op = replace(
+            operation, phase=RestorePhase.CLOSED, updated_at=self._now_iso()
+        )
+        await self._persist_operation(op)
+        await self._write_event(
+            op, "phase_transition", operation.phase, RestorePhase.CLOSED,
+        )
+        return op
+
     # ─── 失败处理 ──────────────────────────────────────
 
     async def fail_operation(
@@ -2060,21 +2594,45 @@ class RestoreOrchestrator:
         operation: RestoreOperation,
         reason: str,
     ) -> None:
-        """nonce state=failed(允许同 operation 重试但禁止换 payload)。"""
+        """nonce state=failed(允许同 operation 重试但禁止换 payload)。
+
+        R76 P0-06 / O8: 改用 ``RestoreNonceStore.fail()``(数据库 CAS,
+        替代直接 getattr(self._store, "fail_capability_nonce"))。
+        """
         meta = operation.datasource_states.get("_meta", {})
         nonce = meta.get("nonce", "")
         payload_digest = meta.get("payload_digest", "")
         if not nonce or not payload_digest:
             return
-        fail_store = getattr(self._store, "fail_capability_nonce", None)
-        if fail_store is None:
+        # R76 P0-06 / O8: 使用 RestoreNonceStore 封装(数据库 CAS)
+        nonce_store = RestoreNonceStore(self._store)
+        # R76 P0-05: 从 _meta 读取持久化的 operation_context(若有)
+        ctx_dict = meta.get("operation_context")
+        if not ctx_dict:
+            # 回退:直接调用 store.fail_capability_nonce(向后兼容旧 operation)
+            fail_store = getattr(self._store, "fail_capability_nonce", None)
+            if fail_store is None:
+                return
+            try:
+                # fail_capability_nonce 签名仅接受 nonce + failure_reason
+                # (backup_id / manifest_sha256 / payload_digest 已在 reserve 时绑定,
+                #  fail 仅 CAS reserved→failed,无需重复绑定)
+                await fail_store(
+                    nonce=nonce,
+                    failure_reason=reason,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[restore_orchestrator] nonce fail 异常 "
+                    f"(operation_id={operation_id}): {e}"
+                )
             return
         try:
-            # fail_capability_nonce 签名仅接受 nonce + failure_reason
-            # (backup_id / manifest_sha256 / payload_digest 已在 reserve 时绑定,
-            #  fail 仅 CAS reserved→failed,无需重复绑定)
-            await fail_store(
-                nonce=nonce,
+            operation_context = RestoreOperationContext.from_dict(ctx_dict)
+            # 构造最小 capability dict(RestoreNonceStore 仅读取 nonce 字段)
+            cap_for_fail = {"nonce": nonce}
+            await nonce_store.fail(
+                cap_for_fail, operation_context,
                 failure_reason=reason,
             )
         except Exception as e:

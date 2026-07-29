@@ -1,4 +1,4 @@
-# R71 P1-06: PR 合并后自动删除 head 分支
+﻿# R71 P1-06: PR 合并后自动删除 head 分支
 #
 # 单人项目治理基线: 残留分支会增加误构建风险(例如 CI 意外触发旧分支)。
 # 本工作流在 PR 合并后自动删除 head 分支,避免人工遗忘。
@@ -32,7 +32,8 @@ jobs:
     if: github.event.pull_request.merged == true
     steps:
       - name: Checkout base
-        uses: actions/checkout@v4
+        # R75 P2-01: 固定完整 commit SHA,禁止 @v4 浮动 tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           # 使用 GITHUB_TOKEN 删除分支需要 write 权限
           token: ${{ secrets.GITHUB_TOKEN }}

@@ -85,6 +85,11 @@ class ErrorCodes:
     BACKUP_RESTORE_APPROVAL_INVALID = "BACKUP.RESTORE.APPROVAL_INVALID"
     BACKUP_RESTORE_CHECKSUM_MISMATCH = "BACKUP.RESTORE.CHECKSUM_MISMATCH"
     BACKUP_RESTORE_TRUST_CHAIN_REQUIRED = "BACKUP.RESTORE.TRUST_CHAIN_REQUIRED"
+    BACKUP_RESTORE_EXACT_CONTRACT_INVALID = "BACKUP.RESTORE.EXACT_CONTRACT_INVALID"
+    BACKUP_RESTORE_MANIFEST_DOWNLOAD_FAILED = "BACKUP.RESTORE.MANIFEST_DOWNLOAD_FAILED"
+    BACKUP_RESTORE_MANIFEST_BINDING_MISMATCH = "BACKUP.RESTORE.MANIFEST_BINDING_MISMATCH"
+    BACKUP_RESTORE_ENCRYPTION_REQUIRED = "BACKUP.RESTORE.ENCRYPTION_REQUIRED"
+    BACKUP_RESTORE_PAYLOAD_DOWNLOAD_FAILED = "BACKUP.RESTORE.PAYLOAD_DOWNLOAD_FAILED"
     # R64 P1-01: payload 含不可序列化类型(bytes/NaN/Infinity/自定义对象)— fail-closed
     # 禁止 default=str 静默字符串化,只允许 JSON schema 声明类型
     BACKUP_PAYLOAD_NOT_SERIALIZABLE = "BACKUP.PAYLOAD.NOT_SERIALIZABLE"
@@ -158,6 +163,14 @@ class ErrorCodes:
     BACKUP_DECRYPT_DEP_MISSING = "BACKUP.DECRYPT.DEP_MISSING"
     # BACKUP_KEK 未配置(services/backup_crypto.py)
     BACKUP_DECRYPT_KEK_MISSING = "BACKUP.DECRYPT.KEK_MISSING"
+    # R83: exact-contract 禁止 legacy AAD 时必须提供完整 AAD 上下文
+    BACKUP_DECRYPT_AAD_CONTEXT_REQUIRED = "BACKUP.DECRYPT.AAD_CONTEXT_REQUIRED"
+    # R83: Secretless restore/switch 合同边界统一 fail-closed 错误
+    SECRETLESS_CONTRACT_VIOLATION = "SECRETLESS.CONTRACT.VIOLATION"
+    SECRETLESS_INTERNAL_UNEXPECTED = "SECRETLESS.INTERNAL.UNEXPECTED"
+    SECRETLESS_SWITCH_INTERNAL_UNEXPECTED = "SECRETLESS_SWITCH.INTERNAL.UNEXPECTED"
+    # R73 §5.24: 解密器构建失败(services/db_backup.py:_build_db_backup_decryptor)
+    BACKUP_DECRYPTOR_BUILD_FAILED = "BACKUP.DECRYPTOR.BUILD_FAILED"
     # R2 凭证未配置(services/db_backup.py)
     BACKUP_RESTORE_R2_CREDENTIAL_MISSING = "BACKUP.RESTORE.R2_CREDENTIAL_MISSING"
     # 中继账号验证码获取失败(services/relay_instance.py)
@@ -991,7 +1004,6 @@ class ErrorRegistry:
               由调用方(模块加载块)根据 ``ERROR_CODES_LOCALE_STRICT`` 环境变量
               决定是 fail-closed(raise AppError)还是降级为 warning。
         """
-        import os as _os
         import re as _re
         from pathlib import Path as _Path
 
@@ -1744,6 +1756,44 @@ def _register_defaults() -> None:
         show_retry_button=False,
         audit_level="critical",
     ))
+    for code, message_key, retryable in (
+        (
+            ErrorCodes.BACKUP_RESTORE_EXACT_CONTRACT_INVALID,
+            "errors.backup.restore.exact_contract_invalid",
+            False,
+        ),
+        (
+            ErrorCodes.BACKUP_RESTORE_MANIFEST_DOWNLOAD_FAILED,
+            "errors.backup.restore.manifest_download_failed",
+            True,
+        ),
+        (
+            ErrorCodes.BACKUP_RESTORE_MANIFEST_BINDING_MISMATCH,
+            "errors.backup.restore.manifest_binding_mismatch",
+            False,
+        ),
+        (
+            ErrorCodes.BACKUP_RESTORE_ENCRYPTION_REQUIRED,
+            "errors.backup.restore.encryption_required",
+            False,
+        ),
+        (
+            ErrorCodes.BACKUP_RESTORE_PAYLOAD_DOWNLOAD_FAILED,
+            "errors.backup.restore.payload_download_failed",
+            True,
+        ),
+    ):
+        ErrorRegistry.register(ErrorDefinition(
+            code=code,
+            message_key=message_key,
+            http_status=500,
+            retryable=retryable,
+            severity="critical",
+            safe_params=["backup_id", "reason"],
+            presentation="inline",
+            show_retry_button=retryable,
+            audit_level="critical",
+        ))
 
     # ── EFFECT_RECEIPT ──
     ErrorRegistry.register(ErrorDefinition(
@@ -1961,7 +2011,7 @@ def _register_defaults() -> None:
         http_status=400,
         retryable=False,
         severity="info",
-        safe_params=["field"],
+        safe_params=["field", "reason"],
         presentation="silent",
         show_retry_button=False,
         audit_level="info",
@@ -2080,6 +2130,63 @@ def _register_defaults() -> None:
     ErrorRegistry.register(ErrorDefinition(
         code=ErrorCodes.BACKUP_DECRYPT_KEK_MISSING,
         message_key="errors.backup.decrypt.kek_missing",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=[],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # R83: exact-contract 禁止 legacy AAD 时必须提供完整上下文
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_DECRYPT_AAD_CONTEXT_REQUIRED,
+        message_key="errors.backup.decrypt.aad_context_required",
+        http_status=500,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    # R83: Secretless restore/switch 合同统一错误边界
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.SECRETLESS_CONTRACT_VIOLATION,
+        message_key="errors.secretless.contract.violation",
+        http_status=409,
+        retryable=False,
+        severity="critical",
+        safe_params=["reason", "component", "field"],
+        presentation="inline",
+        show_retry_button=False,
+        audit_level="critical",
+    ))
+    for code, message_key in (
+        (
+            ErrorCodes.SECRETLESS_INTERNAL_UNEXPECTED,
+            "errors.secretless.internal.unexpected",
+        ),
+        (
+            ErrorCodes.SECRETLESS_SWITCH_INTERNAL_UNEXPECTED,
+            "errors.secretless_switch.internal.unexpected",
+        ),
+    ):
+        ErrorRegistry.register(ErrorDefinition(
+            code=code,
+            message_key=message_key,
+            http_status=500,
+            retryable=False,
+            severity="critical",
+            safe_params=[],
+            presentation="inline",
+            show_retry_button=False,
+            audit_level="critical",
+        ))
+    # R73 §5.24: 解密器构建失败(services/db_backup.py:_build_db_backup_decryptor)
+    ErrorRegistry.register(ErrorDefinition(
+        code=ErrorCodes.BACKUP_DECRYPTOR_BUILD_FAILED,
+        message_key="errors.backup.decryptor.build_failed",
         http_status=500,
         retryable=False,
         severity="critical",

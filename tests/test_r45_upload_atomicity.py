@@ -610,14 +610,14 @@ class TestFinalizeUploadAtomicRollback:
             quota_reservation_id="",
         )
 
-        # Mock add_dirty_outbox 在第一次调用时抛异常
-        original_add_dirty = store.add_dirty_outbox
-        call_count = {"n": 0}
+        # Mock add_dirty_outbox 持久抛异常(模拟 dirty_outbox 不可用)
+        # R75 P0-07: upsert_file_record_local(mark_dirty=True) 内部会调用一次
+        # add_dirty_outbox(失败时被 upsert 内部 try/except 吞掉,仅 warning);
+        # finalize_upload 中的显式 add_dirty_outbox 是确保失败可抛异常的
+        # 主路径。因此 mock 必须在所有调用上都抛异常,才能让显式调用抛出
+        # 异常并触发整体 ROLLBACK。
         async def _failing_add_dirty(*args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                raise RuntimeError("simulated dirty_outbox failure")
-            return await original_add_dirty(*args, **kwargs)
+            raise RuntimeError("simulated dirty_outbox failure")
         monkeypatch.setattr(store, "add_dirty_outbox", _failing_add_dirty)
 
         # finalize_upload 应抛异常

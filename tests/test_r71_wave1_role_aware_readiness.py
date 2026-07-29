@@ -1046,14 +1046,26 @@ class TestDeprecatedWrappers:
         assert callable(collect_dependency_status)
 
     def test_prometheus_exporter_wrapper_calls_new_function(self):
-        """deprecated check_readiness 应调用 collect_dependency_status。"""
+        """deprecated check_readiness 应调用 collect_dependency_status 并返回相同判定。
+
+        契约语义(wrapper 与真实函数返回相同 readiness 判定):比较判定字段
+        ready / passed / checks。返回值中的时间衍生字段(startup_grace_remaining_seconds、
+        last_crdb_sync_age、last_r2_collect_age、ru_daily_usage、details 内含 age 字符串、
+        checked_at)由运行时状态决定,两次连续调用之间必然漂移,不参与等价比较 —
+        否则 CI 会在 grace period / 采集节拍边界随机失败。
+        """
         from services.prometheus_exporter import (
             check_readiness, collect_dependency_status,
         )
-        # 两者应返回相同结果
+        DECISION_KEYS = ("ready", "passed", "checks")
         r1 = check_readiness()
         r2 = collect_dependency_status()
-        assert r1 == r2
+        r1_decision = {k: r1.get(k) for k in DECISION_KEYS}
+        r2_decision = {k: r2.get(k) for k in DECISION_KEYS}
+        assert r1_decision == r2_decision, (
+            f"deprecated wrapper 判定与 collect_dependency_status 不一致: "
+            f"wrapper={r1_decision}, collect={r2_decision}"
+        )
 
     def test_maintenance_mode_check_readiness_wrapper_exists(self):
         """maintenance_mode.check_readiness 应作为 deprecated wrapper 存在。"""

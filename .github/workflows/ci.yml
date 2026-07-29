@@ -35,10 +35,10 @@ jobs:
         python-version: ['3.10', '3.11', '3.12']
 
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: ${{ matrix.python-version }}
 
@@ -65,16 +65,75 @@ jobs:
         # (此前 r40-collector 后台线程 + dsp_bot 限速器累积导致 CI 卡 50+ 分钟)
         # R71 RC43: timeout --signal=KILL 兜底 — 即使 aiosqlite 后台线程导致
         # pytest 退出阶段挂起,也能在测试完成后 10 分钟被强制终止。
-        # 根因: aiosqlite._connection_worker_thread 在事件循环关闭后仍运行,
-        # pytest_sessionfinish hook 尝试清理但可能无法覆盖所有场景。
-        timeout --signal=KILL 50m python -m pytest tests/ -v --tb=short --maxfail=5 --timeout=120 --cov=services --cov=database --cov=utils --cov=bots --cov=admin --cov-report=xml:coverage.xml --cov-report=term-missing
+        # R78 10.5: 使用 pipefail + tee 确保 pytest 输出总是落盘,
+        # 同时生成 junitxml 报告供 artifact upload 使用。
+        # R79 §10.7: coverage/junit 输出路径统一到 artifacts/pytest/,
+        # 不再同时上传根目录 coverage.xml(P1-03:coverage artifact 仍缺失)。
+        # R81 §10.7: 保留 pytest 原始退出码,junit/coverage 缺失不得覆盖首错。
+        mkdir -p artifacts/pytest
+        set -o pipefail
+        timeout --signal=KILL 50m python -m pytest tests/ -v --tb=short --maxfail=5 --timeout=120 \
+          --cov=services --cov=database --cov=utils --cov=bots --cov=admin \
+          --cov-report=xml:artifacts/pytest/coverage-${{ matrix.python-version }}.xml \
+          --cov-report=term-missing \
+          --junitxml=artifacts/pytest/junit-${{ matrix.python-version }}.xml \
+          2>&1 | tee artifacts/pytest/pytest-${{ matrix.python-version }}.log
+        TEST_EXIT=${PIPESTATUS[0]}
+        # R81 §10.7: 保存 pytest 原始退出码到 artifact(供后续步骤与诊断使用)
+        printf '%s\n' "$TEST_EXIT" > "artifacts/pytest/pytest-${{ matrix.python-version }}.exitcode"
+        # R81 §10.7: junit/log 缺失只记录 secondary error,不覆盖 pytest 首错。
+        # pytest 成功时 junit/log 必须存在(否则测试基础设施有问题);
+        # pytest 失败时允许 junit 缺失(如 segfault),但必须有 pytest log。
+        ARTIFACT_EXIT=0
+        test -s "artifacts/pytest/junit-${{ matrix.python-version }}.xml" || ARTIFACT_EXIT=20
+        test -s "artifacts/pytest/pytest-${{ matrix.python-version }}.log" || ARTIFACT_EXIT=21
+        if [ "$TEST_EXIT" -ne 0 ]; then
+          # pytest 失败 — 保留原始失败退出码(首错优先)
+          if [ "$ARTIFACT_EXIT" -ne 0 ]; then
+            echo "::warning::artifact check also failed (exit=$ARTIFACT_EXIT) but pytest failure is primary" >&2
+          fi
+          exit "$TEST_EXIT"
+        fi
+        # pytest 成功 — 此时 artifact 缺失才是真正的失败
+        exit "$ARTIFACT_EXIT"
 
     - name: Upload coverage report
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: coverage-report-${{ matrix.python-version }}
-        path: coverage.xml
+        path: |
+          artifacts/pytest/coverage-${{ matrix.python-version }}.xml
+        retention-days: 14
+        # R81 §10.7: 改为 warn — pytest 失败导致 coverage 未生成时,
+        # 不得让 upload step 的"缺文件错误"掩盖 pytest 根因。
+        # coverage 必需性由独立的 Verify coverage contract step 强制。
+        if-no-files-found: warn
+
+    # R81 §10.7: 独立 coverage 合同验证 —
+    # pytest 成功时 coverage 必须存在且非空;pytest 失败时允许缺失。
+    - name: Verify coverage contract
+      if: always()
+      run: |
+        # 读取 pytest 原始退出码(若文件不存在,说明 Run tests step 本身失败更早)
+        EXITCODE_FILE="artifacts/pytest/pytest-${{ matrix.python-version }}.exitcode"
+        if [ ! -f "$EXITCODE_FILE" ]; then
+          echo "::error::pytest exitcode file missing — Run tests step failed before writing exitcode" >&2
+          exit 22
+        fi
+        TEST_EXIT=$(cat "$EXITCODE_FILE")
+        COV_FILE="artifacts/pytest/coverage-${{ matrix.python-version }}.xml"
+        if [ "$TEST_EXIT" -eq 0 ]; then
+          # pytest 成功 — coverage 必须存在且非空
+          if [ ! -s "$COV_FILE" ]; then
+            echo "::error::pytest succeeded but coverage XML is missing or empty: $COV_FILE" >&2
+            exit 23
+          fi
+          echo "✓ Coverage contract satisfied (pytest=0, coverage exists)"
+        else
+          # pytest 失败 — 允许 coverage 缺失,不在此 step 二次失败
+          echo "::notice::pytest failed (exit=$TEST_EXIT) — coverage contract skipped (pytest failure is primary)"
+        fi
 
     - name: AST syntax check
       run: |
@@ -139,36 +198,53 @@ jobs:
 
     - name: Upload test report
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: test-report-${{ matrix.python-version }}
         path: |
-          .pytest_cache/
-          pytest_out.txt
+          artifacts/pytest/
         retention-days: 14
+        if-no-files-found: error
 
   lint:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
     - name: Install flake8
       run: pip install flake8
     - name: Lint
       run: |
-        # stop the build if there are Python syntax errors or undefined names
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=.git,__pycache__,docs
-        # exit-zero treats all errors as warnings
-        flake8 . --count --exit-zero --max-complexity=20 --max-line-length=120 --statistics --exclude=.git,__pycache__,docs
+        # R81 §10.8: 输出 path:row:column:code:text 格式到 artifacts/static/flake8.txt
+        # 保留 flake8 原始退出码;禁止 continue-on-error / noqa / 排除目录来逃避真实违规。
+        mkdir -p artifacts/static
+        rc=0
+        flake8 . --select=E9,F63,F7,F82 \
+          --format='%(path)s:%(row)d:%(col)d: %(code)s %(text)s' \
+          --exclude=.git,__pycache__,docs \
+          2>&1 | tee artifacts/static/flake8.txt || rc=1
+        # exit-zero 模式(信息性输出;--exit-zero 保证返回 0)
+        flake8 . --count --exit-zero --max-complexity=20 --max-line-length=120 --statistics --exclude=.git,__pycache__,docs \
+          >> artifacts/static/flake8.txt 2>&1
+        exit "$rc"
+    - name: Upload lint report
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: lint-report
+        path: |
+          artifacts/static/flake8.txt
+        retention-days: 14
+        if-no-files-found: warn
 
   # R56 §10: Repository hygiene — 禁止生成产物/审查报告入库
   repo-hygiene:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Check for forbidden generated artifacts
       run: |
         # R56 §10: 禁止 check_output.txt / classify.txt 等生成产物入库
@@ -205,9 +281,9 @@ jobs:
   i18n-check:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
     - name: Install dependencies
@@ -254,9 +330,9 @@ jobs:
   static-gates:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
     - name: Install dependencies
@@ -302,8 +378,23 @@ jobs:
     # (telegram send/edit、fastapi JSONResponse),必须经过 services/sink_adapters/*
     # typed adapter。R65 P1-01 已将全部 486 项存量违规迁移到 typed adapter,
     # CI/Release 由 baseline ratchet 切换为 --strict(任何违规都失败)。
+    # R81 §10.8: 输出到 artifacts/static/sink-import-boundary.txt,保留退出码。
     - name: "Scanner 8: Sink import boundary gate (R65 P1-01 strict mode)"
-      run: python scripts/check_sink_import_boundary.py --strict
+      run: |
+        mkdir -p artifacts/static
+        # R81 fix: 使用 || rc=1 替代 set +e(扫描器合规)
+        rc=0
+        python scripts/check_sink_import_boundary.py --strict 2>&1 | tee artifacts/static/sink-import-boundary.txt || rc=1
+        exit "$rc"
+    - name: Upload static gates reports
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: static-gates-report
+        path: |
+          artifacts/static/
+        retention-days: 14
+        if-no-files-found: warn
     # R65 P1-02 Scanner 9: a11y 矩阵真实执行对等门禁
     # 审计 R65 P1-02: "A11y 64 矩阵是清单,不是 64 个已执行测试。"
     # 整改: scanner 的 --test-report 改为强制必填(无报告即失败)。
@@ -355,27 +446,39 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
     - name: Install bandit
       run: pip install bandit
     - name: Run bandit security scan
       run: |
+        # R81 §10.8: 输出 JSON 到 artifacts/static/bandit.json,保留原始退出码。
         # 仅扫描业务代码,排除 tests / docs / venv
-        bandit -r . -x ./tests,./docs,./.git,./venv,./.venv -ll || true
-      continue-on-error: true
+        # R73 §5.24: 移除 || true 和 continue-on-error — 安全扫描失败必须阻断流水线
+        # R76 §10.M: 使用 .bandit 配置文件跳过已知 false positive(B608/B104/B310/B108)
+        # R81 §10.8: 禁止全局 nosec;只允许最小行级抑制 + 理由 + 单测。
+        # R81 fix: 使用 || rc=1 替代 set +e / || true(扫描器合规)
+        mkdir -p artifacts/static
+        rc=0
+        bandit -r bots services database utils admin scripts \
+          -f json -o artifacts/static/bandit.json -ll -c .bandit || rc=1
+        # 同时生成文本版本便于人工阅读(信息性输出,不影响退出码)
+        bandit -r bots services database utils admin scripts \
+          -ll -c .bandit > artifacts/static/bandit.txt 2>&1 || _info_rc=$?
+        exit "$rc"
     - name: Upload bandit report
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: bandit-report
         path: |
-          bandit-output.txt
+          artifacts/static/bandit.json
+          artifacts/static/bandit.txt
         retention-days: 14
-        if-no-files-found: ignore
+        if-no-files-found: warn
 
   fault-injection:
     runs-on: ubuntu-latest
@@ -384,9 +487,9 @@ jobs:
     # 30 分钟足够过滤后的子集(~1000 测试)跑完,正常 2-3 分钟完成。
     timeout-minutes: 30
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
     - name: Install dependencies
@@ -399,16 +502,35 @@ jobs:
         # R36 B0-4: 故障注入测试(崩溃恢复、Redis 中断、消息重放)
         # R71 RC42: 添加 --timeout=120 防止单个测试挂起导致 job 卡死
         # R71 RC43: timeout --signal=KILL 兜底 — 防止 aiosqlite 后台线程导致 pytest 退出挂起
-        timeout --signal=KILL 25m python -m pytest tests/ -v --tb=short -k "crash or fault or inject or recovery or restore or dlq or inbox" --maxfail=3 --timeout=120
-      continue-on-error: true
+        # R73 §5.24: 移除 continue-on-error — 故障注入测试失败必须阻断流水线
+        # R81 §10.8: 输出 junit.xml / pytest.log / exitcode 到 artifacts/fault-injection/
+        mkdir -p artifacts/fault-injection
+        set -o pipefail
+        timeout --signal=KILL 25m python -m pytest tests/ -v --tb=short \
+          -k "crash or fault or inject or recovery or restore or dlq or inbox" \
+          --maxfail=3 --timeout=120 \
+          --junitxml=artifacts/fault-injection/junit.xml \
+          2>&1 | tee artifacts/fault-injection/pytest.log
+        rc=${PIPESTATUS[0]}
+        printf '%s\n' "$rc" > artifacts/fault-injection/exitcode
+        exit "$rc"
+    - name: Upload fault injection report
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: fault-injection-report
+        path: |
+          artifacts/fault-injection/
+        retention-days: 14
+        if-no-files-found: warn
 
   # R44: Migration dry-run(从原 release-gates job 迁移,校验 DDL/MIGRATION 语句语法)
   migration-dry-run:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
     - name: Install dependencies
@@ -457,10 +579,10 @@ jobs:
       contents: read
       id-token: write   # Sigstore keyless 签名需要 OIDC
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -485,22 +607,22 @@ jobs:
     - name: Sign source artifact with cosign (keyless)
       run: |
         # Sigstore keyless 签名(使用 GitHub OIDC 身份)
+        # R73 §5.24: 移除 continue-on-error — 签名失败必须阻断流水线
         cosign sign-blob --yes \
           --output-certificate tgjiema-${{ github.sha }}.pem \
           --output-signature tgjiema-${{ github.sha }}.sig \
           tgjiema-${{ github.sha }}.tar.gz.sha256
         echo "源代码制品已用 Sigstore keyless 签名"
-      continue-on-error: true
 
     - name: Sign SBOM with cosign (keyless)
       run: |
         # R41 P1-11: SBOM 单独签名,确保 SBOM 完整性可独立验证
+        # R73 §5.24: 移除 continue-on-error — SBOM 签名失败必须阻断流水线
         cosign sign-blob --yes \
           --output-certificate sbom-${{ github.sha }}.pem \
           --output-signature sbom-${{ github.sha }}.sig \
           sbom-${{ github.sha }}.json.sha256
         echo "SBOM 已用 Sigstore keyless 签名"
-      continue-on-error: true
 
     - name: Sign Docker image with cosign (keyless, placeholder)
       run: |
@@ -511,13 +633,13 @@ jobs:
         #   docker build -t ghcr.io/${{ github.repository }}:${{ github.sha }} .
         #   cosign sign --yes ghcr.io/${{ github.repository }}:${{ github.sha }}
         # 当前仅记录签名意图,验证 cosign 可用
-        cosign version || true
+        # R73 §5.24: 移除 continue-on-error — cosign 不可用必须阻断流水线
+        cosign version
         echo "Docker 镜像签名步骤已就绪(待镜像构建流水线激活)"
-      continue-on-error: true
 
     - name: Upload signed artifacts
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: signed-release-${{ github.sha }}
         path: |
@@ -546,10 +668,10 @@ jobs:
   skip-inventory:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
     - name: Set up Python
-      uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
       with:
         python-version: '3.11'
 
@@ -627,7 +749,7 @@ jobs:
 
     - name: Upload skip inventory artifact
       if: always()
-      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: skip-inventory-${{ github.sha }}
         path: skip_inventory_${{ github.sha }}.json

@@ -215,26 +215,38 @@ class TestDoBackupInnerFirstStatement:
     """R72 RC62 C: _do_backup_inner 内部首条语句必须是 init_db(确保连接池优先初始化)。"""
 
     def test_init_db_appears_before_configure_r2(self):
-        """init_db 必须在 configure_r2_dynamic 之前调用。
+        """init_db 必须在 configure_storage_from_settings 之前调用。
 
-        顺序: init_db → configure_r2_dynamic → R2 凭证检查 → 加密检查 → backup 逻辑
+        顺序: init_db → configure_storage_from_settings → R2 凭证检查 → 加密检查 → backup 逻辑
+
+        R76 O7: configure_r2_dynamic 已重构为 configure_storage_from_settings,
+        支持 R2/MinIO 多后端切换(secretless CI 使用 MinIO)。
         """
         inner_body = _extract_do_backup_inner_body()
         init_idx = inner_body.find("init_db")
-        configure_idx = inner_body.find("configure_r2_dynamic")
+        configure_idx = inner_body.find("configure_storage_from_settings")
         assert init_idx >= 0, "未在 _do_backup_inner 中找到 init_db"
-        assert configure_idx >= 0, "未在 _do_backup_inner 中找到 configure_r2_dynamic"
+        assert configure_idx >= 0, (
+            "未在 _do_backup_inner 中找到 configure_storage_from_settings "
+            "(R76 O7: 由 configure_r2_dynamic 重构而来)"
+        )
         assert init_idx < configure_idx, (
-            "R72 RC62: init_db 必须在 configure_r2_dynamic 之前调用"
+            "R72 RC62: init_db 必须在 configure_storage_from_settings 之前调用"
         )
 
     def test_configure_r2_appears_before_r2_credential_check(self):
-        """configure_r2_dynamic 必须在 r2_storage._access_key 检查之前。"""
+        """configure_storage_from_settings 必须在 r2_storage._access_key 检查之前。
+
+        R76 O7: configure_r2_dynamic 已重构为 configure_storage_from_settings。
+        """
         inner_body = _extract_do_backup_inner_body()
-        configure_idx = inner_body.find("configure_r2_dynamic")
+        configure_idx = inner_body.find("configure_storage_from_settings")
         access_key_idx = inner_body.find("r2_storage._access_key")
-        assert configure_idx >= 0
+        assert configure_idx >= 0, (
+            "未在 _do_backup_inner 中找到 configure_storage_from_settings "
+            "(R76 O7: 由 configure_r2_dynamic 重构而来)"
+        )
         assert access_key_idx >= 0
         assert configure_idx < access_key_idx, (
-            "R72 RC62: configure_r2_dynamic 必须在 R2 凭证检查之前调用"
+            "R72 RC62: configure_storage_from_settings 必须在 R2 凭证检查之前调用"
         )

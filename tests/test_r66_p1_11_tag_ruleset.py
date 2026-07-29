@@ -44,6 +44,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="shell scripts require bash, not available on Windows")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 CONFIGURE_SCRIPT = SCRIPTS_DIR / "configure_tag_ruleset.sh"

@@ -910,3 +910,223 @@ class TestPersistenceAcrossRestart:
             assert won is False, "实例 B 应拒绝重复 consume(已 consumed,防重放)"
         finally:
             await store_b.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# 10. R76 P0-06 新字段测试 — nonce_digest / capability_digest /
+#     target_identity / run_id / run_attempt 独立绑定字段
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestR76P0_06BindingFields:
+    """R76 P0-06 / O8: nonce_digest / capability_digest / target_identity /
+    run_id / run_attempt 独立绑定字段测试。
+
+    R76 终审报告 P0-06 要求 nonce 必须使用数据库唯一约束/CAS,绑定 operation、
+    capability digest、nonce 和 target。本测试类验证 009 migration 新增的 5 个
+    独立绑定字段在 reserve/consume 路径上正确存储与查询。
+
+    补充场景:
+        - reserve 后 DB 中 5 个新字段正确存储
+        - consume 时 capability_digest 不匹配返回 False(防换 capability 重放)
+    """
+
+    @pytest.mark.asyncio
+    async def test_reserve_stores_r76_binding_fields(self):
+        """reserve 后 DB 中 nonce_digest / capability_digest / target_identity /
+        run_id / run_attempt 字段正确存储。"""
+        import hashlib
+        import json
+        store, _ = await _make_store()
+        try:
+            nonce = "r76_binding_reserve_001"
+            expected_nonce_digest = hashlib.sha256(
+                nonce.encode("utf-8")
+            ).hexdigest()
+            # 构造一个 capability dict 用于计算 capability_digest
+            cap_dict = {
+                "nonce": nonce,
+                "backup_id": "backup_001",
+                "operation_id": "op_r76_bind",
+            }
+            cap_canonical = json.dumps(
+                cap_dict, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+            )
+            expected_cap_digest = hashlib.sha256(
+                cap_canonical.encode("utf-8")
+            ).hexdigest()
+            expected_target = "empty:sha256:r76_target_test"
+            expected_run_id = 888999
+            expected_run_attempt = 4
+
+            await store.reserve_capability_nonce(
+                nonce,
+                operation_id="op_r76_bind",
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                reserved_by="host_r76:1234",
+                nonce_digest=expected_nonce_digest,
+                capability_digest=expected_cap_digest,
+                target_identity=expected_target,
+                run_id=expected_run_id,
+                run_attempt=expected_run_attempt,
+            )
+            cursor = await store._db.execute(
+                "SELECT nonce_digest, capability_digest, target_identity, "
+                "run_id, run_attempt "
+                "FROM restore_capability_nonces WHERE nonce = ?",
+                (nonce,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None, "reserve 后应查询到 nonce 行"
+            assert row[0] == expected_nonce_digest, (
+                f"nonce_digest 不匹配: expected={expected_nonce_digest}, actual={row[0]!r}"
+            )
+            assert row[1] == expected_cap_digest, (
+                f"capability_digest 不匹配: expected={expected_cap_digest}, actual={row[1]!r}"
+            )
+            assert row[2] == expected_target, (
+                f"target_identity 不匹配: expected={expected_target}, actual={row[2]!r}"
+            )
+            assert row[3] == expected_run_id, (
+                f"run_id 不匹配: expected={expected_run_id}, actual={row[3]!r}"
+            )
+            assert row[4] == expected_run_attempt, (
+                f"run_attempt 不匹配: expected={expected_run_attempt}, actual={row[4]!r}"
+            )
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_consume_capability_digest_mismatch_returns_false(self):
+        """consume 时 capability_digest 不匹配返回 False(防换 capability 重放)。
+
+        R76 P0-06: CAS UPDATE WHERE 子句包含 capability_digest 比对,
+        攻击者用同 nonce 但不同 capability_digest 消费时,CAS 失败。
+        """
+        store, _ = await _make_store()
+        try:
+            nonce = "r76_consume_mismatch_001"
+            correct_digest = "a" * 64  # reserve 时使用的正确 digest
+            tampered_digest = "b" * 64  # 攻击者使用的错误 digest
+
+            await store.reserve_capability_nonce(
+                nonce,
+                operation_id="op_r76_mm",
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                reserved_by="host1:1234",
+                nonce_digest="nonce_digest_placeholder",
+                capability_digest=correct_digest,
+                target_identity="target_r76_mm",
+                run_id=777888,
+                run_attempt=2,
+            )
+            # 用错误的 capability_digest 尝试 consume — 必须失败
+            won = await store.consume_capability_nonce(
+                nonce,
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                consumed_by="attacker:9999",
+                capability_digest=tampered_digest,  # 不匹配
+                operation_id="op_r76_mm",
+            )
+            assert won is False, (
+                "consume 时 capability_digest 不匹配应返回 False(防换 capability 重放)"
+            )
+            # 验证 nonce 仍在 reserved 状态(未被攻击者消费)
+            cursor = await store._db.execute(
+                "SELECT status FROM restore_capability_nonces WHERE nonce = ?",
+                (nonce,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == "reserved", (
+                "capability_digest 不匹配时 nonce 应仍在 reserved 状态"
+            )
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_consume_capability_digest_match_succeeds(self):
+        """consume 时 capability_digest 匹配返回 True(正常路径)。"""
+        store, _ = await _make_store()
+        try:
+            nonce = "r76_consume_match_001"
+            cap_digest = "c" * 64
+            await store.reserve_capability_nonce(
+                nonce,
+                operation_id="op_r76_match",
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                reserved_by="host1:1234",
+                nonce_digest="nonce_digest_match",
+                capability_digest=cap_digest,
+                target_identity="target_match",
+                run_id=666555,
+                run_attempt=1,
+            )
+            won = await store.consume_capability_nonce(
+                nonce,
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                consumed_by="host1:1234",
+                capability_digest=cap_digest,  # 匹配
+                operation_id="op_r76_match",
+            )
+            assert won is True, (
+                "consume 时 capability_digest 匹配应返回 True(正常路径)"
+            )
+        finally:
+            await store.close()
+
+    @pytest.mark.asyncio
+    async def test_nonce_digest_unique_index_blocks_replay(self):
+        """nonce_digest UNIQUE INDEX 防重放:同 nonce_digest 二次 reserve 失败。"""
+        import hashlib
+        store, _ = await _make_store()
+        try:
+            nonce = "r76_unique_idx_001"
+            nonce_digest = hashlib.sha256(nonce.encode("utf-8")).hexdigest()
+            # 第一次 reserve — 成功
+            won1 = await store.reserve_capability_nonce(
+                nonce,
+                operation_id="op_r76_uniq_1",
+                backup_id="backup_001",
+                manifest_sha256="a" * 64,
+                payload_digest="d" * 64,
+                reserved_by="host1:1234",
+                nonce_digest=nonce_digest,
+                capability_digest="cap_1",
+                target_identity="target_1",
+                run_id=1,
+                run_attempt=1,
+            )
+            # 第二次 reserve(同 nonce_digest,但用不同的 nonce 字符串 —
+            # 实际中不会发生,因为 nonce_digest=sha256(nonce),此处模拟攻击者
+            # 试图用不同 nonce 但相同 digest 重放)
+            # 用同 nonce 更直接验证 UNIQUE INDEX
+            won2 = await store.reserve_capability_nonce(
+                nonce,  # 同一 nonce
+                operation_id="op_r76_uniq_2",
+                backup_id="backup_002",
+                manifest_sha256="e" * 64,
+                payload_digest="f" * 64,
+                reserved_by="host2:5678",
+                nonce_digest=nonce_digest,  # 同一 nonce_digest → UNIQUE 冲突
+                capability_digest="cap_2",
+                target_identity="target_2",
+                run_id=2,
+                run_attempt=2,
+            )
+            assert won1 is True, "首次 reserve 应成功"
+            assert won2 is False, (
+                "二次 reserve 同 nonce_digest 应失败(UNIQUE INDEX 防重放)"
+            )
+        finally:
+            await store.close()

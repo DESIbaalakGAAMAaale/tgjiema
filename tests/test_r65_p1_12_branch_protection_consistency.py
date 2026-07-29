@@ -317,9 +317,10 @@ class TestWorkflowContextExtraction:
             "verify-branch-protection 应在 self_excluded_jobs(BP 循环依赖)— "
             f"实际: {sorted(rg.self_excluded_jobs)}"
         )
-        # R65 P1-12: production-evidence 非阻断(失败不阻断 PR 合并)
-        assert "production-evidence" in rg.non_blocking_jobs, (
-            "production-evidence 应在 non_blocking_jobs(R64 P1-12 非阻断)— "
+        # R65 P1-12 / R73 §5.7: generate-evidence-envelope 非阻断
+        # (R64 P1-12 旧名 production-evidence;R73 P1-05 强类型分级后改名)
+        assert "generate-evidence-envelope" in rg.non_blocking_jobs, (
+            "generate-evidence-envelope 应在 non_blocking_jobs(R73 §5.7 非阻断)— "
             f"实际: {sorted(rg.non_blocking_jobs)}"
         )
         # sign-image / publish-attestation 是 push-only,应被排除

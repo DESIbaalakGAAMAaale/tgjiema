@@ -1,51 +1,36 @@
 name: Promote RC
 
 # ══════════════════════════════════════════════════════════════════════
-# R72 P0-15: 删除较弱的平行 production 晋级通道
+# R73 §5.6 (P0-07): Thin wrapper — delegates to single reusable workflow
 # ══════════════════════════════════════════════════════════════════════
 #
 # 整改背景:
-#   旧版本 (R70 P0-10) 的 promote-rc.yml 与 release-gates.yml 的
-#   production-promotion-gate 形成平行 production 晋级入口,且存在多个弱点:
-#     - 只用 `gh run list --status=success --limit=1` 查找成功 run,不核对 head SHA
-#     - 不强制校验 RC run ID / candidate manifest digest / image digest
-#     - 创建普通 annotated tag (`git tag -a`) 而非 signed tag
-#     - 晋级摘要只证明 commit 相同,不证明生产使用同一 RepoDigest
+#   R73 §5.6 要求仓库中只允许存在 ONE production promotion 实现。
+#   旧版本 (R72 P0-15) 的 promote-rc.yml 包含完整的内联晋级逻辑:
+#     - gh run view 查询 RC run
+#     - docker pull + RepoDigest 校验
+#     - GPG 签名配置 + git tag -s 创建 signed production tag
+#   与 release-gates.yml 的 production-promotion-gate / verify-rc-identity
+#   形成两套平行晋级实现,违反 R73 §5.6 单一实现要求。
 #
 # 整改方案 (thin wrapper):
-#   - 删除所有重复校验 job (validate-rc-candidate / verify-production-evidence /
-#     verify-rc-tag-immutability / promote-to-production / promotion-summary)
 #   - 保留 workflow_dispatch 入口(运维手动触发,提供完整 RC 身份字段)
-#   - 移除 production-v* tag push 触发(避免与 release-gates.yml 形成平行通道)
-#   - 本 workflow 仅做 4 项本地校验 + signed tag 创建:
-#       1. rc_run_id 必填且对应 release-gates.yml 的成功 run
-#       2. RC run head SHA == RC tag commit(防 weak lookup 欺骗)
-#       3. docker pull <image>@<digest> 后核对 RepoDigest(不可变内容地址)
-#       4. `git tag -s` 创建 signed production-v* tag,annotation 含 RC 身份字段
-#   - 推送 production-v* tag 触发 release-gates.yml 的 production-promotion-gate,
-#     该 job 通过 verify-rc-identity 重新下载 RC run artifacts 并完整核验:
-#       rc_tag / rc_run_id / source_sha / candidate_manifest_digest / image_digest /
-#       image_repo_digest / rc_verified=true / evidence_status=production /
-#       5 类 production evidence artifact 齐全且未过期
+#   - 删除所有内联晋级逻辑 (gh run view / docker pull / GPG / git tag -s)
+#   - Body 为单一 uses: ./.github/workflows/_promote-verified-rc.yml
+#     所有晋级步骤 (a-p) 委托给 reusable workflow
+#   - inputs 透传 (with:),不做任何本地校验
 #
-# 触发方式:
-#   - workflow_dispatch (唯一入口,运维手动触发)
-#
-# 已废弃的旧触发方式:
-#   - production-v* tag push: 旧版本会在 tag push 时也运行本 workflow,
-#     与 release-gates.yml 的 production-promotion-gate 形成平行通道。
-#     R72 P0-15 后 production-v* tag 仅由 release-gates.yml 处理。
-#
-# 与 release-gates.yml 的关系:
-#   - release-gates.yml: master push → staging / rc-v* tag → rc-candidate /
-#     production-v* tag → production (production-promotion-gate job,含 verify-rc-identity)
-#   - promote-rc.yml (R72 P0-15): thin wrapper,创建 signed production-v* tag 后
-#     委托 release-gates.yml 完成完整晋级门禁
+# 与 _promote-verified-rc.yml 的关系:
+#   - _promote-verified-rc.yml: SINGLE reusable promotion workflow (steps a-p)
+#   - promote-rc.yml (R73 §5.6): thin wrapper,workflow_dispatch → reusable call
+#   - release-gates.yml (R73 §5.6): workflow_dispatch → reusable call
+#     (production-v* tag push 仍保留 production-promotion-gate 作为冗余验证)
 #
 # 整改规范:
 #   - 禁止 TODO 注释、pass 占位符、其他占位符
-#   - 禁止 skip / warn / 吞异常 (所有校验 fail-closed)
-#   - 所有 step 必须显式成功或失败 (set -euo pipefail)
+#   - 禁止 skip / warn / 吞异常 (所有校验 fail-closed,由 reusable workflow 保证)
+#   - 本文件不包含任何 gh run list / gh run view / git tag / docker pull /
+#     部署触发逻辑 — 全部委托给 _promote-verified-rc.yml
 
 on:
   workflow_dispatch:
@@ -58,6 +43,11 @@ on:
         description: 'Release-gates.yml workflow run ID for the RC tag (must be successful)'
         required: true
         type: string
+      rc_run_attempt:
+        description: 'RC workflow run attempt number (must match the successful run)'
+        required: true
+        type: string
+        default: '1'
       source_sha:
         description: 'Source commit SHA the RC was built from (40-char hex, must match rc_tag commit)'
         required: true
@@ -66,373 +56,62 @@ on:
         description: 'Candidate manifest digest (sha256:<64-hex>) from RC run'
         required: true
         type: string
-      image_digest:
-        description: 'OCI image digest (sha256:<64-hex>) from RC run'
+      image_repo_digest:
+        description: 'Image RepoDigest (ghcr.io/<repo>@sha256:<64-hex>) from RC run'
         required: true
         type: string
-      production_tag:
-        description: 'Production tag to create (e.g. production-v1.0.0)'
+      runtime_config_digest:
+        description: 'Runtime config digest (sha256:<64-hex>) from RC run (host config binding)'
         required: true
         type: string
       typed_confirmation:
         description: 'Type PROMOTE-RC-TO-PRODUCTION to confirm'
         required: true
         type: string
+      production_tag:
+        description: 'Production tag to create (e.g. production-v1.0.0, format production-vX.Y.Z)'
+        required: true
+        type: string
 
 # Production 晋级不可取消(避免半完成状态)
 concurrency:
-  group: promote-rc-${{ github.ref }}
+  group: promote-rc-${{ github.ref }}-${{ inputs.production_tag }}
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write   # 委托给 reusable workflow (创建并推送 signed production tag)
+  packages: read    # 委托给 reusable workflow (docker pull RepoDigest)
+  deployments: write  # 委托给 reusable workflow (production deployment record)
+  id-token: write   # 委托给 reusable workflow (OIDC keyless signing)
 
 jobs:
-  # ─── R72 P0-15: Thin wrapper — create signed production-v* tag ────────
-  # 所有身份校验委托给 release-gates.yml 的 production-promotion-gate
-  # (通过 verify-rc-identity job 完成 4 类 evidence artifact 重新核验)。
-  create-signed-production-tag:
-    runs-on: ubuntu-latest
-    environment: production
-    permissions:
-      contents: write  # 推送 signed production-v* tag
-      actions: read    # gh run view 查询 RC run 状态
-      packages: read   # docker pull 读取 RepoDigest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        with:
-          fetch-depth: 0
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
-        with:
-          python-version: '3.11'
-
-      # R72 P0-15 step 1: 校验输入字段 + RC tag 存在 + RC run head SHA == RC tag commit
-      # 不允许 gh run list 不核对 SHA 的弱查找 — 必须用 gh run view <rc_run_id> 精确查询
-      - name: "R72 P0-15: Validate inputs and verify RC run head SHA matches RC tag"
-        id: resolve
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "=== R72 P0-15: Validate RC identity inputs (thin wrapper) ==="
-          RC_TAG="${{ inputs.rc_tag }}"
-          RC_RUN_ID="${{ inputs.rc_run_id }}"
-          SOURCE_SHA="${{ inputs.source_sha }}"
-          CANDIDATE_MANIFEST_DIGEST="${{ inputs.candidate_manifest_digest }}"
-          IMAGE_DIGEST="${{ inputs.image_digest }}"
-          PRODUCTION_TAG="${{ inputs.production_tag }}"
-          TYPED_CONFIRMATION="${{ inputs.typed_confirmation }}"
-          echo "  rc_tag:                       ${RC_TAG}"
-          echo "  rc_run_id:                    ${RC_RUN_ID}"
-          echo "  source_sha:                   ${SOURCE_SHA}"
-          echo "  candidate_manifest_digest:    ${CANDIDATE_MANIFEST_DIGEST}"
-          echo "  image_digest:                 ${IMAGE_DIGEST}"
-          echo "  production_tag:               ${PRODUCTION_TAG}"
-
-          # 校验 typed_confirmation(运维显式确认,defense in depth)
-          if [ "${TYPED_CONFIRMATION}" != "PROMOTE-RC-TO-PRODUCTION" ]; then
-            echo "::error::typed_confirmation 必须为 'PROMOTE-RC-TO-PRODUCTION' (实际: '${TYPED_CONFIRMATION}')"
-            exit 1
-          fi
-
-          # 校验 RC tag 命名规范(必须以 rc-v 开头)
-          if [[ ! "${RC_TAG}" =~ ^rc-v ]]; then
-            echo "::error::RC tag '${RC_TAG}' 不符合命名规范 (必须以 rc-v 开头)"
-            exit 1
-          fi
-          # 校验 production tag 命名规范(必须以 production-v 开头)
-          if [[ ! "${PRODUCTION_TAG}" =~ ^production-v ]]; then
-            echo "::error::Production tag '${PRODUCTION_TAG}' 不符合命名规范 (必须以 production-v 开头)"
-            exit 1
-          fi
-          # 校验 digest 字段格式 (sha256:<64-hex>)
-          for d_name in CANDIDATE_MANIFEST_DIGEST IMAGE_DIGEST; do
-            d_val="${!d_name}"
-            if [[ ! "${d_val}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-              echo "::error::${d_name}='${d_val}' 不符合 sha256:<64-hex> 格式"
-              exit 1
-            fi
-          done
-          # 校验 source_sha 格式 (40-char hex)
-          if [[ ! "${SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::source_sha='${SOURCE_SHA}' 不符合 40-char hex 格式"
-            exit 1
-          fi
-          # 校验 rc_run_id 为纯数字
-          if [[ ! "${RC_RUN_ID}" =~ ^[0-9]+$ ]]; then
-            echo "::error::rc_run_id='${RC_RUN_ID}' 必须为纯数字 workflow run ID"
-            exit 1
-          fi
-
-          # 校验 production tag 不已存在(不允许覆盖,不可变性)
-          if git rev-parse --verify "refs/tags/${PRODUCTION_TAG}" >/dev/null 2>&1; then
-            echo "::error::Production tag '${PRODUCTION_TAG}' already exists"
-            echo "  R70 P0-10: 不允许覆盖已存在的 production tag(不可变性要求)"
-            exit 1
-          fi
-
-          # 校验 RC tag 存在
-          if ! git rev-parse --verify "refs/tags/${RC_TAG}" >/dev/null 2>&1; then
-            echo "::error::RC tag '${RC_TAG}' does not exist"
-            echo "  R72 P0-15: production 晋级必须基于已存在的 RC candidate"
-            exit 1
-          fi
-          RC_COMMIT_SHA=$(git rev-parse "refs/tags/${RC_TAG}^{commit}")
-          echo "  RC commit SHA: ${RC_COMMIT_SHA}"
-
-          # R72 P0-15 关键校验: 用 gh run view 精确查询 rc_run_id,核对 head SHA
-          # (禁止 gh run list --status=success --limit=1 这种弱查找 — 不核对 SHA 易被欺骗)
-          echo "=== R72 P0-15: Verify rc_run_id corresponds to RC tag commit ==="
-          RUN_JSON=$(gh run view "${RC_RUN_ID}" \
-            --workflow=release-gates.yml \
-            --json databaseId,workflowName,headBranch,headSha,status,conclusion,event \
-            2>&1 || echo "")
-          if [ -z "${RUN_JSON}" ] || [ "${RUN_JSON}" = "{}" ] || [ "${RUN_JSON}" = "null" ]; then
-            echo "::error::rc_run_id=${RC_RUN_ID} 不是 release-gates.yml 的 workflow run"
-            echo "  R72 P0-15: 必须提供 release-gates.yml 在 RC tag 上的成功 run ID"
-            exit 1
-          fi
-          RUN_HEAD_SHA=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('headSha',''))")
-          RUN_STATUS=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))")
-          RUN_CONCLUSION=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('conclusion') or '')")
-          RUN_EVENT=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('event',''))")
-          RUN_BRANCH=$(echo "${RUN_JSON}" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('headBranch',''))")
-          echo "  rc_run_id:        ${RC_RUN_ID}"
-          echo "  workflow:         release-gates.yml"
-          echo "  head_branch:      ${RUN_BRANCH}"
-          echo "  head_sha:         ${RUN_HEAD_SHA}"
-          echo "  status:           ${RUN_STATUS}"
-          echo "  conclusion:       ${RUN_CONCLUSION}"
-          echo "  event:            ${RUN_EVENT}"
-          if [ "${RUN_STATUS}" != "completed" ]; then
-            echo "::error::RC run ${RC_RUN_ID} 状态为 '${RUN_STATUS}' (要求 completed)"
-            echo "  R72 P0-15: 必须使用已完成的 release-gates.yml run"
-            exit 1
-          fi
-          if [ "${RUN_CONCLUSION}" != "success" ]; then
-            echo "::error::RC run ${RC_RUN_ID} conclusion 为 '${RUN_CONCLUSION}' (要求 success)"
-            echo "  R72 P0-15: 必须使用成功的 release-gates.yml run"
-            exit 1
-          fi
-          # R72 P0-15 关键校验: RC run head SHA 必须与 RC tag commit 一致
-          # 防止恶意用户用其他 successful run 冒充 RC run
-          if [ "${RUN_HEAD_SHA}" != "${RC_COMMIT_SHA}" ]; then
-            echo "::error::RC run head SHA 与 RC tag commit 不一致"
-            echo "  rc_run_id head SHA: ${RUN_HEAD_SHA}"
-            echo "  rc_tag commit SHA:  ${RC_COMMIT_SHA}"
-            echo "  R72 P0-15: 必须使用同一 commit 的 release-gates.yml run"
-            echo "  禁止用 gh run list 不核对 SHA 的弱查找"
-            exit 1
-          fi
-          # 校验 source_sha 与 RC commit 一致(RC 必须基于该 source 构建)
-          if [ "${SOURCE_SHA}" != "${RC_COMMIT_SHA}" ]; then
-            echo "::error::source_sha 与 RC tag commit 不一致"
-            echo "  source_sha:         ${SOURCE_SHA}"
-            echo "  rc_tag commit SHA:  ${RC_COMMIT_SHA}"
-            echo "  R72 P0-15: source_sha 必须等于 RC tag commit SHA (Build Once 原则)"
-            exit 1
-          fi
-          echo "PASS: rc_run_id=${RC_RUN_ID} head SHA matches RC tag commit ${RC_COMMIT_SHA}"
-
-          echo "rc_tag=${RC_TAG}" >> "$GITHUB_OUTPUT"
-          echo "rc_run_id=${RC_RUN_ID}" >> "$GITHUB_OUTPUT"
-          echo "rc_commit_sha=${RC_COMMIT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "source_sha=${SOURCE_SHA}" >> "$GITHUB_OUTPUT"
-          echo "candidate_manifest_digest=${CANDIDATE_MANIFEST_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "image_digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "production_tag=${PRODUCTION_TAG}" >> "$GITHUB_OUTPUT"
-
-      # R72 P0-15 step 2: docker pull + 核对 RepoDigest
-      # 旧版本只证明 commit SHA 相同,不证明生产使用同一 RepoDigest(不可变内容地址)
-      - name: Login to GHCR
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: "R72 P0-15: Verify image RepoDigest (immutable content address)"
-        id: verify_image
-        run: |
-          set -euo pipefail
-          echo "=== R72 P0-15: Verify image RepoDigest ==="
-          IMAGE_DIGEST="${{ steps.resolve.outputs.image_digest }}"
-          # R70 P0-10: production namespace = maxiuquan/tgjiema
-          IMAGE_REPO="ghcr.io/maxiuquan/tgjiema"
-          IMAGE_REF="${IMAGE_REPO}@${IMAGE_DIGEST}"
-          echo "  image_ref: ${IMAGE_REF}"
-          # docker pull 后读取真实 RepoDigest(不可变内容地址)
-          # 即使 image_digest 已知,pull 后核验 RepoDigest 与之一致 — 证明
-          # 生产部署的是已验证的 exact signed RepoDigest
-          docker pull "${IMAGE_REF}" >/dev/null
-          PULLED_REPO_DIGESTS=$(docker inspect --format '{{json .RepoDigests}}' "${IMAGE_REF}")
-          echo "  pulled RepoDigests: ${PULLED_REPO_DIGESTS}"
-          # 核验 RepoDigest 中包含 image_digest
-          if ! echo "${PULLED_REPO_DIGESTS}" | grep -F "${IMAGE_DIGEST}" >/dev/null; then
-            echo "::error::Pulled image RepoDigest 不含 image_digest ${IMAGE_DIGEST}"
-            echo "  R72 P0-15: production 必须部署具体的 RepoDigest (不可变内容地址)"
-            echo "  不允许仅校验 commit SHA 相同 — 必须证明使用同一 RepoDigest"
-            exit 1
-          fi
-          # 提取完整 image_repo_digest (e.g. ghcr.io/maxiuquan/tgjiema@sha256:...)
-          IMAGE_REPO_DIGEST=$(echo "${PULLED_REPO_DIGESTS}" | python3 -c "
-          import json, sys
-          digests = json.load(sys.stdin)
-          target = '${IMAGE_DIGEST}'
-          for d in digests:
-              if d.endswith('@' + target):
-                  print(d)
-                  sys.exit(0)
-          print('')
-          ")
-          if [ -z "${IMAGE_REPO_DIGEST}" ]; then
-            echo "::error::未找到匹配 image_digest 的 RepoDigest"
-            exit 1
-          fi
-          echo "  image_repo_digest: ${IMAGE_REPO_DIGEST}"
-          echo "image_repo_digest=${IMAGE_REPO_DIGEST}" >> "$GITHUB_OUTPUT"
-          echo "PASS: image RepoDigest 校验通过 (${IMAGE_REPO_DIGEST})"
-
-      # R72 P0-15 step 3: 配置 GPG 签名(fail-closed — 未配置则拒绝创建 unsigned tag)
-      # GPG_SIGNING_KEY secret 必须配置为 ASCII-armored GPG 私钥
-      # GPG_SIGNING_KEY_ID secret 必须配置为对应私钥的 key ID (40-char hex 或 fingerprint)
-      - name: "R72 P0-15: Configure GPG signing key (fail-closed)"
-        id: gpg
-        env:
-          GPG_SIGNING_KEY: ${{ secrets.GPG_SIGNING_KEY }}
-          GPG_SIGNING_KEY_ID: ${{ secrets.GPG_SIGNING_KEY_ID }}
-        run: |
-          set -euo pipefail
-          echo "=== R72 P0-15: Configure GPG signing key ==="
-          if [ -z "${GPG_SIGNING_KEY}" ]; then
-            echo "::error::GPG_SIGNING_KEY secret 未配置"
-            echo "  R72 P0-15: production tag 必须使用 signed tag (git tag -s)"
-            echo "  请配置 GPG_SIGNING_KEY secret (ASCII-armored GPG 私钥)"
-            echo "  和 GPG_SIGNING_KEY_ID secret (对应 key ID)"
-            echo "  未配置 GPG 不允许创建 production tag (fail-closed,无 fallback 到 git tag -a)"
-            exit 1
-          fi
-          if [ -z "${GPG_SIGNING_KEY_ID}" ]; then
-            echo "::error::GPG_SIGNING_KEY_ID secret 未配置"
-            echo "  R72 P0-15: 需要指定 GPG key ID 用于 git tag -s -u <key-id>"
-            exit 1
-          fi
-          # 导入 GPG 私钥(无 passphrase;若有 passphrase 需额外配置 secret)
-          mkdir -p ~/.gnupg && chmod 700 ~/.gnupg
-          echo "${GPG_SIGNING_KEY}" | gpg --batch --import
-          # 配置 git 使用该 key 签名
-          git config --global user.signingkey "${GPG_SIGNING_KEY_ID}"
-          git config --global commit.gpgsign true
-          # 验证 key 已成功导入
-          if ! gpg --list-secret-keys "${GPG_SIGNING_KEY_ID}" >/dev/null 2>&1; then
-            echo "::error::GPG key ${GPG_SIGNING_KEY_ID} 导入后未找到"
-            echo "  请检查 GPG_SIGNING_KEY_ID 与 GPG_SIGNING_KEY 是否匹配"
-            exit 1
-          fi
-          echo "PASS: GPG signing key configured (key ID: ${GPG_SIGNING_KEY_ID})"
-
-      # R72 P0-15 step 4: 创建 signed production-v* tag (git tag -s)
-      # annotation 含 RC 身份字段,供 release-gates.yml 的 verify-rc-identity 解析
-      # (格式: key: value 行,与 release-gates.yml 第 3728-3732 行的解析逻辑一致)
-      - name: "R72 P0-15: Create signed production-v* tag (git tag -s)"
-        run: |
-          set -euo pipefail
-          RC_TAG="${{ steps.resolve.outputs.rc_tag }}"
-          RC_RUN_ID="${{ steps.resolve.outputs.rc_run_id }}"
-          RC_COMMIT_SHA="${{ steps.resolve.outputs.rc_commit_sha }}"
-          SOURCE_SHA="${{ steps.resolve.outputs.source_sha }}"
-          CANDIDATE_MANIFEST_DIGEST="${{ steps.resolve.outputs.candidate_manifest_digest }}"
-          IMAGE_DIGEST="${{ steps.resolve.outputs.image_digest }}"
-          IMAGE_REPO_DIGEST="${{ steps.verify_image.outputs.image_repo_digest }}"
-          PRODUCTION_TAG="${{ steps.resolve.outputs.production_tag }}"
-          GPG_SIGNING_KEY_ID="${{ secrets.GPG_SIGNING_KEY_ID }}"
-          echo "=== R72 P0-15: Create signed production tag (git tag -s) ==="
-          echo "  RC tag:           ${RC_TAG}"
-          echo "  RC run ID:        ${RC_RUN_ID}"
-          echo "  RC commit SHA:    ${RC_COMMIT_SHA}"
-          echo "  Production tag:   ${PRODUCTION_TAG}"
-          echo "  image_repo_digest: ${IMAGE_REPO_DIGEST}"
-
-          # 构造 annotation message(格式与 release-gates.yml verify-rc-identity
-          # 的 grep -iE '^rc-tag:' 解析逻辑严格对齐 — key: value 行,小写连字符分隔,
-          # 行首无前导空格)。使用 printf 而非 heredoc,避免 YAML run: | 块中
-          # heredoc body 缩进被保留导致 grep '^rc-tag:' 失配。
-          # git tag -F - 从 stdin 读取 annotation message。
-          {
-            printf 'Promote %s to production (R72 P0-15 thin wrapper)\n\n' "${RC_TAG}"
-            printf 'rc-tag: %s\n' "${RC_TAG}"
-            printf 'rc-run-id: %s\n' "${RC_RUN_ID}"
-            printf 'source-sha: %s\n' "${SOURCE_SHA}"
-            printf 'candidate-manifest-digest: %s\n' "${CANDIDATE_MANIFEST_DIGEST}"
-            printf 'image-digest: %s\n' "${IMAGE_DIGEST}"
-            printf 'image-repo-digest: %s\n' "${IMAGE_REPO_DIGEST}"
-            printf 'rc-commit-sha: %s\n' "${RC_COMMIT_SHA}"
-            printf '\n'
-            printf 'R72 P0-15: Identity verification delegated to release-gates.yml\n'
-            printf 'production-promotion-gate (verify-rc-identity job). This signed tag\n'
-            printf 'only proves the release manager authorized promotion of the RC\n'
-            printf 'identified by rc-run-id. All evidence artifact verification\n'
-            printf '(candidate manifest / OCI manifest / release attestation / SBOM)\n'
-            printf 'and image_repo_digest binding is re-verified by verify-rc-identity\n'
-            printf 'on the production-v* tag push trigger.\n'
-          } | git tag -s -u "${GPG_SIGNING_KEY_ID}" \
-              -F - \
-              "${PRODUCTION_TAG}" "${RC_COMMIT_SHA}"
-
-          # 推送前验证 tag 是 signed tag (defense in depth)
-          if ! git tag -v "${PRODUCTION_TAG}" >/dev/null 2>&1; then
-            echo "::error::Created tag '${PRODUCTION_TAG}' is not a signed tag"
-            echo "  R72 P0-15: production tag 必须为 GPG-signed tag (git tag -s)"
-            echo "  git tag -v 失败 — 请检查 GPG signing key 配置"
-            # 删除未签名的 tag(若存在)避免遗留半成品
-            git tag -d "${PRODUCTION_TAG}" >/dev/null 2>&1 || true
-            exit 1
-          fi
-          echo "PASS: tag '${PRODUCTION_TAG}' is a GPG-signed tag"
-
-          git push origin "${PRODUCTION_TAG}"
-          echo "PASS: Pushed signed production tag '${PRODUCTION_TAG}' at ${RC_COMMIT_SHA}"
-          echo ""
-          echo "  R72 P0-15: 推送 production-v* tag 会触发 release-gates.yml 的"
-          echo "  production-promotion-gate job,该 job 通过 verify-rc-identity"
-          echo "  重新下载 RC run artifacts 并完整核验所有身份字段。"
-
-      - name: "R72 P0-15: Promotion summary (thin wrapper)"
-        run: |
-          set -euo pipefail
-          RC_TAG="${{ steps.resolve.outputs.rc_tag }}"
-          RC_RUN_ID="${{ steps.resolve.outputs.rc_run_id }}"
-          RC_COMMIT_SHA="${{ steps.resolve.outputs.rc_commit_sha }}"
-          PRODUCTION_TAG="${{ steps.resolve.outputs.production_tag }}"
-          IMAGE_REPO_DIGEST="${{ steps.verify_image.outputs.image_repo_digest }}"
-          echo "=== R72 P0-15: Promotion Summary (thin wrapper) ==="
-          echo "  RC tag:            ${RC_TAG}"
-          echo "  RC run ID:         ${RC_RUN_ID}"
-          echo "  RC commit SHA:     ${RC_COMMIT_SHA}"
-          echo "  Production tag:    ${PRODUCTION_TAG}"
-          echo "  Image RepoDigest:  ${IMAGE_REPO_DIGEST}"
-          echo "  Trigger:           workflow_dispatch"
-          echo "  Tag type:          GPG-signed (git tag -s)"
-          echo "  Status:            SIGNED_TAG_PUSHED"
-          echo ""
-          echo "  R72 P0-15 整改说明:"
-          echo "    - 旧版本 (R70 P0-10) 的 5 个重复 job 已删除:"
-          echo "        validate-rc-candidate / verify-production-evidence /"
-          echo "        verify-rc-tag-immutability / promote-to-production /"
-          echo "        promotion-summary"
-          echo "    - 旧版本弱点已修复:"
-          echo "        - 用 gh run view <rc_run_id> 替代 gh run list --limit=1"
-          echo "        - 强制校验 RC run head SHA == RC tag commit"
-          echo "        - docker pull 后核对 RepoDigest (不只校验 commit 相同)"
-          echo "        - git tag -s 创建 signed tag (替代 git tag -a)"
-          echo "    - 所有完整身份校验委托给 release-gates.yml:"
-          echo "        production-promotion-gate -> verify-rc-identity"
-          echo "        (重新下载 RC run artifacts,完整核验 candidate manifest /"
-          echo "         OCI manifest / release attestation / SBOM)"
-          echo ""
-          echo "  下一步:"
-          echo "    1. release-gates.yml 的 production-promotion-gate 会重新校验所有证据"
-          echo "    2. 在 GitHub Environments 中确认 production deployment 已批准"
-          echo "    3. production-promotion-gate success 后触发实际生产部署"
+  # ─── R73 §5.6 (P0-07): Thin wrapper — delegate to reusable workflow ──
+  # 所有晋级步骤 (a-p) 由 _promote-verified-rc.yml 实现:
+  #   a.  Checkout at source_sha
+  #   b.  Download RC artifacts
+  #   c.  Verify RC tag signature (gh api + git verify-tag)
+  #   d.  Peel RC tag commit == source_sha
+  #   e.  Verify run event=push, ref=refs/tags/${rc_tag}
+  #   f.  Verify run conclusion=success, attempt matches
+  #   g.  Verify candidate manifest digest
+  #   h.  Recompute all artifact digests
+  #   i.  Verify image/runtime_config/SBOM/provenance/OCI digests
+  #   j.  scan_production_bypasses.py (no P0/P1)
+  #   k.  verify_rc_3x.py (rc gate level)
+  #   l.  No open break-glass events
+  #   m.  typed_confirmation verified
+  #   n.  Production tag did not exist
+  #   o.  Signed production tag created + pushed
+  #   p.  Production deployment trigger recorded
+  promote-via-reusable-workflow:
+    uses: ./.github/workflows/_promote-verified-rc.yml
+    with:
+      rc_tag: ${{ inputs.rc_tag }}
+      rc_run_id: ${{ inputs.rc_run_id }}
+      rc_run_attempt: ${{ inputs.rc_run_attempt }}
+      source_sha: ${{ inputs.source_sha }}
+      candidate_manifest_digest: ${{ inputs.candidate_manifest_digest }}
+      image_repo_digest: ${{ inputs.image_repo_digest }}
+      runtime_config_digest: ${{ inputs.runtime_config_digest }}
+      typed_confirmation: ${{ inputs.typed_confirmation }}
+      production_tag: ${{ inputs.production_tag }}

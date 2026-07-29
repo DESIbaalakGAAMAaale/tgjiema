@@ -329,7 +329,7 @@ class CockroachDBClient:
     def configure(self, url: str):
         self._url = url
 
-    async def connect_runtime_only(self):
+    async def connect_runtime_only(self, *, skip_cache_store: bool = False):
         """R37 P1-8: runtime_client 专用连接 — 只创建连接池 + 初始化 SQLite 缓存。
 
         职责边界(P1-8 拆分):
@@ -342,6 +342,11 @@ class CockroachDBClient:
           - 所有业务 Bot / crdb_sync / db_writer / admin / db_backup 的运行时连接
           - migration_runner 调用此方法获取连接池后执行 DDL
           - bootstrap_runner 调用此方法获取连接池后全量加载
+
+        参数:
+          skip_cache_store: 跳过 SQLite CacheStore 初始化。migration_runner 在
+            read-only rootfs 容器中运行时,/app/data 可能不可写,且 DDL 迁移
+            不需要缓存层 — 设为 True 避免 sqlite3.OperationalError。
 
         若 DDL 未执行(migration 未运行),业务查询会失败 — 由部署流程保证
         migration oneshot 先于业务 Bot 启动(systemd After= 依赖)。
@@ -422,12 +427,15 @@ class CockroachDBClient:
             self._pool = await asyncpg.create_pool(self._url, **pool_kwargs)
 
         # ─── SQLite 缓存备份：初始化并恢复内存缓存───
-        from .cache_store import get_cache_store
-        from .cache import load_cache_from_disk
+        # R80 P0-01: migration_runner 在 read-only rootfs 容器中运行时
+        # /app/data 不可写,且 DDL 迁移不需要缓存层 — 跳过初始化。
+        if not skip_cache_store:
+            from .cache_store import get_cache_store
+            from .cache import load_cache_from_disk
 
-        store = get_cache_store()
-        await store.init()
-        await load_cache_from_disk()
+            store = get_cache_store()
+            await store.init()
+            await load_cache_from_disk()
 
         logger.info(
             f"[DB] R37 P1-8 / R64 P1-10: runtime_client 已连接(role={role}, "

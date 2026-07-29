@@ -351,6 +351,8 @@ def decrypt_payload(
     backup_id: str = "",
     schema_version: str = "",
     key_id: str = "",
+    *,
+    allow_legacy_aad: bool = True,
 ) -> bytes:
     """解密备份 payload。
 
@@ -373,6 +375,8 @@ def decrypt_payload(
         backup_id: R40 P0-6 备份标识(用于重建 AAD)
         schema_version: R40 P0-6 schema 版本(用于重建 AAD)
         key_id: R40 P0-6 KEK 标识符(用于重建 AAD,从 manifest 读取)
+        allow_legacy_aad: 是否允许回退到旧版固定 AAD ``backup-payload``。
+            权威三对象恢复必须传 False，避免新备份降级到旧 AAD 语义。
 
     Returns:
         原始 backup JSON 字节
@@ -423,9 +427,15 @@ def decrypt_payload(
     # 旧备份: AAD = b"backup-payload" (向后兼容)
     aad_candidates: list[bytes] = []
     if backup_id or schema_version or key_id:
-        new_aad = f"{backup_id}|{schema_version}|{key_id}".encode("utf-8")
+        new_aad = f"{backup_id}|{schema_version}|{key_id}".encode()
         aad_candidates.append(new_aad)
-    aad_candidates.append(b"backup-payload")  # 向后兼容
+    if allow_legacy_aad:
+        aad_candidates.append(b"backup-payload")  # 仅旧备份迁移路径允许
+    if not aad_candidates:
+        raise AppError(
+            ErrorCodes.BACKUP_DECRYPT_AAD_CONTEXT_REQUIRED,
+            params={"reason": "exact_contract_aad_missing"},
+        )
 
     nonce = base64.b64decode(nonce_b64)
     last_error: Exception | None = None

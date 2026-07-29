@@ -119,35 +119,40 @@ class TestOrchestratorFile:
 
 
 # ════════════════════════════════════════════════════════════════
-# B. 11 个阶段定义完整性
+# B. 16 个阶段定义完整性(R73 §5.15 DAG)
 # ════════════════════════════════════════════════════════════════
 
 
 class TestPhaseDefinitions:
-    """R70 Wave 5 B: 11 个阶段定义完整性。"""
+    """R73 §5.15: 16 个阶段定义完整性(DAG 拓扑序)。"""
 
     EXPECTED_PHASES = [
         "preflight",
-        "start_core",
-        "start_bots",
-        "migration_check",
-        "health_check",
-        "redis_acl_check",
-        "business_smoke",
-        "backup_restore",
-        "sigterm",
-        "restart",
-        "teardown",
+        "start_infrastructure",
+        "start_application_roles",
+        "real_product_transaction_before_backup",
+        "full_backup_to_r2",
+        "blank_isolated_restore",
+        "restore_integrity_and_target_identity",
+        "actual_switch",
+        "real_product_transaction_after_switch",
+        "fault_injection",
+        "actual_rollback",
+        "real_product_transaction_after_rollback",
+        "sigterm_with_inflight_message",
+        "restart_and_pending_recovery",
+        "final_identity_and_cleanup",
+        "evidence_signing",
     ]
 
-    def test_phases_count_is_11(self, orch):
-        """PHASES 列表必须正好包含 11 个阶段。"""
-        assert len(orch.PHASES) == 11, (
-            f"PHASES 必须有 11 个阶段, 实际: {len(orch.PHASES)}"
+    def test_phases_count_is_16(self, orch):
+        """PHASES 列表必须正好包含 16 个阶段。"""
+        assert len(orch.PHASES) == 16, (
+            f"PHASES 必须有 16 个阶段, 实际: {len(orch.PHASES)}"
         )
 
     def test_phases_names_correct(self, orch):
-        """PHASES 名称必须按顺序匹配 R70 Wave 5 要求。"""
+        """PHASES 名称必须按顺序匹配 R73 §5.15 DAG 要求。"""
         actual_names = [name for name, _ in orch.PHASES]
         assert actual_names == self.EXPECTED_PHASES, (
             f"PHASES 名称不匹配: expected={self.EXPECTED_PHASES}, "
@@ -155,7 +160,7 @@ class TestPhaseDefinitions:
         )
 
     def test_phase_funcs_cover_all_phases(self, orch):
-        """PHASE_FUNCS 字典必须覆盖所有 11 个阶段。"""
+        """PHASE_FUNCS 字典必须覆盖所有 16 个阶段。"""
         for phase_name, _ in orch.PHASES:
             assert phase_name in orch.PHASE_FUNCS, (
                 f"PHASE_FUNCS 缺少阶段: {phase_name}"
@@ -556,10 +561,25 @@ class TestPhaseExecutionMocked:
         """preflight 在所有检查通过时返回 pass。"""
         # 模拟 docker 可用
         monkeypatch.setattr(orch.shutil, "which", lambda _: "/usr/bin/docker")
-        monkeypatch.setattr(
-            orch.subprocess, "run",
-            lambda *a, **kw: _make_completed_process(returncode=0),
-        )
+        # R73 §5.15: preflight 现在调用 scan_production_bypasses.py,
+        # 需要模拟 scanner 返回 passed=True 的 JSON 输出
+        import json as _json
+        _scanner_pass_json = _json.dumps({
+            "passed": True,
+            "policy_version": "test",
+            "summary": {"files_scanned": 1, "violations_by_severity": {}},
+            "violations": [],
+        })
+        def _mock_run(cmd, *args, **kwargs):
+            # scan_production_bypasses 命令:返回 passed=True 的 JSON
+            cmd_str = str(cmd)
+            if "scan_production_bypasses" in cmd_str:
+                return _make_completed_process(
+                    returncode=0, stdout=_scanner_pass_json,
+                )
+            # 其他命令(docker info 等):返回成功
+            return _make_completed_process(returncode=0)
+        monkeypatch.setattr(orch.subprocess, "run", _mock_run)
         # 模拟环境变量
         monkeypatch.setenv("TGJIEMA_IMAGE", "ghcr.io/maxiuquan/tgjiema@sha256:" + "a" * 64)
         monkeypatch.setenv("REDIS_WRITER_PASSWORD", "writer_pass")
@@ -720,8 +740,8 @@ class TestPhaseExecutionMocked:
             orch.PHASE_FUNCS.clear()
             orch.PHASE_FUNCS.update(original_funcs)
 
-    def test_keep_on_success_skips_teardown(self, orch, monkeypatch):
-        """--keep-on-success 时跳过 teardown 阶段。"""
+    def test_keep_on_success_skips_cleanup(self, orch, monkeypatch):
+        """--keep-on-success 时跳过 final_identity_and_cleanup 阶段。"""
         executed_phases: list[str] = []
 
         original_funcs = dict(orch.PHASE_FUNCS)
@@ -742,26 +762,31 @@ class TestPhaseExecutionMocked:
                 "--keep-on-success", "--timeout", "5",
             ])
             assert exit_code == 0
-            # teardown 不应被执行
-            assert "teardown" not in executed_phases, (
-                f"--keep-on-success 时不应执行 teardown, "
+            # final_identity_and_cleanup 不应被执行(--keep-on-success + 全部通过)
+            assert "final_identity_and_cleanup" not in executed_phases, (
+                f"--keep-on-success 时不应执行 final_identity_and_cleanup, "
                 f"实际执行: {executed_phases}"
             )
-            # 其他 10 个阶段应被执行
-            assert len(executed_phases) == 10, (
-                f"应执行 10 个阶段(排除 teardown), "
+            # 其他 15 个阶段应被执行(排除 final_identity_and_cleanup)
+            assert len(executed_phases) == 15, (
+                f"应执行 15 个阶段(排除 final_identity_and_cleanup), "
                 f"实际: {len(executed_phases)}"
             )
         finally:
             orch.PHASE_FUNCS.clear()
             orch.PHASE_FUNCS.update(original_funcs)
 
-    def test_first_failure_triggers_teardown_cleanup(self, orch, monkeypatch):
-        """阶段失败时若 teardown 未在执行列表,触发 teardown 清理。"""
+    def test_first_failure_dag_skips_downstream_runs_cleanup(self, orch, monkeypatch):
+        """R73 §5.15: 阶段失败时下游非 ALLOWED 阶段 skipped,cleanup 仍执行。
+
+        新 DAG 行为(替代旧 teardown 触发逻辑):
+        - 失败阶段之后的非 ALLOWED 阶段被 skipped(不调用 phase_func)
+        - ALLOWED_AFTER_FAILURE 阶段(final_identity_and_cleanup / evidence_signing)仍执行
+        - exit_code = 1(failure 不可逆)
+        """
         executed_phases: list[str] = []
 
         original_funcs = dict(orch.PHASE_FUNCS)
-        original_phase_teardown = orch.phase_teardown
 
         def make_pass_func(name):
             def _func(timeout):
@@ -784,36 +809,58 @@ class TestPhaseExecutionMocked:
                 )
             return _func
 
-        # preflight pass, start_core fail, 其余 pass
-        # --keep-on-success 设置,teardown 不在 phases_to_run 中
-        # start_core 失败时应触发 teardown 清理
+        # preflight pass, start_infrastructure fail, 其余 pass
+        # start_infrastructure 失败后,其下游非 ALLOWED 阶段应被 skipped
         orch.PHASE_FUNCS["preflight"] = make_pass_func("preflight")
-        orch.PHASE_FUNCS["start_core"] = make_fail_func("start_core")
-        # main() 失败清理时直接调用 phase_teardown(args.timeout)
-        # (不通过 PHASE_FUNCS["teardown"]),需同时 patch 模块级 phase_teardown
-        teardown_func = make_pass_func("teardown")
-        orch.PHASE_FUNCS["teardown"] = teardown_func
-        monkeypatch.setattr(orch, "phase_teardown", teardown_func)
+        orch.PHASE_FUNCS["start_infrastructure"] = make_fail_func("start_infrastructure")
         for phase_name, _ in orch.PHASES:
-            if phase_name not in ("preflight", "start_core", "teardown"):
+            if phase_name not in ("preflight", "start_infrastructure"):
                 orch.PHASE_FUNCS[phase_name] = make_pass_func(phase_name)
 
         try:
-            exit_code = orch.main([
-                "--keep-on-success", "--timeout", "5",
-            ])
-            assert exit_code == 1  # start_core 失败
-            # preflight 和 start_core 应执行
-            assert "preflight" in executed_phases
-            assert "start_core" in executed_phases
-            # teardown 应被触发清理(尽管 --keep-on-success)
-            assert "teardown" in executed_phases, (
-                "阶段失败时应触发 teardown 清理,即使 --keep-on-success"
+            exit_code = orch.main(["--timeout", "5"])
+            assert exit_code == 1, (
+                f"start_infrastructure 失败应返回 1, 实际: {exit_code}"
+            )
+            # preflight 和 start_infrastructure 应执行
+            assert "preflight" in executed_phases, (
+                "preflight 应执行"
+            )
+            assert "start_infrastructure" in executed_phases, (
+                "start_infrastructure 应执行(失败阶段)"
+            )
+            # 下游非 ALLOWED 阶段不应执行(应被 skipped)
+            downstream_non_allowed = [
+                "start_application_roles",
+                "real_product_transaction_before_backup",
+                "full_backup_to_r2",
+                "blank_isolated_restore",
+                "restore_integrity_and_target_identity",
+                "actual_switch",
+                "real_product_transaction_after_switch",
+                "fault_injection",
+                "actual_rollback",
+                "real_product_transaction_after_rollback",
+                "sigterm_with_inflight_message",
+                "restart_and_pending_recovery",
+            ]
+            for phase in downstream_non_allowed:
+                assert phase not in executed_phases, (
+                    f"阶段 {phase} 应被 skipped(上游失败), "
+                    f"但被实际执行了"
+                )
+            # ALLOWED_AFTER_FAILURE 阶段应执行(cleanup 和诊断)
+            assert "final_identity_and_cleanup" in executed_phases, (
+                "final_identity_and_cleanup (ALLOWED_AFTER_FAILURE) "
+                "应在上游失败后仍执行"
+            )
+            assert "evidence_signing" in executed_phases, (
+                "evidence_signing (ALLOWED_AFTER_FAILURE) "
+                "应在上游失败后仍执行"
             )
         finally:
             orch.PHASE_FUNCS.clear()
             orch.PHASE_FUNCS.update(original_funcs)
-            monkeypatch.setattr(orch, "phase_teardown", original_phase_teardown)
 
 
 # ════════════════════════════════════════════════════════════════

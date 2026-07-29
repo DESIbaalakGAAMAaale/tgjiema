@@ -1000,36 +1000,29 @@ def collect_dependency_status() -> dict:
             "last_r2_collect_age": float,     # R41 P1-10: R2 采集距今秒数(-1=从未)
         }
     """
-    # R71 RC31: CI 模式直接返回 ready=True
-    # CI 容器使用占位符凭证(CRDB/R2 未真实配置),
-    # schema_valid / crdb_sync_fresh / r2_collector_fresh 等 critical 检查
-    # 在 CI 下必然失败 → /health=503 → health_check 失败。
-    # CI 模式跳过依赖状态检查(与 RC27-RC30 CI 跳过模式一致)。
-    _is_ci = (
-        os.getenv("CI", "").lower() in ("true", "1")
-        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-    )
-    if _is_ci:
-        return {
-            "ready": True,
-            "passed": 7,
-            "checks": {
-                "sqlite_readable": True,
-                "recent_scrape": True,
-                "key_schema_exists": True,
-                "schema_valid": True,
-                "crdb_sync_fresh": True,
-                "r2_collector_fresh": True,
-                "acl_configured": True,
-            },
-            "details": {"ci_mode": "CI 模式: 跳过依赖状态检查"},
-            "ru_daily_usage": "0",
-            "last_crdb_sync_age": 0.0,
-            "last_r2_collect_age": 0.0,
-        }
+    # R73 P0-03: 删除 CI/GITHUB_ACTIONS 假绿色分支。
+    # 旧实现在 CI=true / GITHUB_ACTIONS=true 下直接返回 ready=True 并把
+    # sqlite_readable / recent_scrape / key_schema_exists / schema_valid /
+    # crdb_sync_fresh / r2_collector_fresh / acl_configured 七项全部伪造为 True,
+    # 使 RC Compose 中 Prometheus 角色在依赖完全失效的情况下仍 healthy。
+    # 现已删除该分支 — 所有环境一律执行真实检查。
+    # 启动宽限期(_STARTUP_GRACE_PERIOD)只允许暂时不让 freshness 类检查阻断启动,
+    # 但仍返回真实观测值、真实 age 和真实 error_code；critical 检查项
+    # (sqlite_readable / key_schema_exists / schema_valid / acl_configured)
+    # 在任何时刻都必须真实通过。
     global _last_crdb_sync_ts, _last_r2_collect_ts, _acl_configured, _schema_valid
     checks: dict[str, bool] = {}
     details: dict[str, str] = {}
+    # R73 §5.14: 结构化 check 对象(含 healthy / critical / observed_value /
+    # threshold / error_code)，由 checks_structured 字段返回。checks 仍保留
+    # dict[str, bool] 供旧调用方使用。
+    checks_structured: dict[str, dict[str, Any]] = {}
+    _checked_at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    _instance_id = (
+        os.getenv("HOSTNAME")
+        or os.getenv("CONTAINER_ID")
+        or f"pid:{os.getpid()}"
+    )
 
     # 1. SQLite 可读(cache_store.db 存在且可查询)
     sqlite_ok = False
@@ -1042,10 +1035,31 @@ def collect_dependency_status() -> dict:
             conn.close()
             sqlite_ok = True
             details["sqlite_readable"] = f"OK: {CACHE_STORE_DB}"
+            checks_structured["sqlite_readable"] = {
+                "healthy": True,
+                "critical": True,
+                "observed_value": str(CACHE_STORE_DB),
+                "threshold": None,
+                "error_code": None,
+            }
         except Exception as e:
             details["sqlite_readable"] = f"FAIL: {e}"
+            checks_structured["sqlite_readable"] = {
+                "healthy": False,
+                "critical": True,
+                "observed_value": str(CACHE_STORE_DB),
+                "threshold": None,
+                "error_code": f"SQLITE_READ_FAIL: {type(e).__name__}",
+            }
     else:
         details["sqlite_readable"] = f"FAIL: file not found {CACHE_STORE_DB}"
+        checks_structured["sqlite_readable"] = {
+            "healthy": False,
+            "critical": True,
+            "observed_value": str(CACHE_STORE_DB),
+            "threshold": None,
+            "error_code": "SQLITE_FILE_NOT_FOUND",
+        }
     checks["sqlite_readable"] = sqlite_ok
 
     # 2. 最近采集成功(_last_scrape_ok + data_age 未超阈值)
@@ -1060,6 +1074,13 @@ def collect_dependency_status() -> dict:
         f"OK: data_age={data_age:.1f}s" if scrape_recent
         else f"FAIL: _last_scrape_ok={_last_scrape_ok}, data_age={data_age:.1f}s"
     )
+    checks_structured["recent_scrape"] = {
+        "healthy": bool(scrape_recent),
+        "critical": False,  # freshness 类检查:启动宽限期内不阻塞 ready
+        "observed_value": data_age,
+        "threshold": _DATA_AGE_ALERT_THRESHOLD,
+        "error_code": None if scrape_recent else "RECENT_SCRAPE_STALE",
+    }
 
     # 3. 关键 schema 存在(kv_store 表存在,且至少有一个业务表)
     schema_ok = False
@@ -1080,10 +1101,31 @@ def collect_dependency_status() -> dict:
             details["key_schema_exists"] = (
                 f"OK: {row[0]}" if row else "FAIL: 无关键业务表"
             )
+            checks_structured["key_schema_exists"] = {
+                "healthy": schema_ok,
+                "critical": True,
+                "observed_value": row[0] if row else None,
+                "threshold": None,
+                "error_code": None if schema_ok else "KEY_SCHEMA_MISSING",
+            }
         except Exception as e:
             details["key_schema_exists"] = f"FAIL: {e}"
+            checks_structured["key_schema_exists"] = {
+                "healthy": False,
+                "critical": True,
+                "observed_value": None,
+                "threshold": None,
+                "error_code": f"SCHEMA_QUERY_FAIL: {type(e).__name__}",
+            }
     else:
         details["key_schema_exists"] = "SKIP: sqlite 不可读"
+        checks_structured["key_schema_exists"] = {
+            "healthy": False,
+            "critical": True,
+            "observed_value": None,
+            "threshold": None,
+            "error_code": "SQLITE_UNREADABLE",
+        }
     checks["key_schema_exists"] = schema_ok
 
     # 4. R41 P1-10: backup_schema.validate_schema() 校验
@@ -1104,10 +1146,28 @@ def collect_dependency_status() -> dict:
             f"OK: empty_columns=[]" if schema_valid_ok
             else f"FAIL: empty_columns={empty_cols[:5]}"
         )
+        checks_structured["schema_valid"] = {
+            "healthy": schema_valid_ok,
+            "critical": True,
+            "observed_value": {
+                "empty_columns_count": len(empty_cols),
+                "missing_tables": result.get("missing_tables", []),
+                "extra_tables": result.get("extra_tables", []),
+            },
+            "threshold": "empty_columns == []",
+            "error_code": None if schema_valid_ok else "SCHEMA_EMPTY_COLUMNS",
+        }
     except Exception as e:
         _schema_valid = False
         checks["schema_valid"] = False
         details["schema_valid"] = f"FAIL: {e}"
+        checks_structured["schema_valid"] = {
+            "healthy": False,
+            "critical": True,
+            "observed_value": None,
+            "threshold": "empty_columns == []",
+            "error_code": f"SCHEMA_VALIDATE_FAIL: {type(e).__name__}",
+        }
 
     # 5. R41 P1-10: CRDB 同步新鲜度(kv_store.crdb_sync_last_success)
     # crdb_sync 服务每次成功同步后写入 kv_store.crdb_sync_last_success = ISO 时间戳
@@ -1139,6 +1199,13 @@ def collect_dependency_status() -> dict:
         f"OK: age={crdb_sync_age:.1f}s" if crdb_sync_fresh
         else f"FAIL: age={crdb_sync_age:.1f}s, last_ts={_last_crdb_sync_ts}"
     )
+    checks_structured["crdb_sync_fresh"] = {
+        "healthy": bool(crdb_sync_fresh),
+        "critical": False,  # freshness 类检查:启动宽限期内不阻塞 ready
+        "observed_value": crdb_sync_age,
+        "threshold": _CRDB_SYNC_FRESH_THRESHOLD,
+        "error_code": None if crdb_sync_fresh else "CRDB_SYNC_STALE",
+    }
 
     # 6. R41 P1-10: R2 采集新鲜度(kv_store.r2_last_collect_time)
     # r2_collector 服务每次成功采集后写入 kv_store.r2_last_collect_time = ISO 时间戳
@@ -1168,6 +1235,13 @@ def collect_dependency_status() -> dict:
         f"OK: age={r2_collect_age:.1f}s" if r2_collector_fresh
         else f"FAIL: age={r2_collect_age:.1f}s, last_ts={_last_r2_collect_ts}"
     )
+    checks_structured["r2_collector_fresh"] = {
+        "healthy": bool(r2_collector_fresh),
+        "critical": False,  # freshness 类检查:启动宽限期内不阻塞 ready
+        "observed_value": r2_collect_age,
+        "threshold": _R2_COLLECT_FRESH_THRESHOLD,
+        "error_code": None if r2_collector_fresh else "R2_COLLECT_STALE",
+    }
 
     # 7. R41 P1-10: ACL 配置完整性(REDIS_*_PASSWORD 4 个变量)
     # 注意:仅检查环境变量是否设置,不读取密码值(避免日志泄漏)
@@ -1187,6 +1261,16 @@ def collect_dependency_status() -> dict:
         "OK: all 4 REDIS_*_PASSWORD env vars configured" if _acl_configured
         else f"FAIL: missing {missing_envs}"
     )
+    checks_structured["acl_configured"] = {
+        "healthy": _acl_configured,
+        "critical": True,
+        "observed_value": {
+            "configured_count": len(required_redis_envs) - len(missing_envs),
+            "required_count": len(required_redis_envs),
+        },
+        "threshold": "all REDIS_*_PASSWORD present",
+        "error_code": None if _acl_configured else "ACL_MISSING_ENV",
+    }
 
     # R41 P1-10: RU 采集状态(unknown vs 数字)
     # kv_store 中 crdb_ru_daily 不存在或 SQLite 不可读时显示 "unknown"
@@ -1225,10 +1309,21 @@ def collect_dependency_status() -> dict:
         ready = all(critical_checks)
     else:
         ready = all(checks.values())
+    grace_remaining = max(
+        0.0,
+        _STARTUP_GRACE_PERIOD - (time.time() - _STARTUP_TS)
+        if _STARTUP_TS > 0 else 0.0
+    )
     return {
         "ready": ready,
+        "role": "prometheus_exporter",
+        "instance_id": _instance_id,
+        "in_startup_grace": bool(in_grace),
+        "startup_grace_remaining_seconds": grace_remaining,
+        "checked_at": _checked_at,
         "passed": passed,
         "checks": checks,
+        "checks_structured": checks_structured,
         "details": details,
         "ru_daily_usage": ru_daily_usage,
         "last_crdb_sync_age": crdb_sync_age,

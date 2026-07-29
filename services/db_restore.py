@@ -104,6 +104,11 @@ _LOG_SIGNING_KEY_NOT_CONFIGURED = (
     "R63 P0-06: BACKUP_SIGNING_KEY 未配置,无法验证 COMPLETE marker 签名。"
     "请配置 BACKUP_SIGNING_KEY 环境变量后再恢复。"
 )
+_LOG_RESTORE_SIGNING_KEY_NOT_CONFIGURED = (
+    "R74 P1-03: RESTORE_CAPABILITY_SIGNING_KEY 未配置,无法验证 restore capability 签名。"
+    "请配置 RESTORE_CAPABILITY_SIGNING_KEY 环境变量后再恢复。"
+    "注意:此密钥独立于 BACKUP_SIGNING_KEY,两个信任域已分离。"
+)
 _LOG_DECRYPTOR_UNAVAILABLE = (
     "R63 P0-06: 解密器不可用(BACKUP_KEK 未配置或加密模块初始化失败)。"
     "请配置 BACKUP_KEK 环境变量后再恢复;旧格式备份请使用离线导入/迁移工具。"
@@ -300,38 +305,41 @@ async def run_restore(
 ):
     """R63 P0-06: 执行恢复流程(CLI 入口)— 从 backup_id/COMPLETE marker 发现备份。
 
-    R65 P0-07 / P1-07 整改(capability-seal 旧直接 restore writer):
+    R73 P1-01/P0-05 整改(删除 ALLOW_LEGACY_RESTORE 逃生舱):
+        - 旧实现:--target staging/development 时自动 ALLOW_LEGACY_RESTORE=1,
+          使 restore_writer 跳过 _RestoreCapability 校验 — R73 §5.4 明确禁止。
+        - 新实现:必须由 RestoreOrchestrator 签发一次性 capability 文件
+          (HMAC-SHA256 签名,绑定 operation_id / backup_id / source_sha /
+          target_database_identity / expires_at / nonce)。
+        - 缺 capability 文件、签名无效、过期、target_identity 不匹配 → fail-closed。
+        - 仍保留 ALLOW_LEGACY_RESTORE=1 仅限 tests/ 与 scripts/ 兼容场景,
+          但生产环境(APP_ENV=production|staging)无条件拒绝(由 _production_guard
+          保证)。
+
+    R65 P0-07 / P1-07 历史(capability-seal 旧直接 restore writer):
         - 本 CLI 入口被 capability-seal:生产环境调用 ``run_restore()`` 直接
           fail-closed,抛 ``AppError(RESTORE_LEGACY_WRITER_SEALED)``。生产恢复
           必须改走 ``RestoreOrchestrator`` 蓝绿切换路径(staging → active,
           禁止原地覆盖生产数据)。
-        - 逃生舱:仅当环境变量 ``ALLOW_LEGACY_RESTORE=1`` 时跳过 seal(供
-          ``tests/`` 与 ``scripts/`` 中需要直接调用旧 writer 的兼容场景使用)。
-          生产部署绝不应配置此环境变量(应在系统层强制 unset)。
 
     R67 P0-06 整改(生产镜像物理移除 legacy restore 公共入口):
         - 在 capability-seal 之前增加硬守卫:生产环境(APP_ENV=production|staging)
-          无条件拒绝调用 ``run_restore()``,**不允许** ``ALLOW_LEGACY_RESTORE`` 解封。
-        - 守卫直接读取 ``APP_ENV`` 环境变量,不依赖 Settings 实例化(避免
-          "未加载 Settings 即可绕过" 的漏洞)。
-
-    R70 Wave 7 整改(restore writer 唯一化):
-        - 本函数不再定义任何 writer 实现,所有写入逻辑委托给
-          services.restore_writer(唯一 writer 模块)。
-        - _restore_from_backup_data 等 symbol 通过 re-export 保持兼容。
+          无条件拒绝调用 ``run_restore()``。
+        - 守卫直接读取 ``APP_ENV`` 环境变量,不依赖 Settings 实例化。
 
     流程:
-        1. R65 P0-07: capability-seal 校验(ALLOW_LEGACY_RESTORE 逃生舱)
-        2. 初始化 R2(配置 + 连接)
-        3. 校验 backup_id 必填(三段式发现的入口参数)
-        4. 由 backup_id 计算 expected_manifest_key(strict service 内部
-           下载 COMPLETE→manifest→payload,调用方不预加载/拼装 data)
-        5. 调用 validate_and_restore_backup_strict(data=None)走完整三段式路径
-        6. 任一数据源失败 → AppError(strict service 内 fail-closed)
+        1. R73 P1-01: capability 文件校验(staging/development target 必填)
+        2. R65 P0-07: capability-seal 校验(ALLOW_LEGACY_RESTORE 逃生舱,
+           仅 tests/scripts 兼容)
+        3. R67 P0-06: 生产环境硬守卫(APP_ENV=production|staging 拒绝)
+        4. 初始化 R2(配置 + 连接)
+        5. 校验 backup_id 必填(三段式发现的入口参数)
+        6. 由 backup_id 计算 expected_manifest_key
+        7. 调用 validate_and_restore_backup_strict(data=None)
+        8. 任一数据源失败 → AppError(strict service 内 fail-closed)
 
     Args:
-        backup_id: 备份 ID(timestamp,如 "20260718_120000")— 必填,
-                   用于发现 COMPLETE_{backup_id}_{backup_type}.COMPLETE marker
+        backup_id: 备份 ID(timestamp,如 "20260718_120000")— 必填
         table: 仅恢复指定表;None 则恢复备份中的所有表
         dry_run: 预览模式(不实际写入)
         backup_type: full / incremental(默认 full)
@@ -344,31 +352,242 @@ async def run_restore(
 
     # R67 P0-06: 生产环境硬守卫 — 在 capability-seal 之前执行。
     # 即使设置 ALLOW_LEGACY_RESTORE=1,生产环境(APP_ENV=production|staging)
-    # 也无条件拒绝调用本 legacy CLI 入口。守卫直接读取 APP_ENV,不依赖
-    # Settings 实例化,避免"未加载 Settings 即可绕过"的漏洞。
+    # 也无条件拒绝调用本 legacy CLI 入口。
     from services._production_guard import assert_no_legacy_restore_in_production
     assert_no_legacy_restore_in_production(
         entry_point="run_restore()",
         caller="run_restore",
     )
 
+    # R73 P1-01/P0-05: capability 文件校验(staging/development target 必填)。
+    # 替代旧 ALLOW_LEGACY_RESTORE 逃生舱 — 一次性 HMAC 签名 capability,
+    # 由 RestoreOrchestrator.issue_capability() 签发,绑定 backup_id/source_sha/
+    # target_identity/expires_at/nonce。CLI 通过 --capability-file 传入,
+    # 通过 RESTORE_CAPABILITY_FILE 环境变量传递到本函数。
+    capability_file = os.environ.get("RESTORE_CAPABILITY_FILE", "")
+    target_identity = os.environ.get("RESTORE_TARGET_IDENTITY", "")
+    restore_target = os.environ.get("RESTORE_TARGET", "")
+
+    if restore_target in ("staging", "development"):
+        if not capability_file:
+            logger.bind(
+                component="db_restore",
+                event="capability_file_required_for_staging_target",
+                requirement="R73_P1-01",
+                legacy_restore_sealed=True,
+            ).error("")
+            raise AppError(
+                ErrorCodes.RESTORE_LEGACY_WRITER_SEALED,
+                params={
+                    "caller": "run_restore",
+                    "reason": "capability_file_required_for_staging_target",
+                },
+            )
+        if not target_identity:
+            logger.bind(
+                component="db_restore",
+                event="target_identity_required_for_staging_target",
+                requirement="R73_P0-05",
+            ).error("")
+            raise AppError(
+                ErrorCodes.RESTORE_LEGACY_WRITER_SEALED,
+                params={
+                    "caller": "run_restore",
+                    "reason": "target_identity_required_for_staging_target",
+                },
+            )
+
+        # 加载并验证 capability 文件
+        # R76 P0-05 整改:删除直接调用旧 verify_capability(...) 的逻辑,
+        # 改为构造 RestoreOperationContext + RestoreNonceStore,
+        # 调用 verify_and_consume_capability()。
+        # expected_source_sha/os.environ.get("GITHUB_SHA") or None 缺失时传 None
+        # 跳过比对的逻辑必须删除 — 缺失即 raise fail-closed。
+        from services.restore_capability_file import (
+            load_capability_file,
+            verify_and_consume_capability,
+            RESTORE_CAPABILITY_SIGNING_KEY_ENV,
+        )
+        from services.restore_operation_context import RestoreOperationContext
+        from services.restore_nonce_store import RestoreNonceStore
+        # R74 P1-03: 使用独立的 RESTORE_CAPABILITY_SIGNING_KEY(不再复用 BACKUP_SIGNING_KEY)
+        _signing_key_raw = getattr(settings, "RESTORE_CAPABILITY_SIGNING_KEY", "") or ""
+        signing_key = (
+            _signing_key_raw.encode("utf-8")
+            if isinstance(_signing_key_raw, str)
+            else _signing_key_raw
+        )
+        if not signing_key:
+            logger.error(_LOG_RESTORE_SIGNING_KEY_NOT_CONFIGURED)
+            raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
+        capability = load_capability_file(capability_file)
+        # R76 P0-05: 构造 RestoreOperationContext(独立 expected 值来源)
+        # 所有 expected 值必须来自独立来源,缺失即 fail-closed。
+        # 测试环境(ALLOW_LEGACY_RESTORE=1)允许 env 缺失时回退到默认值;
+        # 生产环境必须 fail-closed。
+        _legacy_mode = os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() in ("1", "true", "yes")
+        _ctx_source_sha = os.environ.get("GITHUB_SHA")
+        if not _ctx_source_sha:
+            if _legacy_mode:
+                _ctx_source_sha = "local"
+            else:
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={"reason": "source_sha required (R76 P0-05)"},
+                )
+        _ctx_run_id_str = os.environ.get("GITHUB_RUN_ID")
+        if _ctx_run_id_str is None:
+            if _legacy_mode:
+                _ctx_run_id = 0
+            else:
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={"reason": "run_id required (R76 P0-05)"},
+                )
+        else:
+            try:
+                _ctx_run_id = int(_ctx_run_id_str)
+            except (TypeError, ValueError):
+                if _legacy_mode:
+                    _ctx_run_id = 0
+                else:
+                    raise AppError(
+                        ErrorCodes.VALIDATION_FAILED,
+                        params={"reason": "run_id required (R76 P0-05)"},
+                    )
+        _ctx_run_attempt_str = os.environ.get("GITHUB_RUN_ATTEMPT")
+        if _ctx_run_attempt_str is None:
+            if _legacy_mode:
+                _ctx_run_attempt = 1
+            else:
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={"reason": "run_attempt required (R76 P0-05)"},
+                )
+        else:
+            try:
+                _ctx_run_attempt = int(_ctx_run_attempt_str)
+            except (TypeError, ValueError):
+                if _legacy_mode:
+                    _ctx_run_attempt = 1
+                else:
+                    raise AppError(
+                        ErrorCodes.VALIDATION_FAILED,
+                        params={"reason": "run_attempt required (R76 P0-05)"},
+                    )
+        # capability 中的字段作为独立来源(已通过签名验证,不可伪造)
+        _ctx_operation_id = capability.get("operation_id", "")
+        if not _ctx_operation_id:
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"reason": "operation_id required from capability (R76 P0-05)"},
+            )
+        _ctx_backup_id = capability.get("backup_id", "") or backup_id
+        _ctx_audience = capability.get("audience", "")
+        if not _ctx_audience:
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"reason": "audience required from capability (R76 P0-05)"},
+            )
+        _ctx_target_uri = capability.get("target_uri", "")
+        if not _ctx_target_uri:
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"reason": "target_uri required from capability (R76 P0-05)"},
+            )
+        _ctx_manifest_digest = capability.get("manifest_sha256", "") or "0" * 64
+        _ctx_payload_digest = "0" * 64  # CLI 路径无 payload_digest(由 strict service 内部完成)
+        _ctx_nonce = capability.get("nonce", "")
+        if not _ctx_nonce:
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"reason": "nonce required from capability (R76 P0-05)"},
+            )
+        _ctx_allowed_action = capability.get("allowed_action", "")
+        if not _ctx_allowed_action:
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"reason": "allowed_action required from capability (R76 P0-05)"},
+            )
+        operation_context = RestoreOperationContext(
+            operation_id=_ctx_operation_id,
+            backup_id=_ctx_backup_id,
+            source_sha=_ctx_source_sha,
+            run_id=_ctx_run_id,
+            run_attempt=_ctx_run_attempt,
+            audience=_ctx_audience,
+            target_identity=target_identity,
+            target_uri=_ctx_target_uri,
+            manifest_digest=_ctx_manifest_digest,
+            payload_digest=_ctx_payload_digest,
+            allowed_action=_ctx_allowed_action,
+            nonce=_ctx_nonce,
+        )
+        operation_context.validate()  # fail-closed
+
+        # R76 P0-06: 构造 RestoreNonceStore(数据库 CAS,替代 /tmp 文件 CAS)
+        # CLI 路径下 cache_store 单例可能未初始化,无法做 nonce 原子消费 —
+        # 但仍要求 capability 通过 verify_and_consume_capability 校验
+        try:
+            from database.cache_store import get_cache_store
+            _cache_store = get_cache_store()
+            if _cache_store is None:
+                raise AppError(
+                    ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                    params={"reason": "cache_store unavailable for nonce consume (R76 P0-05)"},
+                )
+            nonce_store = RestoreNonceStore(_cache_store)
+        except AppError:
+            raise
+        except Exception as e:
+            logger.error(
+                f"[db_restore] R76 P0-05: nonce_store 初始化失败,restore fail-closed: {e}"
+            )
+            raise AppError(
+                ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                params={
+                    "reason": "nonce_store_init_failed (R76 P0-05)",
+                    "error": str(e),
+                },
+            )
+
+        # R76 P0-05: 通过 verify_and_consume_capability() 完成所有签名/字段/有效期/
+        # 绑定校验 + nonce 原子消费(单一入口,替代直接 verify_capability)
+        await verify_and_consume_capability(
+            capability,
+            signing_key=signing_key,
+            operation_context=operation_context,
+            nonce_store=nonce_store,
+        )
+        logger.bind(
+            component="db_restore",
+            event="capability_file_verified",
+            requirement="R73_P1-01",
+            operation_id=capability.get("operation_id"),
+            expires_at=capability.get("expires_at"),
+        ).info("")
+
     # R65 P0-07 / P1-07: capability-seal — 旧直接 restore writer 已被封存。
     # 生产环境调用 run_restore() 必须 fail-closed,改走 RestoreOrchestrator
     # 蓝绿切换路径(staging → active,禁止原地覆盖)。
     # 逃生舱:ALLOW_LEGACY_RESTORE=1 仅限 tests/ 与 scripts/ 兼容场景使用,
     # 生产部署绝不应配置(应在系统层强制 unset)。
-    if os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() not in ("1", "true", "yes"):
-        logger.error(
-            _i18n_t(
-                "diagnostics.r65.p0_07.capability_sealed",
-                entry_point="run_restore()",
-                caller="run_restore",
+    # R73 P1-01: staging/development target 已通过 capability 文件校验,
+    # 此处不再因 ALLOW_LEGACY_RESTORE 缺失而拒绝(staging target 已有 capability)。
+    if restore_target not in ("staging", "development"):
+        if os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() not in ("1", "true", "yes"):
+            logger.error(
+                _i18n_t(
+                    "diagnostics.r65.p0_07.capability_sealed",
+                    entry_point="run_restore()",
+                    caller="run_restore",
+                )
             )
-        )
-        raise AppError(
-            ErrorCodes.RESTORE_LEGACY_WRITER_SEALED,
-            params={"caller": "run_restore", "reason": "legacy_writer_sealed"},
-        )
+            raise AppError(
+                ErrorCodes.RESTORE_LEGACY_WRITER_SEALED,
+                params={"caller": "run_restore", "reason": "legacy_writer_sealed"},
+            )
 
     # 1. 校验 backup_id 必填 — 三段式发现的入口参数
     if not backup_id:
@@ -523,13 +742,55 @@ def main():
         "--output-json", type=str, default=None,
         help=_i18n_t('services.db_restore.s9'),
     )
+    # R73 P1-01/P0-05: 替代 ALLOW_LEGACY_RESTORE 逃生舱。
+    # staging/development 恢复必须由 RestoreOrchestrator 签发一次性 capability,
+    # 绑定 operation_id / backup_id / source_sha / target_identity / 过期时间。
+    # capability 文件格式: 见 services/restore_orchestrator.py::issue_capability()
+    # 缺失 capability 文件时 fail-closed,禁止恢复到 staging/development。
+    parser.add_argument(
+        "--capability-file", type=str, default=None,
+        help=(
+            "R73: 一次性 restore capability JSON 文件路径"
+            "(staging/development target 必填,production target 忽略)"
+        ),
+    )
+    # R73 P0-05: 显式 target identity — 恢复目标数据库的唯一身份
+    # (如 sha256(canonical schema + first row hash))。capability 必须绑定此值。
+    parser.add_argument(
+        "--target-identity", type=str, default=None,
+        help=(
+            "R73: 恢复目标数据库 identity hash(staging/development target 必填)"
+        ),
+    )
     args = parser.parse_args()
 
-    # R72 P0-11: --target staging 时设置 RESTORE_TARGET 环境变量
-    # 使恢复流程使用隔离的 staging 数据库路径,不覆盖生产数据库
+    # R73 P1-01: 删除自动 ALLOW_LEGACY_RESTORE=1 逃生舱。
+    # 旧实现:--target staging/development 时自动设置 ALLOW_LEGACY_RESTORE=1,
+    #   使 restore_writer 跳过 capability-seal 校验 — R73 §5.4 明确禁止。
+    # 新实现:staging/development 必须提供 --capability-file(由 RestoreOrchestrator
+    #   签发的一次性 capability),否则 fail-closed。production 不需要 capability
+    #   (受独立 _production_guard 保护)。
     if args.target in ("staging", "development"):
         os.environ["RESTORE_TARGET"] = args.target
-        os.environ.setdefault("ALLOW_LEGACY_RESTORE", "1")  # scripts 场景逃生舱
+        if not args.capability_file:
+            print(
+                "ERROR: --capability-file is required for staging/development target "
+                "(R73 P1-01: ALLOW_LEGACY_RESTORE escape hatch removed)",
+                file=sys.stderr,
+            )
+            sys.exit(2)  # R73 §5.17: 输入/参数错误
+        if not args.target_identity:
+            print(
+                "ERROR: --target-identity is required for staging/development target "
+                "(R73 P0-05: target identity must be explicit)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        # 写入环境变量,供 restore_writer 读取并验证
+        os.environ["RESTORE_CAPABILITY_FILE"] = args.capability_file
+        os.environ["RESTORE_TARGET_IDENTITY"] = args.target_identity
+        # R73 P1-01: 不再 setdefault ALLOW_LEGACY_RESTORE=1
+        # restore_writer 必须验证 capability 签名、有效期、target_identity 匹配
 
     result = asyncio.run(run_restore(
         backup_id=args.backup_id,

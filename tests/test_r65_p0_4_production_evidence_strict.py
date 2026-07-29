@@ -633,13 +633,13 @@ class TestReleaseGatesWorkflow:
         )
 
     def test_production_promotion_gate_needs_production_evidence(self, workflow_yaml):
-        """production-promotion-gate 必须依赖 production-evidence job。"""
+        """production-promotion-gate 必须依赖 generate-evidence-envelope job。"""
         job = workflow_yaml["jobs"]["production-promotion-gate"]
         needs = job.get("needs", [])
         if isinstance(needs, str):
             needs = [needs]
-        assert "production-evidence" in needs, (
-            "production-promotion-gate 必须依赖 production-evidence job"
+        assert "generate-evidence-envelope" in needs, (
+            "production-promotion-gate 必须依赖 generate-evidence-envelope job"
         )
 
     def test_production_promotion_gate_calls_verify_promotion(self, workflow_content):
@@ -671,10 +671,10 @@ class TestReleaseGatesWorkflow:
         )
 
     def test_production_evidence_job_continues_for_prs(self, workflow_yaml):
-        """production-evidence job 必须在 PR/push 时继续运行(生成 dry-run)。"""
-        pe = workflow_yaml["jobs"].get("production-evidence", {})
+        """generate-evidence-envelope job 必须在 PR/push 时继续运行(生成 dry-run)。"""
+        pe = workflow_yaml["jobs"].get("generate-evidence-envelope", {})
         # 必须有 if: always()(PR/push 都运行)
         if_cond = pe.get("if", "")
         assert "always()" in if_cond, (
-            "production-evidence 必须以 if: always() 在 PR/push 上继续运行"
+            "generate-evidence-envelope 必须以 if: always() 在 PR/push 上继续运行"
         )

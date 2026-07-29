@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "policy_version": "r73-1",
+  "source_sha": "29cd843ecc849b02cd5b497e96e795d448e3722e",
+  "scanned_at": "2026-07-26T13:41:33.904151+00:00",
+  "violations": [],
+  "summary": {
+    "files_scanned": 189,
+    "violations_by_severity": {
+      "P0": 0,
+      "P1": 0
+    }
+  }
+}

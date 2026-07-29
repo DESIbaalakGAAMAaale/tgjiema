@@ -1,5 +1,5 @@
 {
-  "_comment": "R71 P1-01/02/03: Solo Founder Branch Ruleset (single ruleset, no approval deadlock). Maintainer @maxiuquan is the sole developer. Required approvals = 0 (solo). strict_required_status_checks_policy=true (current-SHA). Required status checks cover ALL real release-gates.yml job names. No admin bypass. Break-glass allowed only with audit log.",
+  "_comment": "R71 P1-01/02/03 + R76 P1-07/P1-08 + R83 merge-deadlock correction: Solo Founder Branch Ruleset (single ruleset, no approval deadlock). Maintainer @maxiuquan is the sole developer. Required approvals = 0 (solo). strict_required_status_checks_policy=true (current-SHA). Required status checks cover ALL real release-gates.yml job names including secretless-crdb-closed-loop-gate (R76 P1-07). No admin bypass. The branch update restriction is intentionally absent because GitHub applies it to PR merges too; PR-only enforcement comes from the pull_request rule. Break-glass allowed only with audit log.",
   "_schema": "github_repository_ruleset_api_response",
   "_r71_solo_founder_requirements": {
     "target": "branch",
@@ -8,7 +8,7 @@
     "conditions.ref_name.include": "[\"refs/heads/master\", \"refs/heads/main\"]",
     "deletion": "false — no deleting master/main",
     "non_fast_forward": "false — no force push",
-    "update": "false — no direct update (PR-only)",
+    "update": "absent — the GitHub update restriction blocks PR merges too; pull_request enforces PR-only",
     "required_signatures": "true — signed commits required",
     "required_linear_history": "true — no merge commits (squash/rebase only, replaces BP strict=true)",
     "pull_request.required_approving_review_count": "0 — solo founder, no human approval deadlock",
@@ -16,7 +16,7 @@
     "pull_request.dismiss_stale_reviews_on_push": "true — invalidate stale approvals on new push",
     "pull_request.required_review_thread_resolution": "true — conversations must be resolved",
     "required_status_checks.strict_required_status_checks_policy": "true — current-SHA strict (no stale parent commit)",
-    "required_status_checks.required_status_checks": "covers only PR/master-event-producible checks (R72 P1-06: removed 8 tag-only/environment-only checks: compose-runtime-e2e, sign-image, publish-attestation, attestation-semantics-verify, verify-only-3x, migration-binding-gate, verify-rc-identity, production-promotion-gate; R72 RC61: removed 4 more PR-skipped checks: sign-artifacts, verify-git-source-governance, tag-ruleset-verify, bind-runtime-config — all 12 are skipped on pull_request events due to if: conditions)",
+    "required_status_checks.required_status_checks": "covers only PR/master-event-producible checks (R74 P1-06: promote-rc-reusable replaced with validate-promotion-workflow — promotion job is workflow_dispatch only, must not be PR required context; R72 P1-06: removed 8 tag-only/environment-only checks; R72 RC61: removed 4 more PR-skipped checks)",
     "bypass_actors": "[] — no admin/app bypass; break-glass via separate audit log"
   },
   "name": "R71 Solo Founder Branch Ruleset",
@@ -33,7 +33,6 @@
   "rules": [
     {"type": "deletion"},
     {"type": "non_fast_forward"},
-    {"type": "update"},
     {"type": "required_signatures"},
     {"type": "required_linear_history"},
     {
@@ -72,10 +71,11 @@
           {"context": "verify-branch-ruleset"},
           {"context": "rc-continuity"},
           {"context": "crdb-ru-72h-attribution-gate"},
-          {"context": "production-evidence"},
+          {"context": "validate-promotion-workflow"},
           {"context": "oci-allowlist-verify"},
           {"context": "validate-oci-rootfs"},
           {"context": "runtime-smoke-compose"},
+          {"context": "secretless-crdb-closed-loop-gate"},
           {"context": "release-summary"}
         ],
         "strict_required_status_checks_policy": true,

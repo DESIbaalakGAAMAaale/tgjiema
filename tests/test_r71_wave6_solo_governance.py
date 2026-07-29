@@ -83,7 +83,7 @@ CONFIGURE_RULESET_SH = REPO_ROOT / "scripts" / "configure_branch_ruleset.sh"
 VERIFY_RULESET_SH = REPO_ROOT / "scripts" / "verify_branch_ruleset.sh"
 RECORD_BREAK_GLASS_PY = REPO_ROOT / "scripts" / "record_break_glass.py"
 
-# R71 P1-02 / R72 P1-06 / R72 RC60 / R72 RC61: 27 个必需 status checks(仅 PR/master 事件可产生的 check)
+# R71 P1-02 / R72 P1-06 / R72 RC60 / R72 RC61 / R73 §5.7: 必需 status checks(仅 PR/master 事件可产生的 check)
 # 与 .github/branch_ruleset.expected.json / configure_branch_ruleset.sh / verify_branch_ruleset.sh 保持一致
 # R72 P1-06: 移除 8 个 tag-only/environment-only 的 check(compose-runtime-e2e /
 # sign-image / publish-attestation / attestation-semantics-verify / verify-only-3x /
@@ -94,6 +94,15 @@ RECORD_BREAK_GLASS_PY = REPO_ROOT / "scripts" / "record_break_glass.py"
 # R72 RC61: 移除 4 个 PR 事件下 skipped 的 check(sign-artifacts / verify-git-source-governance /
 # tag-ruleset-verify / bind-runtime-config — 其 if: 条件在 PR 事件下不满足,导致
 # strict_required_status_checks_policy=true 阻断 PR 合并;31→27 项)
+# R73 §5.7: 移除 production-evidence(已重命名为 generate-evidence-envelope,
+# 且为 non-blocking context — 失败不阻断 PR 合并,故不在 BP required_status_checks;
+# 27→26 项)。R73 P1-05: 强类型分级证据,完整证据是 release 晋级条件,而非 PR 条件。
+# R73 §5.9: 新增 promote-rc-reusable(唯一晋级 reusable workflow,作为 PR/master 必需 check)
+# R74 P1-06: promote-rc-reusable 替换为 validate-promotion-workflow
+#   (promotion job 是 workflow_dispatch only,不能作为 PR required context;
+#    BP 保留 promote-rc-reusable 作为 workflow job 名一致性基线,但 ruleset 不再要求)
+# R76 P1-07: 新增 secretless-crdb-closed-loop-gate(CRDB 闭环证据门禁,28 项)
+# R76 P1-08: 实际 ruleset (19723336) 收敛到 28 项 PR/master 子集
 EXPECTED_REQUIRED_CHECKS: list[str] = [
     "lint", "static-gates",
     "test (3.10)", "test (3.11)", "test (3.12)",
@@ -104,9 +113,10 @@ EXPECTED_REQUIRED_CHECKS: list[str] = [
     "backup-restore-drill", "sbom", "pip-audit", "trivy",
     "verify-branch-protection", "verify-branch-ruleset",
     "rc-continuity",
-    "crdb-ru-72h-attribution-gate", "production-evidence",
+    "crdb-ru-72h-attribution-gate", "validate-promotion-workflow",
     "oci-allowlist-verify",
     "validate-oci-rootfs", "runtime-smoke-compose",
+    "secretless-crdb-closed-loop-gate",
     "release-summary",
 ]
 
@@ -249,12 +259,13 @@ class TestBranchRulesetExpectedJson:
         assert "refs/heads/main" in includes
 
     def test_rules_contain_required_immutability_rules(self, expected: dict):
-        """R71 P1-01: 包含 deletion / non_fast_forward / update / required_signatures /
-        required_linear_history 规则。"""
+        """R83: 保留安全规则，但不得配置会阻断 PR merge 的 update restriction。"""
         rule_types = [r["type"] for r in expected["rules"]]
         assert "deletion" in rule_types, "缺少 deletion 规则(禁止删除 master/main)"
         assert "non_fast_forward" in rule_types, "缺少 non_fast_forward 规则(禁止 force push)"
-        assert "update" in rule_types, "缺少 update 规则(禁止直接 update)"
+        assert "update" not in rule_types, (
+            "branch update restriction 会阻止 PR merge；PR-only 必须由 pull_request rule 强制"
+        )
         assert "required_signatures" in rule_types, "缺少 required_signatures 规则(强制 GPG 签名)"
         assert "required_linear_history" in rule_types, (
             "缺少 required_linear_history 规则(禁止 merge commit,替代旧 BP strict=true)"
@@ -599,12 +610,13 @@ class TestConfigureBranchRulesetScript:
             )
 
     def test_script_validates_at_least_27_checks(self, script_content: str):
-        """R71 P1-02 / R72 P1-06 / RC61: 脚本校验 REQUIRED_STATUS_CHECKS 至少含 27 个 context
-        (R72 P1-06 移除 8 个 tag-only/environment-only check,从 36 缩减到 29;
-        RC61 再移除 4 个 PR-skipped check,从 29 缩减到 27)。"""
-        # 脚本中应有 "-lt 27" 校验(R72 P1-06/RC61 缩减)
-        assert "-lt 27" in script_content, (
-            "configure_branch_ruleset.sh 应校验 REQUIRED_STATUS_CHECKS 至少含 27 个 context"
+        """R71 P1-02 / R72 P1-06 / RC61 / R76 P1-07/P1-08: 脚本校验 REQUIRED_STATUS_CHECKS
+        至少含 28 个 context(R72 P1-06 移除 8 个 tag-only/environment-only check,从 36 缩减到 29;
+        RC61 再移除 4 个 PR-skipped check,从 29 缩减到 27;R74 P1-06 替换 promote-rc-reusable
+        为 validate-promotion-workflow;R76 P1-07 新增 secretless-crdb-closed-loop-gate,27→28)。"""
+        # 脚本中应有 "-lt 28" 校验(R76 P1-07/P1-08 调整)
+        assert "-lt 28" in script_content, (
+            "configure_branch_ruleset.sh 应校验 REQUIRED_STATUS_CHECKS 至少含 28 个 context"
         )
 
     def test_script_self_asserts_required_approving_review_count_zero(

@@ -1155,6 +1155,46 @@ async def apply_migrations(
         logger.error("[migrate] 无法获取 SQLite 连接,迁移中止")
         return {"applied": [], "skipped": [], "failed": []}
 
+    # R76 §10.M: SQLite 无内置 sha1/sha256 函数,009_restore_capability_nonce_binding.sql
+    # 使用 sha1() 回填老记录 nonce_digest。注册 Python 实现的自定义函数使 migration
+    # SQL 可跨 SQLite/CRDB 运行(CRDB 内置 sha1/sha256,SQLite 需 create_function)。
+    # 返回 bytes(原始摘要)使 SQL hex() 能正确转换为十六进制字符串。
+    try:
+        import hashlib as _hashlib_mod
+
+        def _sqlite_sha1(value):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                value = value.encode("utf-8")
+            # 用于 009_restore_capability_nonce_binding.sql 老记录 nonce_digest 回填
+            # (审计用途,非安全边界)。新记录由 RestoreNonceStore 使用 sha256。
+            # migration SQL 已固化使用 sha1() 函数,无法在不破坏数据兼容性的
+            # 前提下替换。CRDB 内置 sha1() 同样用于此回填。
+            return _hashlib_mod.sha1(value).digest()  # nosec B324
+
+        def _sqlite_sha256(value):
+            if value is None:
+                return None
+            if isinstance(value, str):
+                value = value.encode("utf-8")
+            return _hashlib_mod.sha256(value).digest()
+
+        # aiosqlite 的 create_function 是协程,必须 await;同步 sqlite3 的 create_function
+        # 是同步方法。用 inspect.isawaitable 兼容两种驱动。
+        import inspect as _inspect
+        _r1 = db.create_function("sha1", 1, _sqlite_sha1)
+        if _inspect.isawaitable(_r1):
+            await _r1
+        _r2 = db.create_function("sha256", 1, _sqlite_sha256)
+        if _inspect.isawaitable(_r2):
+            await _r2
+    except (AttributeError, TypeError) as _e:
+        # R76 P0-01: 非 SQLite 连接(CRDB asyncpg 等)无 create_function 方法 → AttributeError;
+        # 驱动签名不匹配 → TypeError。使用具体异常类型,避免吞掉真实错误(R62 P1-04 规则1/2)。
+        # 仅记录 debug 日志,不影响后续 migration 流程(CRDB 内置 sha1/sha256 函数)。
+        logger.debug(f"[migrate] 跳过 SQLite create_function 注册(非 SQLite 连接): {_e}")
+
     result: dict[str, list[str]] = {
         "applied": [],
         "skipped": [],

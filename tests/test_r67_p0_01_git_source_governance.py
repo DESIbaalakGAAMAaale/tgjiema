@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="shell scripts require bash, not available on Windows")
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EXPECTED_JSON = REPO_ROOT / ".github" / "branch_ruleset.expected.json"
 CONFIGURE_SH = REPO_ROOT / "scripts" / "configure_branch_ruleset.sh"
@@ -66,12 +68,12 @@ class TestBranchRulesetExpectedJson:
         rule_types = [r["type"] for r in expected["rules"]]
         assert "required_signatures" in rule_types
 
-    def test_rules_contain_deletion_and_non_fast_forward_and_update(self, expected):
-        """禁止删除 / force push / 直接 update(必须走 PR)。"""
+    def test_rules_contain_safe_branch_immutability_rules(self, expected):
+        """禁止删除/force push；PR-only 由 pull_request 而非 update restriction 保证。"""
         rule_types = [r["type"] for r in expected["rules"]]
         assert "deletion" in rule_types
         assert "non_fast_forward" in rule_types
-        assert "update" in rule_types
+        assert "update" not in rule_types
 
     def test_rules_contain_pull_request_with_zero_reviewers(self, expected):
         """R71 Wave 6 P1-01: solo founder — required_approving_review_count == 0(无审批死锁)。
@@ -153,8 +155,11 @@ class TestConfigureBranchRulesetScript:
     def test_script_contains_required_rules(self):
         content = CONFIGURE_SH.read_text(encoding="utf-8")
         # 关键规则类型必须在 payload 中出现
-        for rule in ("deletion", "non_fast_forward", "update", "required_signatures", "pull_request"):
+        for rule in ("deletion", "non_fast_forward", "required_signatures", "pull_request"):
             assert f'"type": "{rule}"' in content, f"缺少规则: {rule}"
+        assert '"type": "update"' not in content, (
+            "branch update restriction 会阻断 PR merge，必须保持缺失"
+        )
 
     def test_script_bypass_actors_empty(self):
         content = CONFIGURE_SH.read_text(encoding="utf-8")
@@ -209,8 +214,9 @@ class TestVerifyBranchRulesetScript:
 
     def test_script_checks_all_required_rules(self):
         content = VERIFY_SH.read_text(encoding="utf-8")
-        for rule in ("deletion", "non_fast_forward", "update", "required_signatures", "pull_request"):
+        for rule in ("deletion", "non_fast_forward", "required_signatures", "pull_request"):
             assert rule in content, f"验证脚本未检查规则: {rule}"
+        assert "rules 不含 update restriction" in content
 
     def test_script_checks_bypass_actors_empty(self):
         content = VERIFY_SH.read_text(encoding="utf-8")

@@ -927,7 +927,7 @@ class TestYamlWorkflowGates:
         # master 分支应使用 staging 命名空间 + 30 天 retention
         assert "RETENTION_DAYS=\"30\"" in content
         # 应明确说明 master 不进入生产命名空间
-        assert "NOT eligible for production promotion" in content
+        assert "staging 命名空间 ONLY" in content
 
     def test_workflow_dispatch_has_rc_identity_inputs(self):
         """P0-11: workflow_dispatch 应有 6 个 RC 身份输入字段。"""
@@ -951,10 +951,10 @@ class TestYamlWorkflowGates:
         with open(RELEASE_GATES_PATH, "r", encoding="utf-8") as f:
             content = f.read()
         assert "verify-rc-identity:" in content
-        # 应有 if: 仅在 workflow_dispatch 或 production-v* tag 触发
+        # R73 §5.6: verify-rc-identity 仅在 production-v* tag push 时运行
+        # (workflow_dispatch 晋级逻辑已委托给 _promote-verified-rc.yml)
         assert (
-            "github.event_name == 'workflow_dispatch' || startsWith(github.ref, "
-            "'refs/tags/production-v')" in content
+            "startsWith(github.ref, 'refs/tags/production-v')" in content
         )
 
     def test_production_promotion_gate_needs_verify_rc_identity(self):
@@ -964,8 +964,8 @@ class TestYamlWorkflowGates:
         # needs 列表应包含 verify-rc-identity
         assert "verify-rc-identity" in content
         # production-promotion-gate 的 needs 行应包含 verify-rc-identity
-        # (在 needs: [production-evidence, ... verify-rc-identity] 中)
-        assert "needs: [production-evidence, crdb-ru-72h-attribution-gate, verify-only-3x, verify-rc-identity]" in content
+        # (R73 P1-05: production-evidence 重命名为 generate-evidence-envelope)
+        assert "needs: [generate-evidence-envelope, crdb-ru-72h-attribution-gate, verify-only-3x, verify-rc-identity]" in content
 
     def test_release_summary_includes_verify_rc_identity(self):
         """P0-11: release-summary 应聚合 verify-rc-identity 结果。"""

@@ -17,7 +17,8 @@
 #     - required_status_checks.strict_required_status_checks_policy: true(current-SHA,不允许 stale parent commit)
 #     - required_status_checks.required_status_checks: 覆盖所有真实 release-gates.yml job 名
 #     - bypass_actors: [](无 admin/app bypass;紧急情况通过 scripts/record_break_glass.py 审计日志)
-#     - deletion / non_fast_forward / update / required_signatures: 全部启用(不可变历史 + 签名)
+#     - deletion / non_fast_forward / required_signatures: 启用(不可变历史 + 签名)
+#     - 不配置 update restriction: GitHub 会同时阻止 PR merge，PR-only 由 pull_request rule 保证
 #
 #   本脚本通过 GitHub REST API(POST /repos/{owner}/{repo}/rulesets
 #   或 PUT /repos/{owner}/{repo}/rulesets/{id})配置单一 Repository Ruleset,
@@ -62,19 +63,21 @@ GitHub Repository Ruleset("R71 Solo Founder Branch Ruleset")。
 R71 Solo Founder 必需的规则(solo-founder 模式,无审批死锁):
   - deletion             false — 禁止删除 master/main
   - non_fast_forward     false — 禁止 force push(历史不可变)
-  - update               false — 禁止直接 update(必须走 PR)
+  - update               absent — 不启用 branch update restriction；该规则会阻止 PR merge
   - required_signatures  true  — 所有推送 commit 必须经过 GPG 签名验证
   - pull_request         0 名 reviewer(solo founder,无审批死锁)
                          + dismiss_stale_reviews_on_push=true
                          + require_code_owner_review=false(CODEOWNERS 保留但不阻断)
                          + required_review_thread_resolution=true
   - required_status_checks  strict_required_status_checks_policy=true(current-SHA,不允许 stale parent commit)
-                         + 29 个 required_status_checks(仅 PR/master 事件可产生的 check,
+                         + 28 个 required_status_checks(仅 PR/master 事件可产生的 check,
                            R72 P1-06 已移除 tag-only/environment-only 的 check 如
                            compose-runtime-e2e / sign-image / publish-attestation /
                            attestation-semantics-verify / verify-only-3x /
                            migration-binding-gate / verify-rc-identity /
-                           production-promotion-gate)
+                           production-promotion-gate;
+                           R74 P1-06: promote-rc-reusable → validate-promotion-workflow;
+                           R76 P1-07: 新增 secretless-crdb-closed-loop-gate)
   - required_linear_history true  — 强制线性历史(无 merge commit,squash/rebase only)
   - bypass_actors        []    — 禁止任何角色(包括 admin)bypass;
                          紧急情况通过 scripts/record_break_glass.py 审计日志
@@ -206,7 +209,7 @@ if ! [[ "$REQUIRED_REVIEWERS" =~ ^[0-9]+$ ]] || [ "$REQUIRED_REVIEWERS" -lt 0 ];
   exit 1
 fi
 
-# ─── 4. R71 Solo Founder 必需 status checks(29 项,仅 PR/master 事件可产生的 check) ───
+# ─── 4. R71 Solo Founder 必需 status checks(28 项,仅 PR/master 事件可产生的 check) ───
 # R71 P1-02: 必需 status checks 列表必须完整,覆盖所有 PR/master 事件实际可产生的
 # release-gates.yml job 名(以及 ci / e2e / deploy-check 中的 job)。
 # R72 P1-06: 移除以下 tag-only / environment-only 的 check(它们不在 PR/master 事件
@@ -218,9 +221,13 @@ fi
 #     (if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/production-v'))
 # 保留 R71 Wave 4 新增的 validate-oci-rootfs(RC61 移除 R71 Wave 7 的 bind-runtime-config —
 # 其 if: 条件在 PR 事件下不满足,导致 strict_required_status_checks_policy=true 阻断 PR 合并)。
+# R74 P1-06: promote-rc-reusable 替换为 validate-promotion-workflow
+#   (promotion job 是 workflow_dispatch only,不能作为 PR required context)
+# R76 P1-07: 新增 secretless-crdb-closed-loop-gate (CRDB 闭环证据门禁)
+# R76 P1-08: 实际 ruleset (19723336) 必须收敛到本期望列表(27→28 项)
 REQUIRED_STATUS_CHECKS="${REQUIRED_STATUS_CHECKS:-}"
 if [ -z "$REQUIRED_STATUS_CHECKS" ]; then
-  REQUIRED_STATUS_CHECKS='["lint","static-gates","test (3.10)","test (3.11)","test (3.12)","docker-build","docker-digest-verify","compose-config","redis-acl-matrix","schema-diff","restore-legacy-seal-gate","i18n-strict-export-boundary-gate","migration-manifest-gate","button-flow-real-ux-gate","backup-restore-drill","sbom","pip-audit","trivy","verify-branch-protection","verify-branch-ruleset","rc-continuity","crdb-ru-72h-attribution-gate","production-evidence","oci-allowlist-verify","validate-oci-rootfs","runtime-smoke-compose","release-summary"]'
+  REQUIRED_STATUS_CHECKS='["lint","static-gates","test (3.10)","test (3.11)","test (3.12)","docker-build","docker-digest-verify","compose-config","redis-acl-matrix","schema-diff","restore-legacy-seal-gate","i18n-strict-export-boundary-gate","migration-manifest-gate","button-flow-real-ux-gate","backup-restore-drill","sbom","pip-audit","trivy","verify-branch-protection","verify-branch-ruleset","rc-continuity","crdb-ru-72h-attribution-gate","validate-promotion-workflow","oci-allowlist-verify","validate-oci-rootfs","runtime-smoke-compose","secretless-crdb-closed-loop-gate","release-summary"]'
 fi
 # 校验是合法 JSON 数组
 if ! echo "$REQUIRED_STATUS_CHECKS" | jq -e 'type == "array" and length >= 1' > /dev/null 2>&1; then
@@ -232,15 +239,18 @@ if ! echo "$REQUIRED_STATUS_CHECKS" | jq -e 'all(.[]; type == "string")' > /dev/
   echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 数组元素必须全部为字符串"
   exit 1
 fi
-# R71 P1-02 / R72 P1-06 / RC61: 校验至少包含 27 个 context(仅 PR/master 事件可产生的 check,
-# 已移除 8 个 tag-only/environment-only 的 check: compose-runtime-e2e / sign-image /
-# publish-attestation / attestation-semantics-verify / verify-only-3x /
-# migration-binding-gate / verify-rc-identity / production-promotion-gate;
+# R71 P1-02 / R72 P1-06 / RC61 / R76 P1-07/P1-08: 校验至少包含 28 个 context
+# (仅 PR/master 事件可产生的 check,已移除 8 个 tag-only/environment-only 的 check:
+#   compose-runtime-e2e / sign-image / publish-attestation /
+#   attestation-semantics-verify / verify-only-3x / migration-binding-gate /
+#   verify-rc-identity / production-promotion-gate;
 # RC61: 再移除 4 个 PR-skipped 的 check: sign-artifacts / verify-git-source-governance /
-# tag-ruleset-verify / bind-runtime-config)
+#   tag-ruleset-verify / bind-runtime-config;
+# R74 P1-06: promote-rc-reusable → validate-promotion-workflow;
+# R76 P1-07: 新增 secretless-crdb-closed-loop-gate)
 REQUIRED_CHECKS_COUNT=$(echo "$REQUIRED_STATUS_CHECKS" | jq 'length')
-if [ "$REQUIRED_CHECKS_COUNT" -lt 27 ]; then
-  echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 至少需要 27 个 context(仅 PR/master 事件可产生的 release-gates.yml job),实际: $REQUIRED_CHECKS_COUNT"
+if [ "$REQUIRED_CHECKS_COUNT" -lt 28 ]; then
+  echo "ERROR: [R71 P1-02] REQUIRED_STATUS_CHECKS 至少需要 28 个 context(仅 PR/master 事件可产生的 release-gates.yml job),实际: $REQUIRED_CHECKS_COUNT"
   exit 1
 fi
 
@@ -273,7 +283,6 @@ PAYLOAD=$(jq -n \
   rules: [
     {"type": "deletion"},
     {"type": "non_fast_forward"},
-    {"type": "update"},
     {"type": "required_signatures"},
     {"type": "required_linear_history"},
     {
@@ -420,9 +429,9 @@ echo "Assert: rules 包含 non_fast_forward (non_fast_forward=false, 禁止 forc
 echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "non_fast_forward")' > /dev/null \
   || { echo "ERROR: [R71 P1-01] rules 缺少 non_fast_forward 类型"; exit 1; }
 
-echo "Assert: rules 包含 update (update=false, 禁止直接 update)"
-echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "update")' > /dev/null \
-  || { echo "ERROR: [R71 P1-01] rules 缺少 update 类型"; exit 1; }
+echo "Assert: rules 不含 update restriction (允许合规 PR merge)"
+echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "update") | not' > /dev/null \
+  || { echo "ERROR: [R83] branch update restriction 会阻止 PR merge"; exit 1; }
 
 echo "Assert: rules 包含 required_signatures (强制 GPG 签名验证)"
 echo "$RULESET_JSON" | jq -e '[.rules[].type] | any(. == "required_signatures")' > /dev/null \
@@ -460,7 +469,7 @@ echo "Assert: required_status_checks.strict_required_status_checks_policy == tru
 echo "$RULESET_JSON" | jq -e '[.rules[] | select(.type == "required_status_checks") | .parameters.strict_required_status_checks_policy] | add == true' > /dev/null \
   || { echo "ERROR: [R71 P1-03] required_status_checks.strict_required_status_checks_policy != true"; exit 1; }
 
-echo "Assert: required_status_checks 包含全部 29 个必需 check (R71 P1-02 / R72 P1-06)"
+echo "Assert: required_status_checks 包含全部 28 个必需 check (R71 P1-02 / R72 P1-06 / R76 P1-07/P1-08)"
 ACTUAL_CHECKS=$(echo "$RULESET_JSON" \
   | jq -r '[.rules[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context] | sort | join(",")')
 EXPECTED_CHECKS=$(echo "$REQUIRED_STATUS_CHECKS" | jq -r 'sort | join(",")')
@@ -495,6 +504,98 @@ echo "$RULESET_JSON" | jq -e '(.bypass_actors // []) | length == 0' > /dev/null 
 
 echo ""
 echo "✓ [R71 P1-01/02/03 + R72 P1-06] 所有断言通过"
+
+# ════════════════════════════════════════════════════════════════
+# 9. R73 §5.13: Ruleset reconciliation — export actual ruleset,
+#    compute digest, compare with .github/branch_ruleset.expected.json
+# ════════════════════════════════════════════════════════════════
+echo ""
+echo "=== R73 §5.13: Ruleset reconciliation (expected vs actual) ==="
+
+EXPECTED_FILE=".github/branch_ruleset.expected.json"
+if [ ! -f "$EXPECTED_FILE" ]; then
+  echo "ERROR: [R73 §5.13] Expected ruleset baseline not found: $EXPECTED_FILE"
+  exit 1
+fi
+
+# Re-export actual ruleset JSON via gh api(独立于 PUT/POST 响应,确保读到最新状态)
+if [ "$USE_GH_CLI" = "true" ]; then
+  ACTUAL_RULESET_JSON=$(gh api "repos/${OWNER}/${REPO}/rulesets/${RULESET_ID}")
+else
+  ACTUAL_RULESET_JSON=$(curl -sS \
+    -H "Authorization: token ${TOKEN}" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "https://api.github.com/repos/${OWNER}/${REPO}/rulesets/${RULESET_ID}")
+fi
+
+if ! echo "$ACTUAL_RULESET_JSON" | jq -e '.id' > /dev/null 2>&1; then
+  echo "ERROR: [R73 §5.13] 重新导出 ruleset JSON 失败(id=${RULESET_ID})"
+  echo "$ACTUAL_RULESET_JSON"
+  exit 1
+fi
+
+# 提取语义字段(剥离 metadata:_comment / _schema / _r71_solo_founder_requirements /
+# id / node_id / created_at / updated_at / _links / current_user_can_* 等)
+# 仅对比:name, description, target, source_type, enforcement, conditions, rules, bypass_actors
+ACTUAL_SEMANTIC=$(echo "$ACTUAL_RULESET_JSON" \
+  | jq -S -c '{name, description, target, source_type, enforcement, conditions, rules, bypass_actors}')
+EXPECTED_SEMANTIC=$(jq -S -c '{name, description, target, source_type, enforcement, conditions, rules, bypass_actors}' "$EXPECTED_FILE")
+
+# 计算 SHA-256 digest(跨平台兼容:sha256sum 优先,回退到 shasum -a 256)
+_compute_sha256() {
+  local input="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$input" | sha256sum | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$input" | shasum -a 256 | cut -d' ' -f1
+  else
+    echo "ERROR: [R73 §5.13] sha256sum / shasum 均不可用" >&2
+    return 1
+  fi
+}
+
+ACTUAL_DIGEST=$(_compute_sha256 "$ACTUAL_SEMANTIC") || exit 1
+EXPECTED_DIGEST=$(_compute_sha256 "$EXPECTED_SEMANTIC") || exit 1
+
+MATCHED=false
+if [ "$EXPECTED_DIGEST" = "$ACTUAL_DIGEST" ]; then
+  MATCHED=true
+fi
+
+# 写入 reconciliation 报告(.github/ruleset-reconciliation.json)
+TMP_ACTUAL=$(mktemp)
+printf '%s' "$ACTUAL_RULESET_JSON" > "$TMP_ACTUAL"
+jq -n \
+  --arg ruleset_id "$RULESET_ID" \
+  --arg expected_digest "sha256:$EXPECTED_DIGEST" \
+  --arg actual_digest "sha256:$ACTUAL_DIGEST" \
+  --argjson matched "$MATCHED" \
+  --slurpfile actual "$TMP_ACTUAL" \
+  '{
+    reconciliation_schema: "r73-5-13-ruleset-reconciliation",
+    ruleset_id: ($ruleset_id | tonumber),
+    expected_digest: $expected_digest,
+    actual_digest: $actual_digest,
+    matched: $matched,
+    reconciled_at: (now | todate),
+    actual_ruleset_json: $actual[0]
+  }' > .github/ruleset-reconciliation.json
+rm -f "$TMP_ACTUAL"
+
+echo "[INFO] Reconciliation 报告: .github/ruleset-reconciliation.json"
+jq '{ruleset_id, expected_digest, actual_digest, matched}' .github/ruleset-reconciliation.json
+
+if [ "$MATCHED" != "true" ]; then
+  echo "ERROR: [R73 §5.13] Ruleset digest 不匹配 — 实际 ruleset 与 expected baseline 不一致"
+  echo "  expected_digest: sha256:$EXPECTED_DIGEST"
+  echo "  actual_digest:   sha256:$ACTUAL_DIGEST"
+  echo "  expected semantic JSON: $EXPECTED_SEMANTIC"
+  echo "  actual semantic JSON:   $ACTUAL_SEMANTIC"
+  exit 1
+fi
+echo "✓ [R73 §5.13] Ruleset digest 与 expected baseline 匹配"
+
 echo ""
 echo "最终配置(关键字段):"
 echo "$RULESET_JSON" | jq '{id, name, target, source_type, enforcement, conditions, rules, bypass_actors}'
@@ -503,9 +604,12 @@ echo ""
 echo "=========================================================="
 echo "  ✓ R71 Solo Founder Branch Ruleset 已配置成功"
 echo "  P1-01: required_approving_review_count=0 (无审批死锁)"
-echo "  P1-02: 29 个 required_status_checks (仅 PR/master 事件可产生的 check)"
+echo "  P1-02: 28 个 required_status_checks (仅 PR/master 事件可产生的 check)"
 echo "  P1-03: strict_required_status_checks_policy=true (current-SHA)"
 echo "  R72 P1-06: required_linear_history=true (强制线性历史)"
 echo "  R72 P1-06: 已移除 8 个 tag-only/environment-only check (避免合并死锁)"
+echo "  R74 P1-06: promote-rc-reusable → validate-promotion-workflow"
+echo "  R76 P1-07: 新增 secretless-crdb-closed-loop-gate (CRDB 闭环证据门禁)"
+echo "  R76 P1-08: 实际 ruleset 收敛到本期望列表"
 echo "  bypass_actors=[] (无 admin bypass; 紧急情况用 record_break_glass.py)"
 echo "=========================================================="

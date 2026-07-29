@@ -1,8 +1,8 @@
 {
   "_meta": {
     "description": "前端错误码映射 — 由 scripts/export_error_codes_frontend.py 生成。请勿手动修改,通过 ErrorRegistry.to_frontend_mapping() 自动生成。",
-    "enum_count": 149,
-    "generated_at": "2026-07-23T18:00:12.224600Z",
+    "enum_count": 159,
+    "generated_at": "2026-07-29T05:04:57.933856Z",
     "schema": {
       "code": "三段式错误码 DOMAIN.OPERATION.REASON",
       "http_status": "HTTP 状态码",
@@ -13,7 +13,7 @@
       "show_retry_button": "是否显示重试按钮(R61 P1-05: 独立显式设置,通常等于 retryable 但可独立覆盖)",
       "telegram_presentation": "Bot 端展示方式(R61 P1-05 显式字段): short_hint(短提示+查看详情)/inline(直接展开,用于 critical)/silent(不展示,用于 info)/modal/toast(预留扩展)"
     },
-    "total_codes": 149,
+    "total_codes": 159,
     "version": "R56-§5.2"
   },
   "codes": {
@@ -175,6 +175,19 @@
       "show_retry_button": false,
       "telegram_presentation": "silent"
     },
+    "BACKUP.DECRYPT.AAD_CONTEXT_REQUIRED": {
+      "audit_level": "critical",
+      "code": "BACKUP.DECRYPT.AAD_CONTEXT_REQUIRED",
+      "http_status": 500,
+      "message_key": "errors.backup.decrypt.aad_context_required",
+      "retryable": false,
+      "safe_params": [
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "BACKUP.DECRYPT.DEP_MISSING": {
       "audit_level": "critical",
       "code": "BACKUP.DECRYPT.DEP_MISSING",
@@ -193,6 +206,17 @@
       "code": "BACKUP.DECRYPT.KEK_MISSING",
       "http_status": 500,
       "message_key": "errors.backup.decrypt.kek_missing",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.DECRYPTOR.BUILD_FAILED": {
+      "audit_level": "critical",
+      "code": "BACKUP.DECRYPTOR.BUILD_FAILED",
+      "http_status": 500,
+      "message_key": "errors.backup.decryptor.build_failed",
       "retryable": false,
       "safe_params": [],
       "severity": "critical",
@@ -265,6 +289,76 @@
       ],
       "severity": "critical",
       "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.ENCRYPTION_REQUIRED": {
+      "audit_level": "critical",
+      "code": "BACKUP.RESTORE.ENCRYPTION_REQUIRED",
+      "http_status": 500,
+      "message_key": "errors.backup.restore.encryption_required",
+      "retryable": false,
+      "safe_params": [
+        "backup_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.EXACT_CONTRACT_INVALID": {
+      "audit_level": "critical",
+      "code": "BACKUP.RESTORE.EXACT_CONTRACT_INVALID",
+      "http_status": 500,
+      "message_key": "errors.backup.restore.exact_contract_invalid",
+      "retryable": false,
+      "safe_params": [
+        "backup_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.MANIFEST_BINDING_MISMATCH": {
+      "audit_level": "critical",
+      "code": "BACKUP.RESTORE.MANIFEST_BINDING_MISMATCH",
+      "http_status": 500,
+      "message_key": "errors.backup.restore.manifest_binding_mismatch",
+      "retryable": false,
+      "safe_params": [
+        "backup_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.MANIFEST_DOWNLOAD_FAILED": {
+      "audit_level": "critical",
+      "code": "BACKUP.RESTORE.MANIFEST_DOWNLOAD_FAILED",
+      "http_status": 500,
+      "message_key": "errors.backup.restore.manifest_download_failed",
+      "retryable": true,
+      "safe_params": [
+        "backup_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
+      "telegram_presentation": "inline"
+    },
+    "BACKUP.RESTORE.PAYLOAD_DOWNLOAD_FAILED": {
+      "audit_level": "critical",
+      "code": "BACKUP.RESTORE.PAYLOAD_DOWNLOAD_FAILED",
+      "http_status": 500,
+      "message_key": "errors.backup.restore.payload_download_failed",
+      "retryable": true,
+      "safe_params": [
+        "backup_id",
+        "reason"
+      ],
+      "severity": "critical",
+      "show_retry_button": true,
       "telegram_presentation": "inline"
     },
     "BACKUP.RESTORE.R2_CREDENTIAL_MISSING": {
@@ -1908,6 +2002,43 @@
       "show_retry_button": false,
       "telegram_presentation": "inline"
     },
+    "SECRETLESS.CONTRACT.VIOLATION": {
+      "audit_level": "critical",
+      "code": "SECRETLESS.CONTRACT.VIOLATION",
+      "http_status": 409,
+      "message_key": "errors.secretless.contract.violation",
+      "retryable": false,
+      "safe_params": [
+        "reason",
+        "component",
+        "field"
+      ],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "SECRETLESS.INTERNAL.UNEXPECTED": {
+      "audit_level": "critical",
+      "code": "SECRETLESS.INTERNAL.UNEXPECTED",
+      "http_status": 500,
+      "message_key": "errors.secretless.internal.unexpected",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
+    "SECRETLESS_SWITCH.INTERNAL.UNEXPECTED": {
+      "audit_level": "critical",
+      "code": "SECRETLESS_SWITCH.INTERNAL.UNEXPECTED",
+      "http_status": 500,
+      "message_key": "errors.secretless_switch.internal.unexpected",
+      "retryable": false,
+      "safe_params": [],
+      "severity": "critical",
+      "show_retry_button": false,
+      "telegram_presentation": "inline"
+    },
     "SYSTEM.RATE.LIMITED": {
       "audit_level": "warning",
       "code": "SYSTEM.RATE.LIMITED",
@@ -2082,7 +2213,8 @@
       "message_key": "errors.validation.input.failed",
       "retryable": false,
       "safe_params": [
-        "field"
+        "field",
+        "reason"
       ],
       "severity": "info",
       "show_retry_button": false,

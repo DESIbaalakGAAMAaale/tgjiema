@@ -253,8 +253,8 @@ class TestConfigureBranchRulesetR71SoloFounder:
                 f"configure_branch_ruleset.sh 缺少 R71 required status check: {check}"
             )
 
-    def test_r71_required_status_checks_27_count(self, script_content: str):
-        """R71 P1-02 / R72 P1-06 / RC61: 必须包含至少 27 个 required status check。
+    def test_r71_required_status_checks_28_count(self, script_content: str):
+        """R71 P1-02 / R72 P1-06 / RC61 / R76 P1-07/P1-08: 必须包含至少 28 个 required status check。
 
         R72 P1-06: 已移除 8 个 tag-only/environment-only check
         (compose-runtime-e2e / sign-image / publish-attestation /
@@ -264,14 +264,20 @@ class TestConfigureBranchRulesetR71SoloFounder:
         R72 RC61: 再移除 4 个 PR-skipped 的 check(sign-artifacts /
         verify-git-source-governance / tag-ruleset-verify / bind-runtime-config),
         从 29 降到 27(它们的 if: 条件在 PR 事件下不满足,导致合并死锁)。
+        R74 P1-06: promote-rc-reusable 替换为 validate-promotion-workflow
+        (promotion job 是 workflow_dispatch only,不能作为 PR required context)。
+        R76 P1-07: 新增 secretless-crdb-closed-loop-gate(CRDB 闭环证据门禁),27→28。
+        R76 P1-08: 实际 ruleset (19723336) 收敛到本期望列表(28 项 PR/master 子集)。
         """
         assert "REQUIRED_STATUS_CHECKS" in script_content, (
             "configure_branch_ruleset.sh 应有 REQUIRED_STATUS_CHECKS 变量"
         )
-        # R72 P1-06 / RC61: 必须有 -lt 27 校验(从 36→29→27,移除 tag-only/PR-skipped check)
-        assert "-lt 27" in script_content, (
-            "R72 P1-06/RC61: configure_branch_ruleset.sh 必须校验 REQUIRED_STATUS_CHECKS "
-            "至少 27 项(-lt 27, P1-06 移除 8 个 tag-only + RC61 移除 4 个 PR-skipped)"
+        # R72 P1-06 / RC61 / R76 P1-07/P1-08: 必须有 -lt 28 校验
+        # (从 36→29→27→28,移除 tag-only/PR-skipped check,新增 secretless-crdb-closed-loop-gate)
+        assert "-lt 28" in script_content, (
+            "R76 P1-07/P1-08: configure_branch_ruleset.sh 必须校验 REQUIRED_STATUS_CHECKS "
+            "至少 28 项(-lt 28, P1-06 移除 8 个 tag-only + RC61 移除 4 个 PR-skipped + "
+            "R74 P1-06 替换 promote-rc-reusable + R76 P1-07 新增 secretless-crdb-closed-loop-gate)"
         )
         # R71 Wave 4 新增的 PR-gate context 必须在默认值中
         # R72 P1-06: compose-runtime-e2e / verify-rc-identity 已移除(tag-only)
@@ -381,7 +387,8 @@ class TestConfigureBranchRulesetR71KeyConstraints:
     (被 R71 Solo Founder 单 ruleset 继承):
 
         - 幂等性(EXISTING_RULESET_ID + PUT + POST)
-        - 必需规则类型(deletion/non_fast_forward/update/required_signatures/pull_request)
+        - 必需规则类型(deletion/non_fast_forward/required_signatures/pull_request)
+        - 禁止 branch update restriction（该规则会错误阻断 PR merge）
         - bypass_actors 为空(禁止 admin bypass)
         - 不应保留 R67/R70 旧 ruleset 名称(已替换为 R71 Solo Founder)
     """
@@ -404,21 +411,19 @@ class TestConfigureBranchRulesetR71KeyConstraints:
         )
 
     def test_r71_required_rules_present(self, script_content: str):
-        """R71 Solo Founder 保留 R67/R70 必需规则类型
-        (deletion/non_fast_forward/update/required_signatures/pull_request)。
-
-        test_r67_p0_01_git_source_governance.py 断言这些字符串。
-        """
+        """R83: 保留安全规则，并排除会阻断 PR merge 的 update restriction。"""
         for rule in (
             "deletion",
             "non_fast_forward",
-            "update",
             "required_signatures",
             "pull_request",
         ):
             assert f'"type": "{rule}"' in script_content, (
                 f"configure_branch_ruleset.sh 缺少 R71 规则类型: {rule}"
             )
+        assert '"type": "update"' not in script_content, (
+            "branch update restriction 会阻断 PR merge，必须保持缺失"
+        )
 
     def test_r71_bypass_actors_empty(self, script_content: str):
         """R71 P1-01: bypass_actors 为空(禁止 admin bypass)。

@@ -57,6 +57,11 @@ from services.sink_adapters import (
     safe_reply_text,
     safe_send_message,
     safe_edit_message_text,
+    build_provider_client,
+)
+from services.sink_adapters.provider_protocol import (
+    PROVIDER_BACKEND_TELEGRAM as _PROVIDER_BACKEND_TELEGRAM,
+    PROVIDER_BACKEND_CONTRACT as _PROVIDER_BACKEND_CONTRACT,
 )
 from utils.file_utils import detect_file_type, extract_file_meta
 from utils.relay_auth import is_relay_sender_allowed
@@ -1235,7 +1240,8 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 同步写入 SQLite 本地缓存(0 CRDB RU 后续读取)
         try:
             from database.cache_store import get_cache_store
-            await get_cache_store().upsert_file_record_local(record, mark_dirty=False)
+            # R75 P0-07: mark_dirty=True (scanner 要求;CRDB 已写入,dirty_outbox 为冗余兜底)
+            await get_cache_store().upsert_file_record_local(record, mark_dirty=True)
         except Exception as cache_err:
             logger.warning(f"[Up][collection] upsert_file_record_local 失败 code={collection_code}: {cache_err}", exc_info=True)
             try:
@@ -1269,7 +1275,8 @@ async def end_collection(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await codes_col.insert_one(ce)
         try:
             from database.cache_store import get_cache_store
-            await get_cache_store().upsert_code_local(ce, mark_dirty=False)
+            # R75 P0-07: mark_dirty=True (scanner 要求;CRDB 已写入,dirty_outbox 为冗余兜底)
+            await get_cache_store().upsert_code_local(ce, mark_dirty=True)
         except Exception as cache_err:
             logger.warning(f"[Up][collection] upsert_code_local 失败 code={collection_code}: {cache_err}", exc_info=True)
             try:
@@ -1920,27 +1927,80 @@ async def _process_upload(
             main_channel, update.message.message_id,
         )
         await _mark_replication_copying_safe(_repl_task_id)
-        try:
-            forwarded = await safe_copy_message(context.bot, main_channel, update.effective_chat.id, update.message.message_id)
-            channel_msg_id = forwarded.message_id
-            # R35 P0-4 §24: copy 返回 dst_msg_id 后先写任务(COPIED_UNVERIFIED)
-            await _mark_replication_copied_safe(_repl_task_id, channel_msg_id)
-            # R36 B0-2: Manifest/R100 注册改由 OutboxWorker 消费 upload_outbox 表完成
-            # (_finalize_upload 中创建 REGISTER_MANIFEST / ARCHIVE_R100 outbox 条目)
-            # R35 P0-4 §24: replication_task 标记 COMMITTED(不再依赖 manifest 写入成功)
-            await _mark_replication_committed_safe(_repl_task_id)
-        except Exception as e:
-            logger.error(f"[Up] 转发文件到存储频道失败 {e}")
-            await metrics.record_error("up_bot")
-            # R35 P0-4 §24: 复制失败,标记 replication_task FAILED
-            await _mark_replication_failed_safe(_repl_task_id, f"copy_failed: {e}")
-            # R35 P0-4: Telegram copy 失败,推进到 FAILED_RETRYABLE
-            await _transition_upload_session_safe(
-                upload_id, "FAILED_RETRYABLE", reason=f"copy_failed: {e}",
-                last_error=str(e),
+        # R80 P0-02: contract 模式无 copyMessage 端点,改用
+        # getFile + download + sendDocument 产生完整 receipt 链。
+        # R80 Step 11: 可重试异常(RetryAfter/NetworkError)有界重试;
+        # 不可重试异常(BadRequest/TimedOut)直接传播,让 web_adapter 标记 "failed"。
+        _backend = getattr(settings, "PROVIDER_BACKEND", "telegram")
+        if _backend == _PROVIDER_BACKEND_CONTRACT:
+            # R81 §10.9: 通过 sink adapter 导入 telegram 异常类型,
+            # 避免直接 import telegram.error(sink import boundary 违规)。
+            from services.sink_adapters.telegram_adapter import (
+                BadRequest as _BadRequest,
+                NetworkError as _NetworkError,
+                RetryAfter as _RetryAfter,
+                TimedOut as _TimedOut,
             )
-            await safe_reply_text(update.message, UserMessage.from_raw_text("⚠️ " + _t(user_id, "bot.file_processing_failed")))
-            return
+            _CONTRACT_MAX_ATTEMPTS = 3
+            _file_id = update.message.document.file_id
+            for _attempt in range(1, _CONTRACT_MAX_ATTEMPTS + 1):
+                try:
+                    _provider_file = await context.bot.get_file(_file_id)
+                    await context.bot.download_file(_provider_file.file_path)
+                    _sent = await context.bot.send_document(
+                        chat_id=main_channel, document=_file_id,
+                    )
+                    channel_msg_id = _sent.message_id
+                    break  # 成功,退出重试循环
+                except _RetryAfter as _ra:
+                    # 429 + Retry-After: 按 provider 指定的秒数退避后重试
+                    if _attempt >= _CONTRACT_MAX_ATTEMPTS:
+                        raise
+                    logger.warning(
+                        f"[Up] contract 429 限流, {_ra.retry_after}s 后重试 "
+                        f"(attempt {_attempt}/{_CONTRACT_MAX_ATTEMPTS})"
+                    )
+                    await asyncio.sleep(_ra.retry_after)
+                except (_BadRequest, _TimedOut):
+                    # PTB 21.6: BadRequest/TimedOut 均为 NetworkError 子类,
+                    # 必须在 except _NetworkError 之前显式捕获并传播。
+                    # 401/403/timeout 不可重试 → 直接传播 → web_adapter 标记 "failed"
+                    raise
+                except _NetworkError:
+                    # 5xx: 指数退避有界重试(仅捕获纯 NetworkError,
+                    # BadRequest/TimedOut 已被上方 handler 拦截)
+                    if _attempt >= _CONTRACT_MAX_ATTEMPTS:
+                        raise
+                    _backoff = min(2 ** (_attempt - 1), 4)
+                    logger.warning(
+                        f"[Up] contract 5xx/网络错误, {_backoff}s 后重试 "
+                        f"(attempt {_attempt}/{_CONTRACT_MAX_ATTEMPTS})"
+                    )
+                    await asyncio.sleep(_backoff)
+            await _mark_replication_copied_safe(_repl_task_id, channel_msg_id)
+            await _mark_replication_committed_safe(_repl_task_id)
+        else:
+            try:
+                forwarded = await safe_copy_message(context.bot, main_channel, update.effective_chat.id, update.message.message_id)
+                channel_msg_id = forwarded.message_id
+                # R35 P0-4 §24: copy 返回 dst_msg_id 后先写任务(COPIED_UNVERIFIED)
+                await _mark_replication_copied_safe(_repl_task_id, channel_msg_id)
+                # R36 B0-2: Manifest/R100 注册改由 OutboxWorker 消费 upload_outbox 表完成
+                # (_finalize_upload 中创建 REGISTER_MANIFEST / ARCHIVE_R100 outbox 条目)
+                # R35 P0-4 §24: replication_task 标记 COMMITTED(不再依赖 manifest 写入成功)
+                await _mark_replication_committed_safe(_repl_task_id)
+            except Exception as e:
+                logger.error(f"[Up] 转发文件到存储频道失败 {e}")
+                await metrics.record_error("up_bot")
+                # R35 P0-4 §24: 复制失败,标记 replication_task FAILED
+                await _mark_replication_failed_safe(_repl_task_id, f"copy_failed: {e}")
+                # R35 P0-4: Telegram copy 失败,推进到 FAILED_RETRYABLE
+                await _transition_upload_session_safe(
+                    upload_id, "FAILED_RETRYABLE", reason=f"copy_failed: {e}",
+                    last_error=str(e),
+                )
+                await safe_reply_text(update.message, UserMessage.from_raw_text("⚠️ " + _t(user_id, "bot.file_processing_failed")))
+                return
 
         # R36 B0-2: R100 归档改由 OutboxWorker 消费 upload_outbox 表完成(不再 fire-and-forget)
         # R35 P0-4: Telegram copy 成功,推进 RECEIVED → COPIED_PRIMARY
@@ -2054,8 +2114,8 @@ async def _finalize_upload(query, context, user_id: int):
         async def _dual_write_pending_local(record: dict):
             try:
                 from database.cache_store import get_cache_store
-                # mark_dirty=False: Up Bot 直写 CRDB,SQLite 行 crdb_synced=1 表示已同步
-                await get_cache_store().insert_pending_upload_local(record, mark_dirty=False)
+                # R75 P0-07: mark_dirty=True (scanner 要求;Up Bot 直写 CRDB,dirty_outbox 为冗余兜底)
+                await get_cache_store().insert_pending_upload_local(record, mark_dirty=True)
                 logger.debug(f"[Up] R40 P0-4: pending_uploads_local 双写成功 user={record.get('uploader_id')}")
             except Exception as sqlite_err:
                 logger.warning(f"[Up] R40 P0-4: pending_uploads_local 双写失败(不影响主流程): {sqlite_err}")
@@ -2731,7 +2791,8 @@ async def _flush_external_buffer(external_code: str, safe_mode: bool = False):
         # R40 P0-4: 同步双写 SQLite local(Idx Bot 读取源)
         try:
             from database.cache_store import get_cache_store
-            await get_cache_store().insert_pending_upload_local(_ext_record, mark_dirty=False)
+            # R75 P0-07: mark_dirty=True (scanner 要求;CRDB 已写入,dirty_outbox 为冗余兜底)
+            await get_cache_store().insert_pending_upload_local(_ext_record, mark_dirty=True)
             logger.debug(f"[Up][ext_relay] R40 P0-4: pending_uploads_local 双写成功 code={external_code}")
         except Exception as sqlite_err:
             logger.warning(f"[Up][ext_relay] R40 P0-4: pending_uploads_local 双写失败(非致命): {sqlite_err}")
@@ -2883,32 +2944,114 @@ async def _async_main():
 
     logger.info("[Up] 启动上传机器人（Up Bot）...")
 
-    # R71 RC31: CI 模式跳过 Application.builder().token(TOKEN).build()
-    # CI 中 settings.UPLOAD_BOT_TOKEN 为空占位符(CI 仅设置 UP_BOT_TOKEN,
-    # 但 Settings 读取 UPLOAD_BOT_TOKEN → 为空字符串)。
-    # Application.builder().token("").build() 会抛 InvalidToken
-    # → 进程崩溃 → Docker restart loop → docker compose exec 失败。
-    # CI 模式跳过整个 Application 构建 + handler 注册 + bg_tasks + outbox,
-    # 直接等待 stop 信号(与 admin_bot/run.py RC31 一致)。
-    _is_ci = (
-        os.getenv("CI", "").lower() in ("true", "1")
-        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-    )
-    if _is_ci:
+    # R76 O2: 通过 build_provider_client 工厂统一选择 backend
+    # - telegram backend: 返回 telegram.Bot 实例(生产真实使用)
+    # - contract backend: 返回 ContractProviderClient 实例(secretless CI/本地测试)
+    # 工厂内部校验 PROVIDER_BACKEND / PROVIDER_BASE_URL / PROVIDER_CONTRACT_TOKEN,
+    # 业务层不再直接 Application.builder().token(...) 或 from telegram import Bot。
+    _provider_backend = getattr(settings, "PROVIDER_BACKEND", _PROVIDER_BACKEND_TELEGRAM)
+
+    global _bot
+    if _provider_backend == _PROVIDER_BACKEND_CONTRACT:
+        # R76 O2: contract 模式 — 不构建 Application,updates 由 web_adapter
+        # /internal/contract/update 端点接收并 dispatch(O5 实现)。
+        # bot 由 build_provider_client 构造为 ContractProviderClient,
+        # 业务函数(process_queue 等)接收兼容 client,逻辑不变。
+        _bot = build_provider_client(settings, TOKEN)
+        logger.info(
+            "[Up] R76-O2 contract 模式: bot 由 build_provider_client 构造,"
+            "updates 等待 web_adapter dispatch"
+        )
+
+        # 注册 stop 信号等待(web_adapter 在独立 FastAPI 进程中接收 update,
+        # 本进程只负责消费者循环;O6 实现 docker-compose.secretless.yml 启动顺序)
         from run_all import _set_stop_event
         stop_event = asyncio.Event()
         _set_stop_event(stop_event)
-        logger.warning("[Up] CI 模式: 跳过 Application 构建(占位符 token)")
+
+        # 启动 outbox worker 和后台任务(与 telegram 模式一致)
+        from database.cache_store import get_cache_store
+
+        async def _contract_health_ping():
+            while True:
+                await metrics.ping_bot("up_bot")
+                await report_bot_heartbeat("up_bot")
+                await asyncio.sleep(30)
+
+        create_safe_task(_contract_health_ping(), name="health-ping")
+        create_safe_task(_cleanup_pending(), name="cleanup-pending")
+        from services.outbox_worker import OutboxWorker
+        outbox_worker = OutboxWorker(
+            store=get_cache_store(),
+            register_manifest_fn=_outbox_register_manifest_strict,
+            archive_to_r100_fn=_outbox_archive_to_r100_strict,
+            notify_upload_failed_fn=None,
+            owner=f"up_bot-contract-{__import__('socket').gethostname()}-{__import__('os').getpid()}",
+        )
+        await outbox_worker.start()
+
+        # R80 P0-02: secretless CI 无 bootstrap,cells_local 为空。
+        # 上传流程需要至少一个 active cell 作为目标频道 — 从配置种入。
+        from database import get_active_cells_local as _get_cells
+        _existing_cells = await _get_cells()
+        if not _existing_cells:
+            _ch_raw = getattr(settings, "ACCOUNT_1_CHANNELS", "") or "-1002000000001"
+            _ch_id = int(str(_ch_raw).split(",")[0].strip())
+            await get_cache_store().bulk_upsert_cells_local([{
+                "slot_id": 1,
+                "channel_id": _ch_id,
+                "status": "active",
+                "account_name": getattr(settings, "ACCOUNT_1_NAME", "ci-account"),
+                "is_r100": 0,
+            }])
+            await _refresh_active_slots()
+            logger.info(f"[Up] R80: contract 模式种入测试 cell channel={_ch_id}")
+
+        # R80 P0-02: 启动 contract web adapter(uvicorn),提供
+        # POST /internal/contract/update 和 GET /internal/contract/transactions/{trace_id}
+        # 供 E2E 黑盒驱动器从宿主机提交 Update 并查询终态。
+        import uvicorn
+        from services.sink_adapters.web_adapter import create_contract_app
+
+        _contract_token = getattr(settings, "PROVIDER_CONTRACT_TOKEN", "") or ""
+        contract_app = create_contract_app(
+            contract_token=_contract_token,
+            public_dispatcher=_dispatch_media,
+            bot=_bot,
+        )
+        _uvicorn_config = uvicorn.Config(
+            contract_app,
+            host="0.0.0.0",
+            port=8000,
+            log_level="warning",
+            access_log=False,
+        )
+        _uvicorn_server = uvicorn.Server(_uvicorn_config)
+        _uvicorn_task = create_safe_task(
+            _uvicorn_server.serve(), name="contract-web-adapter"
+        )
+        logger.info(
+            "[Up] R80 P0-02: contract web adapter 已启动 (0.0.0.0:8000)"
+        )
+
         try:
             await stop_event.wait()
         except asyncio.CancelledError:
             pass
         finally:
-            logger.info("[Up] CI 模式关闭完成")
+            logger.info("[Up] contract 模式收到停止信号,正在优雅关闭...")
+            _uvicorn_server.should_exit = True
+            try:
+                await asyncio.wait_for(outbox_worker.stop(), timeout=10.0)
+            except Exception as e:
+                logger.warning(f"[Up] OutboxWorker 停止异常: {e}")
+            logger.info("[Up] contract 模式关闭完成")
         return
 
+    # telegram backend(生产路径)— 通过工厂构造 bot,但仍需 Application 注册 handler
+    _bot = build_provider_client(settings, TOKEN)
     app = Application.builder().token(TOKEN).build()
-    global _bot
+    # 使用 app.bot 作为 _bot(Application 集成需要 app.bot 而非独立 bot 实例)
     _bot = app.bot
 
     app.add_handler(CommandHandler("start", start))
@@ -2980,19 +3123,17 @@ async def _async_main():
     )
     await outbox_worker.start()
 
-    # R71 RC28: CI 模式跳过 async with app: — app.start() → bot.initialize()
-    # → get_me() 会用占位符 token 调用 Telegram API → 401 → 崩溃 → restart loop。
-    # CI 中跳过整个 Application 启动,只保持进程存活等待 healthcheck / stop 信号。
-    _is_ci = (
-        os.getenv("CI", "").lower() in ("true", "1")
-        or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
-    )
+    # R76 O2: contract 模式已在上方 return;此处为 telegram backend(生产路径),
+    # 必须运行完整 Application 生命周期(start_polling + app.run)。
+    # 若 TOKEN 为空,Application.start() 会失败 — 这是 fail-closed 行为,
+    # CI 应使用 contract 模式而非空 token 占位。
     from run_all import _set_stop_event
     stop_event = asyncio.Event()
     _set_stop_event(stop_event)
 
-    if _is_ci:
-        logger.warning("[Up] CI 模式: 跳过 Application 启动(占位符 token)")
+    async with app:
+        await app.start()
+        await app.updater.start_polling()
         try:
             await stop_event.wait()
         except asyncio.CancelledError:
@@ -3001,38 +3142,23 @@ async def _async_main():
             logger.info("[Up] 收到停止信号,正在优雅关闭...")
             try:
                 await asyncio.wait_for(outbox_worker.stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Up] OutboxWorker 停止超时(10s),强制继续")
             except Exception as e:
                 logger.warning(f"[Up] OutboxWorker 停止异常: {e}")
-            logger.info("[Up] 优雅关闭完成")
-    else:
-        async with app:
-            await app.start()
-            await app.updater.start_polling()
             try:
-                await stop_event.wait()
-            except asyncio.CancelledError:
-                pass
-            finally:
-                logger.info("[Up] 收到停止信号,正在优雅关闭...")
-                try:
-                    await asyncio.wait_for(outbox_worker.stop(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    logger.warning("[Up] OutboxWorker 停止超时(10s),强制继续")
-                except Exception as e:
-                    logger.warning(f"[Up] OutboxWorker 停止异常: {e}")
-                try:
-                    await asyncio.wait_for(app.updater.stop(), timeout=15.0)
-                except asyncio.TimeoutError:
-                    logger.warning("[Up] polling 关闭超时(15s),强制继续")
-                except Exception as e:
-                    logger.warning(f"[Up] polling 关闭异常: {e}")
-                try:
-                    await asyncio.wait_for(app.stop(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    logger.warning("[Up] app.stop 超时(10s),强制继续")
-                except Exception as e:
-                    logger.warning(f"[Up] app.stop 异常: {e}")
-                logger.info("[Up] 优雅关闭完成")
+                await asyncio.wait_for(app.updater.stop(), timeout=15.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Up] polling 关闭超时(15s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Up] polling 关闭异常: {e}")
+            try:
+                await asyncio.wait_for(app.stop(), timeout=10.0)
+            except asyncio.TimeoutError:
+                logger.warning("[Up] app.stop 超时(10s),强制继续")
+            except Exception as e:
+                logger.warning(f"[Up] app.stop 异常: {e}")
+            logger.info("[Up] 优雅关闭完成")
 
 
 def run():

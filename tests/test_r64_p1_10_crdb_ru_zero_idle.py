@@ -17,7 +17,6 @@ R64 P1-10 验收标准:
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import sys
@@ -25,7 +24,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -611,17 +609,21 @@ class TestCheckCrdbRuThresholdScript:
         assert "SERVICE_ROLE" in content
         assert "prometheus_exporter" in content
 
-    def test_script_returns_zero_on_zero_ru(self):
+    def test_script_returns_zero_on_zero_ru(self, tmp_path):
         """0 RU 场景应返回退出码 0(实际执行脚本)。"""
         import subprocess
         script_path = REPO_ROOT / "scripts" / "check_crdb_ru_threshold.py"
-        # 使用临时 DB(避免污染项目 data 目录)
+        # 使用本测试独占且不存在的临时 DB，避免跨运行残留 RU 证据污染。
+        cache_db = tmp_path / "test_ru_threshold_check.db"
         result = subprocess.run(
-            ["python3", str(script_path), "--json", "--day-only"],
+            [sys.executable, str(script_path), "--json", "--day-only"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=60,
-            env={**os.environ, "CACHE_STORE_DB": "/tmp/test_ru_threshold_check.db"},
+            env={**os.environ, "CACHE_STORE_DB": str(cache_db), "PYTHONUTF8": "1"},
+            check=False,
         )
         # 应成功执行(exit code 0)
         assert result.returncode == 0, f"脚本应成功执行,stderr: {result.stderr[-500:]}"

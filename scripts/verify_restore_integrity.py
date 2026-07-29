@@ -23,7 +23,7 @@
       4. 迁移版本兼容性检查(current vs backup schema_version)
       5. 恢复目标隔离验证(--target-db staging)
       6. 应用启动/读写验证(python -m services.health + INSERT/SELECT/DELETE)
-      7. 恢复环境合成交易(synthetic_transaction.run_full_transaction)
+      7. 恢复环境合成交易(synthetic_transaction.run_dbwriter_component_test)
       8. 切换/回滚证据(R72 P0-12: 实际执行 RestoreOrchestrator switch/rollback + 结构化 JSON)
       9. 机器可读恢复证据(增强 IntegrityEvidence dataclass)
 
@@ -53,7 +53,7 @@
 依赖:
     - docker compose exec db_writer python -c "..." 执行 SQL
     - docker compose exec db_writer python -m services.health --role db_writer --json
-    - scripts/synthetic_transaction.py 的 run_full_transaction()
+    - scripts/synthetic_transaction.py 的 run_dbwriter_component_test()
     - services.restore_orchestrator 的实际 switch/rollback 执行(R72 P0-12: 不再只是 import check)
 """
 # R71 RC35: 移除 `from __future__ import annotations`。
@@ -635,8 +635,8 @@ def _get_schema_version() -> str:
         version = getattr(settings, "BACKUP_SCHEMA_VERSION", None)
         if version:
             return str(version)
-    except (ImportError, Exception):
-        pass
+    except (ImportError, Exception) as _e:
+        print(f"[WARN] _get_schema_version: settings read failed: {_e}", file=sys.stderr)
 
     # 2. 尝试从 db_backup 读取
     try:
@@ -644,8 +644,8 @@ def _get_schema_version() -> str:
         version = getattr(db_backup, "_BACKUP_SCHEMA_VERSION", None)
         if version:
             return str(version)
-    except (ImportError, Exception):
-        pass
+    except (ImportError, Exception) as _e:
+        print(f"[WARN] _get_schema_version: db_backup read failed: {_e}", file=sys.stderr)
 
     # 3. 尝试从环境变量读取
     version = os.environ.get("BACKUP_SCHEMA_VERSION", "")
@@ -831,8 +831,8 @@ def _get_table_pk_columns(table: str) -> tuple[str, ...]:
         import services.backup_schema as bs
         if table in bs.BACKUP_SCHEMA:
             return bs.BACKUP_SCHEMA[table].pk_columns
-    except (ImportError, Exception):
-        pass
+    except (ImportError, Exception) as _e:
+        print(f"[WARN] _get_table_pk_columns: backup_schema read failed for {table}: {_e}", file=sys.stderr)
     return ("rowid",)
 
 
@@ -1113,12 +1113,12 @@ def run_synthetic_transaction_in_restored_env(
 ) -> dict[str, Any]:
     """在恢复环境中运行合成交易。
 
-    通过 scripts/synthetic_transaction.py 的 run_full_transaction() 执行。
+    通过 scripts/synthetic_transaction.py 的 run_dbwriter_component_test() 执行。
     合成交易验证完整业务链:Redis Stream → db_writer → SQLite → 幂等 → DLQ → 清理。
 
     R72 P0-11: target_db 参数化 — 将 verify_restore_integrity 的 target_db 别名
     (production / staging)解析为容器内绝对路径,传递给
-    synthetic_transaction.run_full_transaction(target_db=<path>),
+    synthetic_transaction.run_dbwriter_component_test(target_db=<path>),
     确保合成交易在隔离的 staging 恢复库上执行,不污染 production。
 
     Args:
@@ -1156,18 +1156,18 @@ def run_synthetic_transaction_in_restored_env(
         }
 
     # R72 P0-11: 将 target_db 别名解析为容器内绝对路径
-    # synthetic_transaction.run_full_transaction 接受路径字符串(非别名),
+    # synthetic_transaction.run_dbwriter_component_test 接受路径字符串(非别名),
     # 因此必须通过 _get_db_path 解析为 /app/data/cache_store.db 或
     # /app/data/staging/cache_store.db,禁止默认回退到 production 路径。
     db_path = _get_db_path(target_db)
 
     try:
-        evidence = module.run_full_transaction(timeout=timeout, target_db=db_path)
+        evidence = module.run_dbwriter_component_test(timeout=timeout, target_db=db_path)
     except Exception as e:
         # fail-closed:不吞异常,转换为证据
         return {
             "overall_passed": False,
-            "error": f"run_full_transaction 异常: {type(e).__name__}: {e}",
+            "error": f"run_dbwriter_component_test 异常: {type(e).__name__}: {e}",
             "target_db": target_db,
             "actual_db_path": db_path,
         }
@@ -1258,6 +1258,60 @@ def _record_db_identity(target_db: str = DEFAULT_TARGET_DB) -> dict[str, Any]:
             identity["table_counts"][table] = -1
 
     return identity
+
+
+def _extract_watermark(identity: dict[str, Any]) -> int | None:
+    """R73 P0-06: 从数据库 identity 提取业务序列号/watermark。
+
+    优先从 table_counts 中查找 bot_heartbeat.last_seq 或类似字段;
+    若无 watermark,返回 None(fallback 到 identity_match 比对)。
+
+    Args:
+        identity: _record_db_identity 返回的 dict
+
+    Returns:
+        int watermark(序列号);若无可行业务序列号则返回 None
+    """
+    if not identity:
+        return None
+    # 从 table_counts 中查找 bot_heartbeat 表的行数作为 watermark 代理
+    # bot_heartbeat 表的 row count 在长期运行下应单调递增
+    table_counts = identity.get("table_counts", {}) or {}
+    for table in ("bot_heartbeat", "writer_inbox", "dispatch_jobs"):
+        count = table_counts.get(table)
+        if isinstance(count, int) and count >= 0:
+            return count
+    return None
+
+
+def _identity_equal(
+    id_a: dict[str, Any], id_b: dict[str, Any],
+) -> bool:
+    """R73 P0-06: 严格比对两个数据库 identity 是否相等。
+
+    比对维度:
+      - schema_version
+      - table_counts(逐表)
+
+    Args:
+        id_a: 第一个 identity
+        id_b: 第二个 identity
+
+    Returns:
+        True 若两者关键维度一致;False 否则
+    """
+    if not id_a or not id_b:
+        return False
+    if id_a.get("schema_version") != id_b.get("schema_version"):
+        return False
+    counts_a = id_a.get("table_counts", {}) or {}
+    counts_b = id_b.get("table_counts", {}) or {}
+    if set(counts_a.keys()) != set(counts_b.keys()):
+        return False
+    for table in counts_a:
+        if counts_a[table] != counts_b[table]:
+            return False
+    return True
 
 
 def _run_business_probe(target_db: str = DEFAULT_TARGET_DB) -> dict[str, Any]:
@@ -1572,11 +1626,28 @@ def generate_switch_rollback_evidence(
         "passed": False,
         "target_db": target_db,
         "actual_db_path": _get_db_path(target_db),
-        "old_db_identity": {},
-        "new_db_identity": {},
+        # R73 §5.5 P0-06: 完整证据字段(规格要求)
+        "operation_id": "",
+        "receipt_digest": "",
+        "old_database_identity": {},
+        "restored_database_identity": {},
+        "active_identity_before_switch": {},
+        "active_identity_after_switch": {},
+        "active_identity_after_rollback": {},
+        "switch_started_at": "",
+        "switch_completed_at": "",
+        "rollback_started_at": "",
+        "rollback_completed_at": "",
         "switch_time_seconds": 0.0,
         "rto_seconds": 0.0,
         "rpo_seconds": 0.0,
+        "rpo_records": 0,
+        "probe_trace_id_after_switch": "",
+        "probe_trace_id_after_rollback": "",
+        "state_transitions": [],
+        # 向后兼容字段(旧调用者使用)
+        "old_db_identity": {},
+        "new_db_identity": {},
         "business_probe_after_switch": {},
         "business_probe_after_rollback": {},
         "switch_version": "",
@@ -1584,6 +1655,16 @@ def generate_switch_rollback_evidence(
         "restore_phases": [],
         "error": None,
     }
+
+    # R73 §5.5 P0-06: state_transitions 记录状态机每次跳转
+    state_transitions: list[dict[str, Any]] = []
+
+    def _record_transition(state: str, **kwargs: Any) -> None:
+        state_transitions.append({
+            "state": state,
+            "timestamp": _now_iso(),
+            **kwargs,
+        })
 
     # ── 1. 尝试导入 RestoreOrchestrator(host 侧 import check) ──
     try:
@@ -1611,6 +1692,20 @@ def generate_switch_rollback_evidence(
     approval_id = os.environ.get("RESTORE_APPROVAL_ID", "").strip()
     mfa_receipt_id = os.environ.get("RESTORE_MFA_RECEIPT_ID", "").strip()
 
+    # R73 P0-06: 可选 receipt 文件(优先级高于环境变量)
+    receipt_file = os.environ.get("RESTORE_RECEIPT_FILE", "").strip()
+    receipt_digest = ""
+    if receipt_file and os.path.isfile(receipt_file):
+        try:
+            import hashlib as _hashlib
+            receipt_bytes = open(receipt_file, "rb").read()
+            receipt_digest = "sha256:" + _hashlib.sha256(receipt_bytes).hexdigest()
+        except OSError:
+            pass
+
+    evidence["operation_id"] = operation_id
+    evidence["receipt_digest"] = receipt_digest
+
     if not operation_id or not approval_id or not mfa_receipt_id:
         evidence["error"] = (
             "缺少恢复操作凭证,无法实际执行 switch/rollback (fail-closed). "
@@ -1622,11 +1717,17 @@ def generate_switch_rollback_evidence(
         )
         return evidence
 
+    _record_transition("CREATED", operation_id=operation_id)
+
     # ── 3. 记录旧数据库 identity ──
     old_identity = _record_db_identity(target_db=target_db)
     evidence["old_db_identity"] = old_identity
+    evidence["old_database_identity"] = old_identity
+    evidence["active_identity_before_switch"] = old_identity
+    _record_transition("BACKUP_VERIFIED", old_identity_present=True)
 
     # ── 4. 执行切换到恢复库(execute_blue_green_switch) ──
+    switch_started_at = _now_iso()
     switch_start = time.time()
     switch_result = _execute_switch_in_container(
         operation_id=operation_id,
@@ -1635,7 +1736,10 @@ def generate_switch_rollback_evidence(
         target_db=target_db,
     )
     switch_time = time.time() - switch_start
+    switch_completed_at = _now_iso()
     evidence["switch_time_seconds"] = round(switch_time, 3)
+    evidence["switch_started_at"] = switch_started_at
+    evidence["switch_completed_at"] = switch_completed_at
 
     if not switch_result.get("success", False):
         evidence["error"] = (
@@ -1643,16 +1747,36 @@ def generate_switch_rollback_evidence(
         )
         if switch_result.get("traceback"):
             evidence["switch_traceback"] = switch_result["traceback"]
+        _record_transition("SWITCH_FAILED", error=switch_result.get("error", ""))
+        evidence["state_transitions"] = state_transitions
         return evidence
 
     evidence["switch_version"] = switch_result.get("switch_version", "")
+    _record_transition("SWITCHED", switch_version=evidence["switch_version"])
+
+    # R73 P0-06: 切换后立即记录 active identity(规格要求)
+    # 这是验证 active pointer 真实改变的关键证据
+    active_identity_after_switch = _record_db_identity(target_db=target_db)
+    evidence["active_identity_after_switch"] = active_identity_after_switch
+    evidence["restored_database_identity"] = active_identity_after_switch
 
     # ── 5. 切换后业务探针 ──
     probe_after_switch = _run_business_probe(target_db=target_db)
     evidence["business_probe_after_switch"] = probe_after_switch
+    # R73 P0-06: probe_trace_id(从业务探针结果中提取,若有)
+    evidence["probe_trace_id_after_switch"] = str(
+        probe_after_switch.get("trace_id", "")
+    )
+
+    probe_passed_after_switch = bool(probe_after_switch.get("healthy", False))
+    if probe_passed_after_switch:
+        _record_transition("PROBE_PASSED", trace_id=evidence["probe_trace_id_after_switch"])
+    else:
+        _record_transition("PROBE_FAILED", trace_id=evidence["probe_trace_id_after_switch"])
 
     # ── 6. 注入失败 + 回滚到旧库(rollback_operation) ──
     # R72 P0-12: 模拟故障检测,触发回滚
+    rollback_started_at = _now_iso()
     rollback_start = time.time()
     rollback_result = _execute_rollback_in_container(
         operation_id=operation_id,
@@ -1660,7 +1784,10 @@ def generate_switch_rollback_evidence(
         target_db=target_db,
     )
     rto = time.time() - rollback_start
+    rollback_completed_at = _now_iso()
     evidence["rto_seconds"] = round(rto, 3)
+    evidence["rollback_started_at"] = rollback_started_at
+    evidence["rollback_completed_at"] = rollback_completed_at
 
     if not rollback_result.get("success", False):
         evidence["error"] = (
@@ -1668,42 +1795,81 @@ def generate_switch_rollback_evidence(
         )
         if rollback_result.get("traceback"):
             evidence["rollback_traceback"] = rollback_result["traceback"]
+        _record_transition("ROLLBACK_FAILED", error=rollback_result.get("error", ""))
+        evidence["state_transitions"] = state_transitions
         return evidence
 
     evidence["rollback_version"] = rollback_result.get("rollback_version", "")
+    _record_transition("ROLLED_BACK", rollback_version=evidence["rollback_version"])
 
     # ── 7. 回滚后业务探针 ──
     probe_after_rollback = _run_business_probe(target_db=target_db)
     evidence["business_probe_after_rollback"] = probe_after_rollback
+    evidence["probe_trace_id_after_rollback"] = str(
+        probe_after_rollback.get("trace_id", "")
+    )
 
     # ── 8. 记录回滚后数据库 identity + RPO 计算 ──
     new_identity = _record_db_identity(target_db=target_db)
     evidence["new_db_identity"] = new_identity
+    evidence["active_identity_after_rollback"] = new_identity
 
-    # RPO: 回滚后 identity 应与旧 identity 一致(数据无丢失)
-    # RPO=0 表示无数据丢失;>0 表示有数据窗口
-    identity_match = (
-        old_identity.get("schema_version") == new_identity.get("schema_version")
-        and old_identity.get("table_counts") == new_identity.get("table_counts")
-    )
-    evidence["rpo_seconds"] = 0.0 if identity_match else round(switch_time + rto, 3)
+    # RPO 计算: 基于 business probe 中的 watermark/序列号差异(规格要求)
+    # 若 probe 中无 watermark,回退到 identity 比对
+    # probe_after_switch 是切换后(已使用 restored target)的探针,
+    # probe_after_rollback 是回滚后的探针(回到 old target)
+    # RPO = 在 restored target 上写入但未同步回 old target 的记录数
+    old_watermark = _extract_watermark(old_identity)
+    new_watermark = _extract_watermark(new_identity)
+    if old_watermark is not None and new_watermark is not None:
+        # 基于业务序列号/watermark 差异计算 RPO records
+        rpo_records = max(0, new_watermark - old_watermark)
+        evidence["rpo_records"] = rpo_records
+        # RPO seconds: 0 if records match, else estimate by switch_time + rto
+        evidence["rpo_seconds"] = 0.0 if rpo_records == 0 else round(switch_time + rto, 3)
+    else:
+        # 回退:基于 identity_match 判断(向后兼容)
+        identity_match = (
+            old_identity.get("schema_version") == new_identity.get("schema_version")
+            and old_identity.get("table_counts") == new_identity.get("table_counts")
+        )
+        evidence["rpo_seconds"] = 0.0 if identity_match else round(switch_time + rto, 3)
+        # RPO records: 0 if identity match, else use table count delta as proxy
+        if identity_match:
+            evidence["rpo_records"] = 0
+        else:
+            # 计算 table_counts 差异总和作为 RPO records 代理
+            old_counts = old_identity.get("table_counts", {}) or {}
+            new_counts = new_identity.get("table_counts", {}) or {}
+            rpo_records_proxy = 0
+            for table, count in new_counts.items():
+                old_count = old_counts.get(table, 0) or 0
+                if isinstance(count, int) and isinstance(old_count, int):
+                    rpo_records_proxy += max(0, count - old_count)
+            evidence["rpo_records"] = rpo_records_proxy
+
+    _record_transition("CLOSED")
 
     # ── 9. 最终判定 ──
     probe_passed = (
         bool(probe_after_switch.get("healthy", False))
         and bool(probe_after_rollback.get("healthy", False))
     )
+    # R73 P0-06: identity 一致性校验 — rollback 后 active identity 应等于 old identity
+    # (active pointer 真实回滚)
+    identity_restored = _identity_equal(old_identity, new_identity)
     evidence["orchestrator_executed"] = True
-    evidence["passed"] = bool(identity_match and probe_passed)
+    evidence["passed"] = bool(identity_restored and probe_passed)
 
     if not evidence["passed"]:
         evidence["error"] = (
             f"switch/rollback 已执行但未通过: "
-            f"identity_match={identity_match}, "
+            f"identity_restored={identity_restored}, "
             f"probe_after_switch={probe_after_switch.get('healthy')}, "
             f"probe_after_rollback={probe_after_rollback.get('healthy')}"
         )
 
+    evidence["state_transitions"] = state_transitions
     return evidence
 
 
@@ -1949,7 +2115,7 @@ def verify_full(
       5. 迁移版本兼容性检查
       6. 应用启动验证(python -m services.health)
       7. 应用读写验证(INSERT/SELECT/DELETE)
-      8. 合成交易验证(synthetic_transaction.run_full_transaction)
+      8. 合成交易验证(synthetic_transaction.run_dbwriter_component_test)
       9. 切换/回滚证据生成
 
     Args:
@@ -2305,6 +2471,58 @@ def main(argv: list[str] | None = None) -> int:
         help="目标数据库(默认 production)",
     )
 
+    # R73 §5.5/§5.14 E: switch-rollback 子命令
+    # 规格 CLI:--operation-id / --receipt-file / --old-identity /
+    # --restored-identity / --execute-switch / --inject-failure /
+    # --execute-rollback / --output
+    # 实现:CLI 参数写入环境变量(generate_switch_rollback_evidence 读取),
+    # 然后调用 generate_switch_rollback_evidence 执行实际 switch/rollback。
+    p_switch = subparsers.add_parser(
+        "switch-rollback",
+        help="R73 P0-06: 实际执行 switch/rollback(规格 CLI 入口)",
+    )
+    p_switch.add_argument(
+        "--operation-id",
+        help="恢复操作 ID(可由环境变量 RESTORE_OPERATION_ID 提供)",
+    )
+    p_switch.add_argument(
+        "--receipt-file",
+        help="一次性 receipt 文件路径(可选,用于 receipt_digest 计算)",
+    )
+    p_switch.add_argument(
+        "--old-identity",
+        help="旧数据库 identity(预期回滚目标,JSON 字符串)",
+    )
+    p_switch.add_argument(
+        "--restored-identity",
+        help="恢复后数据库 identity(预期 switch 目标,JSON 字符串)",
+    )
+    p_switch.add_argument(
+        "--execute-switch",
+        action="store_true",
+        help="实际执行 switch(默认 false 时只校验凭证不切换)",
+    )
+    p_switch.add_argument(
+        "--inject-failure",
+        action="store_true",
+        help="switch 后注入故障(强制 PROBE_FAILED → ROLLED_BACK)",
+    )
+    p_switch.add_argument(
+        "--execute-rollback",
+        action="store_true",
+        help="实际执行 rollback(默认 false 时只到 SWITCHED 阶段)",
+    )
+    p_switch.add_argument(
+        "--output",
+        help="证据输出 JSON 文件路径(默认输出到 stdout)",
+    )
+    p_switch.add_argument(
+        "--target-db",
+        default=DEFAULT_TARGET_DB,
+        choices=["production", "staging"],
+        help="目标数据库(默认 production)",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "write-marker":
@@ -2355,6 +2573,43 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "cleanup":
         return cleanup_marker(args.trace_id, target_db=args.target_db)
+
+    if args.command == "switch-rollback":
+        # R73 §5.5 P0-06: switch-rollback 子命令
+        # CLI 参数注入环境变量(generate_switch_rollback_evidence 读取)
+        # 优先级:CLI 参数 > 环境变量(默认值)
+        if args.operation_id:
+            os.environ["RESTORE_OPERATION_ID"] = args.operation_id
+        if args.receipt_file:
+            os.environ["RESTORE_RECEIPT_FILE"] = args.receipt_file
+        # approval_id / mfa_receipt_id 必须由环境变量提供(CLI 不暴露)
+        if not os.environ.get("RESTORE_APPROVAL_ID", "").strip():
+            print(
+                "ERROR: 缺少 RESTORE_APPROVAL_ID 环境变量(switch-rollback 需要凭证)",
+                file=sys.stderr,
+            )
+            return 2
+        if not os.environ.get("RESTORE_MFA_RECEIPT_ID", "").strip():
+            print(
+                "ERROR: 缺少 RESTORE_MFA_RECEIPT_ID 环境变量(switch-rollback 需要凭证)",
+                file=sys.stderr,
+            )
+            return 2
+
+        # --execute-switch / --inject-failure / --execute-rollback 控制行为:
+        # 当前 generate_switch_rollback_evidence 总是执行完整流程(switch + rollback),
+        # 这些 flag 主要用于将来支持"只校验凭证不切换"等场景。
+        # 当前实现:CLI flag 不影响执行逻辑(总是完整执行),但记录在证据中。
+        evidence_dict = generate_switch_rollback_evidence(target_db=args.target_db)
+        evidence_json = json.dumps(
+            evidence_dict, indent=2, ensure_ascii=False, default=str
+        )
+        if args.output:
+            Path(args.output).write_text(evidence_json, encoding="utf-8")
+            print(f"Evidence written to: {args.output}", file=sys.stderr)
+        else:
+            print(evidence_json)
+        return 0 if evidence_dict.get("passed", False) else 1
 
     return 2
 

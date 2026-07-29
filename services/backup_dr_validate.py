@@ -1,7 +1,11 @@
 """R56 §8: 备份灾备与数据可信性 — 三段式备份 + 恢复前验证 + staging 原子切换。
 
+R76 O7 / 10.G: 对象存储后端统一为 S3 兼容协议(Cloudflare R2 生产 / MinIO CI)。
+本模块所有 ``r2_storage`` 参数实际为统一 ``R2Storage`` 单例,由
+``configure_storage_from_settings()`` 根据 ``OBJECT_STORAGE_BACKEND`` 注入。
+
 报告 §8 要求:
-    - SQLite/R2 备份采用 ``payload.enc → manifest.json → COMPLETE``
+    - SQLite/对象存储 备份采用 ``payload.enc → manifest.json → COMPLETE``
     - manifest 绑定 ciphertext hash、schema version、KEK key id、覆盖范围、创建版本
     - 恢复前先验证签名、校验和、schema compatibility、对象完整性
     - 恢复过程使用 staging 目录,验证后原子切换
@@ -31,15 +35,15 @@ import json
 import os
 import secrets as _secrets
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Optional
 
 from loguru import logger
 
+from services.error_codes import AppError, ErrorCodes
 from services.i18n import translate as _i18n_t
-
 
 # ── 常量 ──────────────────────────────────────────────────────
 
@@ -63,6 +67,32 @@ REQUIRED_MANIFEST_FIELDS = (
     "backup_type",
     "encryption",
 )
+
+
+@dataclass(frozen=True)
+class ExactBackupContract:
+    """显式对象 key 绑定后的只读备份合同。
+
+    该对象只证明 COMPLETE/manifest/payload 信任链和解密明文有效，不能授权写入。
+    写入目标必须由调用方另行建立隔离身份并执行空库断言。
+    """
+
+    valid: bool
+    backup_id: str = ""
+    payload_key: str = ""
+    manifest_key: str = ""
+    complete_key: str = ""
+    manifest_sha256: str = ""
+    ciphertext_sha256: str = ""
+    plaintext_sha256: str = ""
+    schema_version: str = ""
+    source_sha: str = ""
+    source_database_identity: str = ""
+    schema_fingerprint: str = ""
+    manifest: Mapping = field(default_factory=lambda: MappingProxyType({}))
+    plaintext_bytes: bytes = b""
+    error_code: str = ""
+    error_message: str = ""
 
 
 @dataclass
@@ -983,6 +1013,9 @@ async def validate_backup_completeness(
     expected_manifest_key: str,  # R59 P0-04: 强制参数,不再允许 fail-open(原 = "")
     signing_key: bytes,          # R59 P0-04: 强制参数,不再允许 fail-open(原 = b"")
     expected_backup_id: str,     # R59 P0-04: 新增强制参数,比对 backup_id
+    *,
+    expected_complete_key: str = "",
+    expected_payload_key: str = "",
 ) -> BackupValidationResult:
     """R58 P0-3 / R59 P0-04 / R60 P0-04: 验证备份完整性(COMPLETE 标记存在 + 签名 + 严格绑定)。
 
@@ -1044,7 +1077,7 @@ async def validate_backup_completeness(
             error_message="R59 P0-04: expected_backup_id is required (fail-closed)",
         )
 
-    complete_key = get_complete_key(timestamp, backup_type)
+    complete_key = expected_complete_key or get_complete_key(timestamp, backup_type)
     try:
         content = await r2_storage.download(complete_key)
         if content is None:
@@ -1097,6 +1130,16 @@ async def validate_backup_completeness(
                 error_message=(
                     f"COMPLETE marker manifest_key mismatch: "
                     f"expected={expected_manifest_key}, actual={marker_manifest_key}"
+                ),
+            )
+        if expected_payload_key and marker_payload_key != expected_payload_key:
+            return BackupValidationResult(
+                valid=False,
+                backup_id=timestamp,
+                error_code="BACKUP.RESTORE.COMPLETE_MARKER_INVALID",
+                error_message=(
+                    f"COMPLETE marker payload_key mismatch: "
+                    f"expected={expected_payload_key}, actual={marker_payload_key}"
                 ),
             )
         # R58 P0-3: manifest_sha256/payload_sha256 必须非空(强绑定)
@@ -1165,6 +1208,7 @@ async def validate_backup_completeness(
             backup_id=marker_backup_id,
             manifest_sha256=marker_manifest_sha,  # R59 P0-04: 传递给 manifest bytes SHA 比对
             payload_key=marker_payload_key,       # R59 P0-04: 传递给 payload_key 一致性比对
+            ciphertext_sha256=marker_payload_sha,  # 已签名 COMPLETE 中的 payload digest
         )
     except Exception as e:
         return BackupValidationResult(
@@ -1179,13 +1223,15 @@ async def validate_backup_manifest(
     timestamp: str,
     backup_type: str,
     r2_storage,
+    *,
+    expected_manifest_key: str = "",
 ) -> BackupValidationResult:
     """R56 §8: 验证 manifest 字段完整性。
 
     检查 manifest 包含所有必填字段(ciphertext_sha256、schema_version、
     backup_id、encryption.key_id 等)。
     """
-    manifest_key = get_manifest_key(timestamp, backup_type)
+    manifest_key = expected_manifest_key or get_manifest_key(timestamp, backup_type)
     try:
         content = await r2_storage.download(manifest_key)
         if content is None:
@@ -1351,6 +1397,8 @@ async def validate_backup_payload(
     schema_version: str,  # R59 P0-04: 强制参数(原 = ""),AAD 绑定需要
     decryptor,            # R59 P0-04: 强制参数(原 = None),缺失返回 invalid
     key_id: str = "",     # R59 P0-04: 新增,AAD 绑定需要
+    *,
+    expected_payload_key: str = "",
 ) -> BackupValidationResult:
     """R58 P0-3 / R59 P0-04: 下载 payload → 校验 ciphertext_sha256 → 解密 → 校验 plaintext_sha256。
 
@@ -1363,13 +1411,14 @@ async def validate_backup_payload(
         - decryptor 必填:缺失时直接返回 invalid(不再记录 warning 后跳过)
         - schema_version 必填:AAD 绑定需要
         - 新增 key_id 参数:AAD 绑定需要
-        - AAD 绑定字段扩展为:backup_id|schema_version|payload_key|key_id|plaintext_sha256
-          (R58 仅绑定 backup_id:schema_version,R59 扩展为 5 字段强绑定)
+        - AAD 必须与权威 backup_once() 加密格式一致:
+          backup_id|schema_version|key_id
 
-    AAD 绑定字段(R59 P0-04):
-        backup_id | schema_version | payload_key | key_id | plaintext_sha256
-        — 绑定备份身份、schema 版本、对象 key、加密密钥 ID、明文摘要
-        — 防止密文被替换到其他 backup_id/payload_key 的攻击
+    AAD 绑定字段:
+        backup_id | schema_version | key_id
+        — 与 services.backup_crypto.encrypt_payload() 的实际格式保持一致
+        — payload_key、ciphertext/plaintext digest 由已签名 COMPLETE + manifest
+          信任链独立强绑定，不能伪造为 AEAD 中并不存在的字段
 
     Args:
         timestamp: 备份 ID(= backup_id)
@@ -1402,7 +1451,7 @@ async def validate_backup_payload(
             error_message="R59 P0-04: schema_version is required for AAD binding (fail-closed)",
         )
 
-    payload_key = get_payload_key(timestamp, backup_type)
+    payload_key = expected_payload_key or get_payload_key(timestamp, backup_type)
     try:
         ciphertext = await r2_storage.download(payload_key)
         if ciphertext is None:
@@ -1435,12 +1484,10 @@ async def validate_backup_payload(
                 error_message="R59 P0-04: expected_plaintext_sha256 is required (fail-closed)",
             )
         try:
-            # R59 P0-04: AAD 绑定 5 字段 — backup_id|schema_version|payload_key|key_id|plaintext_sha256
-            # (R58 仅绑定 backup_id:schema_version,R59 扩展为 5 字段强绑定)
-            aad = (
-                f"{timestamp}|{schema_version}|{payload_key}|{key_id}|"
-                f"{expected_plaintext_sha256}"
-            ).encode("utf-8")
+            # 权威备份 AAD 由 backup_crypto.encrypt_payload() 定义为
+            # backup_id|schema_version|key_id。对象 key 与两个 digest 已分别由
+            # 已签名 COMPLETE marker 和 manifest 原始 bytes digest 强绑定。
+            aad = f"{timestamp}|{schema_version}|{key_id}".encode()
             plaintext = decryptor.decrypt(ciphertext, aad=aad)
         except Exception as decrypt_err:
             return BackupValidationResult(
@@ -1621,6 +1668,305 @@ def _compute_sha256(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
 
+def _exact_contract_failure(
+    *,
+    backup_id: str,
+    payload_key: str,
+    manifest_key: str,
+    complete_key: str,
+    error_code: str,
+    error_message: str,
+) -> ExactBackupContract:
+    """构造保留 exact-key 上下文的 fail-closed 结果。"""
+    return ExactBackupContract(
+        valid=False,
+        backup_id=backup_id,
+        payload_key=payload_key,
+        manifest_key=manifest_key,
+        complete_key=complete_key,
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+
+async def validate_exact_backup_contract(
+    *,
+    backup_id: str,
+    payload_key: str,
+    manifest_key: str,
+    complete_key: str,
+    backup_type: str,
+    r2_storage,
+    signing_key: bytes,
+    current_schema_version: str,
+    kek: bytes | None = None,
+    payload_read_key: str = "",
+) -> ExactBackupContract:
+    """验证由 backup-state 显式给出的三对象合同并返回只读明文。
+
+    本入口不按 ``backup_id`` 重新推导任何对象 key。验证顺序固定为：
+    COMPLETE 签名与 exact-key 绑定 → manifest 原始 bytes digest → manifest
+    exact-key/digest/schema 绑定 → payload 密文 digest → AES-GCM 解密与明文
+    digest。``payload_read_key`` 仅用于 corruption negative 下载损坏副本；
+    COMPLETE/manifest 仍必须绑定权威 ``payload_key``，因此不能替换信任链。
+    任何下载、解析、配置或认证错误都返回其真实错误码，调用方不得将其当作
+    corruption negative 成功。
+    """
+    exact_values = {
+        "backup_id": backup_id,
+        "payload_key": payload_key,
+        "manifest_key": manifest_key,
+        "complete_key": complete_key,
+        "backup_type": backup_type,
+        "current_schema_version": current_schema_version,
+    }
+    actual_payload_read_key = payload_read_key.strip() or payload_key
+    missing = [name for name, value in exact_values.items() if not str(value).strip()]
+    if missing or not signing_key or r2_storage is None:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code=ErrorCodes.BACKUP_RESTORE_EXACT_CONTRACT_INVALID,
+            error_message=f"missing exact contract fields: {missing}",
+        )
+    if len({payload_key, manifest_key, complete_key}) != 3:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code=ErrorCodes.BACKUP_RESTORE_EXACT_CONTRACT_INVALID,
+            error_message="payload/manifest/COMPLETE keys must be distinct",
+        )
+
+    complete_result = await validate_backup_completeness(
+        backup_id,
+        backup_type,
+        r2_storage,
+        expected_manifest_key=manifest_key,
+        signing_key=signing_key,
+        expected_backup_id=backup_id,
+        expected_complete_key=complete_key,
+        expected_payload_key=payload_key,
+    )
+    if not complete_result.valid:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code=complete_result.error_code,
+            error_message=complete_result.error_message,
+        )
+
+    try:
+        manifest_bytes = await r2_storage.download(manifest_key)
+    except Exception as exc:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code=ErrorCodes.BACKUP_RESTORE_MANIFEST_DOWNLOAD_FAILED,
+            error_message=f"manifest download failed: {type(exc).__name__}: {exc}",
+        )
+    if manifest_bytes is None:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.MANIFEST_MISSING",
+            error_message=f"manifest.json not found: {manifest_key}",
+        )
+    actual_manifest_sha = _compute_sha256(manifest_bytes)
+    if actual_manifest_sha != complete_result.manifest_sha256:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.MANIFEST_HASH_MISMATCH",
+            error_message=(
+                "manifest hash mismatch: "
+                f"expected={complete_result.manifest_sha256[:16]}..., "
+                f"actual={actual_manifest_sha[:16]}..."
+            ),
+        )
+    try:
+        manifest = json.loads(manifest_bytes)
+    except Exception as exc:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
+            error_message=f"manifest JSON invalid: {type(exc).__name__}: {exc}",
+        )
+    if not isinstance(manifest, dict):
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
+            error_message="manifest must be a JSON object",
+        )
+
+    missing_fields = [field for field in REQUIRED_MANIFEST_FIELDS if field not in manifest]
+    if missing_fields:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.MANIFEST_INCOMPLETE",
+            error_message=f"manifest missing required fields: {missing_fields}",
+        )
+
+    manifest_backup_id = str(manifest.get("backup_id", ""))
+    manifest_payload_key = str(manifest.get("payload_key", ""))
+    manifest_manifest_key = str(manifest.get("manifest_key", ""))
+    ciphertext_sha = str(manifest.get("ciphertext_sha256", ""))
+    plaintext_sha = str(manifest.get("plaintext_sha256", ""))
+    schema_version = str(manifest.get("schema_version", ""))
+    encryption = manifest.get("encryption", {})
+    if manifest_backup_id != backup_id:
+        mismatch = f"manifest backup_id mismatch: expected={backup_id}, actual={manifest_backup_id}"
+    elif manifest_payload_key != payload_key:
+        mismatch = f"manifest payload_key mismatch: expected={payload_key}, actual={manifest_payload_key}"
+    elif manifest_manifest_key != manifest_key:
+        mismatch = f"manifest manifest_key mismatch: expected={manifest_key}, actual={manifest_manifest_key}"
+    elif ciphertext_sha != complete_result.ciphertext_sha256:
+        mismatch = "manifest ciphertext_sha256 does not match signed COMPLETE payload_sha256"
+    else:
+        mismatch = ""
+    if mismatch:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code=ErrorCodes.BACKUP_RESTORE_MANIFEST_BINDING_MISMATCH,
+            error_message=mismatch,
+        )
+    if not isinstance(encryption, dict) or not encryption.get("encrypted"):
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code=ErrorCodes.BACKUP_RESTORE_ENCRYPTION_REQUIRED,
+            error_message="authoritative exact backup must use encrypted payload",
+        )
+    key_id = str(encryption.get("key_id", ""))
+    wrapped_dek = str(encryption.get("wrapped_dek", ""))
+    nonce = str(encryption.get("nonce", ""))
+    digests_valid = all(
+        len(value) == 64 and all(char in "0123456789abcdef" for char in value.lower())
+        for value in (ciphertext_sha, plaintext_sha)
+    )
+    if not key_id or not wrapped_dek or not nonce or not digests_valid:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.MANIFEST_INVALID",
+            error_message="manifest encryption metadata or digests are invalid",
+        )
+    compatible, reason = validate_schema_compatibility(
+        schema_version, current_schema_version
+    )
+    if not compatible:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.SCHEMA_INCOMPATIBLE",
+            error_message=reason,
+        )
+
+    try:
+        ciphertext = await r2_storage.download(actual_payload_read_key)
+    except Exception as exc:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code=ErrorCodes.BACKUP_RESTORE_PAYLOAD_DOWNLOAD_FAILED,
+            error_message=f"payload download failed: {type(exc).__name__}: {exc}",
+        )
+    if ciphertext is None:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.PAYLOAD_MISSING",
+            error_message=f"payload.enc not found: {actual_payload_read_key}",
+        )
+    actual_ciphertext_sha = _compute_sha256(ciphertext)
+    if actual_ciphertext_sha != ciphertext_sha:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.CIPHERTEXT_HASH_MISMATCH",
+            error_message=(
+                "ciphertext hash mismatch: "
+                f"expected={ciphertext_sha[:16]}..., actual={actual_ciphertext_sha[:16]}..."
+            ),
+        )
+
+    try:
+        from services.backup_crypto import decrypt_payload
+
+        plaintext = decrypt_payload(
+            ciphertext,
+            wrapped_dek=wrapped_dek,
+            nonce_b64=nonce,
+            kek=kek,
+            expected_plaintext_sha256=plaintext_sha,
+            backup_id=backup_id,
+            schema_version=schema_version,
+            key_id=key_id,
+            allow_legacy_aad=False,
+        )
+    except Exception as exc:
+        return _exact_contract_failure(
+            backup_id=backup_id,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            complete_key=complete_key,
+            error_code="BACKUP.RESTORE.DECRYPT_FAILED",
+            error_message=f"decryption failed: {type(exc).__name__}: {exc}",
+        )
+
+    return ExactBackupContract(
+        valid=True,
+        backup_id=backup_id,
+        payload_key=payload_key,
+        manifest_key=manifest_key,
+        complete_key=complete_key,
+        manifest_sha256=actual_manifest_sha,
+        ciphertext_sha256=actual_ciphertext_sha,
+        plaintext_sha256=_compute_sha256(plaintext),
+        schema_version=schema_version,
+        source_sha=str(manifest.get("source_sha") or manifest.get("commit_sha") or ""),
+        source_database_identity=str(manifest.get("source_database_identity", "")),
+        schema_fingerprint=str(manifest.get("schema_fingerprint", "")),
+        manifest=_deep_freeze(manifest),
+        plaintext_bytes=bytes(plaintext),
+    )
+
+
 # ── 完整恢复流程编排 ───────────────────────────────────────────
 
 
@@ -1634,6 +1980,9 @@ async def validate_backup_for_restore(
     expected_backup_id: str,     # R59 P0-04: 强制参数(透传给 validate_backup_completeness)
     decryptor,                   # R59 P0-04: 强制参数(透传给 validate_backup_payload)
     key_id: str = "",            # R59 P0-04: AAD 绑定需要(透传给 validate_backup_payload)
+    *,
+    expected_complete_key: str = "",
+    expected_payload_key: str = "",
 ) -> BackupValidationResult:
     """R56 §8 / R59 P0-04: 完整的恢复前验证流程编排。
 
@@ -1667,11 +2016,18 @@ async def validate_backup_for_restore(
     r1 = await validate_backup_completeness(
         timestamp, backup_type, r2_storage,
         expected_manifest_key, signing_key, expected_backup_id,
+        expected_complete_key=expected_complete_key,
+        expected_payload_key=expected_payload_key,
     )
     if not r1.valid:
         return r1
     # 2. manifest 完整性
-    r2 = await validate_backup_manifest(timestamp, backup_type, r2_storage)
+    r2 = await validate_backup_manifest(
+        timestamp,
+        backup_type,
+        r2_storage,
+        expected_manifest_key=expected_manifest_key,
+    )
     if not r2.valid:
         return r2
     # 3. schema compatibility
@@ -1694,6 +2050,7 @@ async def validate_backup_for_restore(
         schema_version=r2.schema_version,  # R59 P0-04: 必填(AAD 绑定)
         decryptor=decryptor,               # R59 P0-04: 必填(fail-closed)
         key_id=key_id,                     # R59 P0-04: AAD 绑定
+        expected_payload_key=expected_payload_key or r1.payload_key,
     )
     if not r4.valid:
         return r4
@@ -1711,6 +2068,77 @@ async def validate_backup_for_restore(
 
 
 # ── R59 P0-04 / R61 P0-03: 统一 fail-closed 恢复入口 ────────────
+
+
+def _validate_r76_p0_05_env() -> "tuple[bytes, str, int, int]":
+    """R76 P0-05: 校验环境变量并返回独立 expected 值来源(必须在备份验证前调用)。
+
+    生产环境(无 ALLOW_LEGACY_RESTORE=1)缺失任一 env → fail-closed(AppError)。
+    测试环境(ALLOW_LEGACY_RESTORE=1,conftest autouse fixture)允许回退到默认值。
+
+    必须在备份验证步骤之前调用,确保 env 缺失时立即 fail-closed,
+    不会因后续备份验证步骤的失败掩盖 env 校验缺失。
+
+    Returns:
+        (_restore_signing_key, _ctx_source_sha, _ctx_run_id, _ctx_run_attempt)
+    """
+    _restore_signing_key = os.environ.get("RESTORE_CAPABILITY_SIGNING_KEY", "").encode()
+    if not _restore_signing_key:
+        raise AppError(
+            ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+            params={"reason": "RESTORE_CAPABILITY_SIGNING_KEY not set"},
+        )
+    _legacy_mode = os.environ.get("ALLOW_LEGACY_RESTORE", "").lower() in ("1", "true", "yes")
+    _ctx_source_sha = os.environ.get("GITHUB_SHA")
+    if not _ctx_source_sha:
+        if _legacy_mode:
+            _ctx_source_sha = "local"
+        else:
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"reason": "source_sha required (R76 P0-05)"},
+            )
+    _ctx_run_id_str = os.environ.get("GITHUB_RUN_ID")
+    if _ctx_run_id_str is None:
+        if _legacy_mode:
+            _ctx_run_id = 0
+        else:
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"reason": "run_id required (R76 P0-05)"},
+            )
+    else:
+        try:
+            _ctx_run_id = int(_ctx_run_id_str)
+        except (TypeError, ValueError):
+            if _legacy_mode:
+                _ctx_run_id = 0
+            else:
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={"reason": "run_id required (R76 P0-05)"},
+                )
+    _ctx_run_attempt_str = os.environ.get("GITHUB_RUN_ATTEMPT")
+    if _ctx_run_attempt_str is None:
+        if _legacy_mode:
+            _ctx_run_attempt = 1
+        else:
+            raise AppError(
+                ErrorCodes.VALIDATION_FAILED,
+                params={"reason": "run_attempt required (R76 P0-05)"},
+            )
+    else:
+        try:
+            _ctx_run_attempt = int(_ctx_run_attempt_str)
+        except (TypeError, ValueError):
+            if _legacy_mode:
+                _ctx_run_attempt = 1
+            else:
+                raise AppError(
+                    ErrorCodes.VALIDATION_FAILED,
+                    params={"reason": "run_attempt required (R76 P0-05)"},
+                )
+    return _restore_signing_key, _ctx_source_sha, _ctx_run_id, _ctx_run_attempt
 
 
 async def validate_and_restore_backup_strict(
@@ -1801,13 +2229,17 @@ async def validate_and_restore_backup_strict(
                   旧格式备份(db_backup_*.json)应**不调用本函数** —
                   调用方必须在调用前检测并 FAIL,提示用户使用离线导入/迁移工具。
     """
+    # R76 §10.M: 在函数体开头无条件导入 AppError/ErrorCodes,避免下方 20+ 处
+    # 条件分支内的 local import 导致 Python 将 AppError 视为整个函数的局部变量,
+    # 当条件分支跳过 import 时触发 UnboundLocalError(模块级 line 45 已导入,
+    # 此处为防御性绑定,确保所有代码路径都能引用)
+    from services.error_codes import AppError, ErrorCodes
+
     # R62 P0-01: 信任链元数据(由严格三段式验证填充)
     cap_backup_id = ""
     cap_manifest_sha256 = ""
     cap_payload_key = ""
-    cap_ciphertext_sha256 = ""
     cap_plaintext_sha256 = ""
-    cap_encryption_key_id = ""
     cap_schema_fingerprint = ""
 
     # ── 严格三段式验证模式(无 skip 路径) ──
@@ -1824,6 +2256,12 @@ async def validate_and_restore_backup_strict(
     if not expected_backup_id:
         from services.error_codes import AppError, ErrorCodes
         raise AppError(ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED)
+
+    # R76 P0-05: env 校验必须在备份验证前执行 — 缺失即 fail-closed,
+    # 不得因后续备份验证步骤的失败掩盖 env 校验缺失
+    _restore_signing_key, _ctx_source_sha, _ctx_run_id, _ctx_run_attempt = (
+        _validate_r76_p0_05_env()
+    )
 
     # ── 步骤 1: 下载 COMPLETE → 验签 → 比对 backup_id ──
     r1 = await validate_backup_completeness(
@@ -1973,9 +2411,7 @@ async def validate_and_restore_backup_strict(
     cap_backup_id = manifest_backup_id
     cap_manifest_sha256 = actual_manifest_sha
     cap_payload_key = expected_payload_key
-    cap_ciphertext_sha256 = ct_sha
     cap_plaintext_sha256 = pt_sha
-    cap_encryption_key_id = key_id
     # R62 P0-01: schema_fingerprint 用作 scope(防 schema 跨越攻击)
     cap_schema_fingerprint = schema_version
 
@@ -2015,33 +2451,99 @@ async def validate_and_restore_backup_strict(
         canonical_payload_bytes=_canonical_json_bytes(enriched_data),
     )
 
-    # ── R61 P0-03 / R62 P0-01: 构造不可伪造的 _RestoreCapability ──
-    # 仅本模块可通过 _RESTORE_SENTINEL 构造;外部代码无法获取 sentinel 引用。
-    # capability.payload_digest 与 verified_payload.payload_digest 绑定,
-    # _restore_from_backup_data 首条语句 assert_valid() 校验二者一致性。
-    capability = _RestoreCapability(
-        _RESTORE_SENTINEL,
+    # ── R75 P0-06: 签发 capability dict(替代旧 _RestoreCapability 对象) ──
+    # 新的 verify_and_consume_capability() 需要 HMAC 签名的 capability dict,
+    # 不再使用 sentinel 保护的 _RestoreCapability 对象。
+    from services.restore_capability_file import issue_capability
+    # R76 P0-05: _restore_signing_key / _ctx_source_sha / _ctx_run_id /
+    # _ctx_run_attempt 已在函数开头通过 _validate_r76_p0_05_env() 校验获取
+    _ctx_audience = "backup_dr_validate"
+    _ctx_target_uri = f"sqlite://{cap_payload_key}"
+    # R76 P0-05: operation_id 由 orchestrator 生成;此处使用 backup_id+timestamp
+    # 作为确定性 operation_id(backup_dr_validate 路径无 orchestrator)
+    _ctx_operation_id = f"restore-{cap_backup_id}-{timestamp}"
+    _ctx_nonce = _secrets.token_hex(16)
+    capability = issue_capability(
         backup_id=cap_backup_id,
-        manifest_sha256=cap_manifest_sha256,
-        payload_key=cap_payload_key,
-        ciphertext_sha256=cap_ciphertext_sha256,
-        plaintext_sha256=cap_plaintext_sha256,
-        encryption_key_id=cap_encryption_key_id,
-        issuer="validate_and_restore_backup_strict",
-        schema_fingerprint=cap_schema_fingerprint,
-        payload_digest=verified_payload.payload_digest,
+        source_sha=_ctx_source_sha,
+        target_database_identity=cap_schema_fingerprint,
+        target_path=cap_payload_key,
+        run_id=_ctx_run_id,
+        run_attempt=_ctx_run_attempt,
+        audience=_ctx_audience,
+        target_uri=_ctx_target_uri,
+        signing_key=_restore_signing_key,
+        operation_id=_ctx_operation_id,
+        nonce=_ctx_nonce,
     )
 
+    # R76 P0-05 / O8: 构造 RestoreOperationContext(独立 expected 值来源)
+    # context 字段与 issue_capability 使用相同的独立来源(env + manifest),
+    # 但 context 作为独立对象传递给 writer,不依赖 capability 自身回填
+    from services.restore_nonce_store import RestoreNonceStore
+    from services.restore_operation_context import RestoreOperationContext
+    operation_context = RestoreOperationContext(
+        operation_id=_ctx_operation_id,
+        backup_id=cap_backup_id,
+        source_sha=_ctx_source_sha,
+        run_id=_ctx_run_id,
+        run_attempt=_ctx_run_attempt,
+        audience=_ctx_audience,
+        target_identity=cap_schema_fingerprint,
+        target_uri=_ctx_target_uri,
+        manifest_digest=cap_manifest_sha256,
+        payload_digest=cap_plaintext_sha256,
+        allowed_action="restore_to_blank_target",
+        nonce=_ctx_nonce,
+    )
+    operation_context.validate()  # fail-closed
+
+    # R76 P0-06 / O8: 获取 RestoreNonceStore(数据库 CAS,替代 /tmp 文件 CAS)
+    # 当 get_cache_store() 返回 None(单元测试场景)时,跳过 nonce 预留,
+    # nonce_store=None 传给 writer,writer 的 verify_and_consume_capability
+    # 会在 None.consume 上抛异常(fail-closed),由集成测试覆盖真实 DB 路径
+    try:
+        from database.cache_store import get_cache_store
+        _cache_store = get_cache_store()
+        if _cache_store is None:
+            logger.debug(
+                "[backup_dr_validate] R76 O8: cache_store 不可用,"
+                "跳过 nonce 预留(测试场景)"
+            )
+            nonce_store = None
+        else:
+            nonce_store = RestoreNonceStore(_cache_store)
+            # 预留 nonce(数据库 CAS)
+            reserved = await nonce_store.reserve(
+                capability, operation_context,
+                reserved_by=f"backup_dr_validate:{_ctx_operation_id}",
+            )
+            if not reserved:
+                raise AppError(
+                    ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                    params={
+                        "reason": "nonce_reserve_failed_replay_detected",
+                        "operation_id": _ctx_operation_id,
+                    },
+                )
+    except AppError:
+        raise
+    except Exception as e:
+        # CacheStore 不可用时使用 None(测试场景)— verify_and_consume_capability
+        # 会因 nonce_store.consume 抛异常而失败(fail-closed)
+        logger.warning(
+            f"[backup_dr_validate] R76 O8: nonce_store 初始化失败,"
+            f"restore 将 fail-closed: {e}"
+        )
+        nonce_store = None
+
     # ── R61 P0-03: 调用私有写入器(R69 Wave 2: 从 services.restore_writer 导入) ──
-    # R69 P0-4 (Wave 2): 写入器逻辑已从 services/db_restore.py 提取到
-    # services/restore_writer.py,消除生产镜像对 services/db_restore.py 的延迟 import 依赖
-    # (.dockerignore 排除 services/db_restore.py 作为 CLI-only 入口)。
-    # services/restore_writer.py 不被 .dockerignore 排除,在生产镜像中可用。
-    # 保持延迟导入以避免循环依赖(restore_writer 间接依赖本模块的 VerifiedBackupPayload)。
     from services.restore_writer import _restore_from_backup_data
     result = await _restore_from_backup_data(
         verified_payload,
-        _capability=capability,
+        capability=capability,
+        operation_context=operation_context,
+        nonce_store=nonce_store,
         tables=tables,
         merge=merge,
     )
@@ -2104,6 +2606,11 @@ async def _restore_preverified_payload(
         AppError: capability 校验失败(过期/重放/digest 不匹配/scope 跨越)时
                   由 _restore_from_backup_data 首条 assert_valid 抛出
     """
+    # R76 P0-05: env 校验必须在 capability 签发前执行 — 缺失即 fail-closed
+    _restore_signing_key, _ctx_source_sha, _ctx_run_id, _ctx_run_attempt = (
+        _validate_r76_p0_05_env()
+    )
+
     # R62 P0-02 / R64 P1-01: 构造 VerifiedBackupPayload(单一 canonical bytes 来源)
     # payload_digest 从 canonical_payload_bytes 自动计算(__post_init__)
     # R65 P1-06: 用 _enrich_payload_data 补齐 canonical payload 必填字段
@@ -2119,27 +2626,97 @@ async def _restore_preverified_payload(
         canonical_payload_bytes=_canonical_json_bytes(enriched_data),
     )
 
-    # R62 P0-01: 构造不可伪造的 _RestoreCapability
-    # payload_digest 与 verified_payload.payload_digest 绑定,
-    # _restore_from_backup_data 首条 assert_valid 校验二者一致(防 payload 替换)。
-    capability = _RestoreCapability(
-        _RESTORE_SENTINEL,
+    # R75 P0-06: 签发 capability dict(替代旧 _RestoreCapability 对象)
+    from services.restore_capability_file import issue_capability
+    # R76 P0-05: _restore_signing_key / _ctx_source_sha / _ctx_run_id /
+    # _ctx_run_attempt 已在函数开头通过 _validate_r76_p0_05_env() 校验获取
+    _ctx_audience = issuer
+    _ctx_target_uri = f"sqlite://{payload_key}"
+    # R76 P0-05: operation_id 由 orchestrator 生成;此处使用 backup_id+timestamp
+    # 作为确定性 operation_id(backup_dr_validate 路径无 orchestrator)
+    _ctx_operation_id = f"restore-{backup_id}-{payload_key}"
+    _ctx_nonce = _secrets.token_hex(16)
+    capability = issue_capability(
         backup_id=backup_id,
-        manifest_sha256=manifest_sha256,
-        payload_key=payload_key,
-        ciphertext_sha256=ciphertext_sha256,
-        plaintext_sha256=plaintext_sha256,
-        encryption_key_id=encryption_key_id,
-        issuer=issuer,
-        schema_fingerprint=schema_fingerprint,
-        payload_digest=verified_payload.payload_digest,
+        source_sha=_ctx_source_sha,
+        target_database_identity=schema_fingerprint,
+        target_path=payload_key,
+        run_id=_ctx_run_id,
+        run_attempt=_ctx_run_attempt,
+        audience=_ctx_audience,
+        target_uri=_ctx_target_uri,
+        signing_key=_restore_signing_key,
+        operation_id=_ctx_operation_id,
+        nonce=_ctx_nonce,
     )
+
+    # R76 P0-05 / O8: 构造 RestoreOperationContext(独立 expected 值来源)
+    # 与 validate_and_restore_backup_strict 镜像,context 字段从 env + 已验证
+    # manifest 字段读取,不依赖 capability 自身回填
+    from services.restore_nonce_store import RestoreNonceStore
+    from services.restore_operation_context import RestoreOperationContext
+    operation_context = RestoreOperationContext(
+        operation_id=_ctx_operation_id,
+        backup_id=backup_id,
+        source_sha=_ctx_source_sha,
+        run_id=_ctx_run_id,
+        run_attempt=_ctx_run_attempt,
+        audience=_ctx_audience,
+        target_identity=schema_fingerprint,
+        target_uri=_ctx_target_uri,
+        manifest_digest=manifest_sha256,
+        payload_digest=verified_payload.payload_digest,
+        allowed_action="restore_to_blank_target",
+        nonce=_ctx_nonce,
+    )
+    operation_context.validate()  # fail-closed
+
+    # R76 P0-06 / O8: 获取 RestoreNonceStore(数据库 CAS,替代 /tmp 文件 CAS)
+    # 当 get_cache_store() 返回 None(单元测试场景)时,跳过 nonce 预留,
+    # nonce_store=None 传给 writer,writer 的 verify_and_consume_capability
+    # 会在 None.consume 上抛异常(fail-closed),由集成测试覆盖真实 DB 路径
+    try:
+        from database.cache_store import get_cache_store
+        _cache_store = get_cache_store()
+        if _cache_store is None:
+            logger.debug(
+                "[backup_dr_validate] R76 O8: cache_store 不可用 "
+                "(_restore_preverified_payload),跳过 nonce 预留(测试场景)"
+            )
+            nonce_store = None
+        else:
+            nonce_store = RestoreNonceStore(_cache_store)
+            # 预留 nonce(数据库 CAS)
+            reserved = await nonce_store.reserve(
+                capability, operation_context,
+                reserved_by=f"backup_dr_validate:{_ctx_operation_id}",
+            )
+            if not reserved:
+                raise AppError(
+                    ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                    params={
+                        "reason": "nonce_reserve_failed_replay_detected",
+                        "operation_id": _ctx_operation_id,
+                    },
+                )
+    except AppError:
+        raise
+    except Exception as e:
+        # CacheStore 不可用时使用 None(测试场景)— verify_and_consume_capability
+        # 会因 nonce_store.consume 抛异常而失败(fail-closed)
+        logger.warning(
+            f"[backup_dr_validate] R76 O8: nonce_store 初始化失败 "
+            f"(_restore_preverified_payload),restore 将 fail-closed: {e}"
+        )
+        nonce_store = None
 
     # 调用私有写入器(R69 Wave 2: 从 services.restore_writer 延迟导入)
     from services.restore_writer import _restore_from_backup_data
     return await _restore_from_backup_data(
         verified_payload,
-        _capability=capability,
+        capability=capability,
+        operation_context=operation_context,
+        nonce_store=nonce_store,
         tables=tables,
         merge=merge,
     )

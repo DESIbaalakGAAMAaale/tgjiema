@@ -53,6 +53,21 @@ class Settings(BaseSettings):
     MON_BOT_TOKEN: str = ""
     ADMIN_TELEGRAM_ID: int = 0
 
+    # ── R76 O1: Secretless 协议兼容层配置 ──────────────────────────────────
+    # PROVIDER_BACKEND: telegram=生产真实 Bot,contract=CI/本地协议模拟器
+    # OBJECT_STORAGE_BACKEND: r2=生产Cloudflare R2,minio=CI/本地S3兼容
+    # SECRETLESS_MODE=true 时强制 contract+minio，禁止任何真实凭证
+    # 详情参见 docs/tgjiema R76 整改报告 10.O-O1
+    PROVIDER_BACKEND: str = "telegram"
+    PROVIDER_BASE_URL: str = "https://api.telegram.org"
+    PROVIDER_CONTRACT_TOKEN: str = ""
+    OBJECT_STORAGE_BACKEND: str = "r2"
+    S3_ENDPOINT_URL: str = ""
+    S3_ACCESS_KEY_ID: str = ""
+    S3_SECRET_ACCESS_KEY: str = ""
+    S3_BUCKET_NAME: str = ""
+    SECRETLESS_MODE: bool = False
+
     MON_CHECK_INTERVAL: int = 60
 
     # ── 轮转参数（可在 .env 或管理员 Bot 运行时覆盖） ──
@@ -588,6 +603,148 @@ class Settings(BaseSettings):
                     "(旧 restore writer 已被封存,生产恢复必须通过 RestoreOrchestrator "
                     "蓝绿切换路径执行)。如需在测试/脚本中使用,请在非生产环境设置此变量。"
                 )
+        return self
+
+    @model_validator(mode='after')
+    def validate_secretless_mode_constraints(self):
+        """R76 O1: Secretless 协议兼容层约束校验。
+
+        约束(详见 docs/tgjiema R76 整改报告 10.O-O1):
+          1. SECRETLESS_MODE=true 时 APP_ENV 必须为 test/development,
+             或 CI=true/GITHUB_ACTIONS=true (CI 环境识别)
+          2. secretless 时强制 PROVIDER_BACKEND=contract,
+             OBJECT_STORAGE_BACKEND=minio
+          3. secretless 时禁止 PROVIDER_BASE_URL 指向 api.telegram.org,
+             禁止 R2 endpoint
+          4. production 时禁止 SECRETLESS_MODE=true、PROVIDER_BACKEND=contract、
+             OBJECT_STORAGE_BACKEND=minio
+          5. contract 模式只要求 PROVIDER_BASE_URL 和一次性测试token,
+             不要求任何真实 Bot Token
+          6. minio 模式只要求 S3 兼容endpoint 和 CI 临时key,
+             不要求 R2 account ID
+          7. 错误必须抛 ValueError,不得自动回退 backend
+
+        本 validator 是 fail-closed 边界保护:任何不允许的组合直接拒绝启动,
+        不允许"自动纠正"(避免静默降级到不安全配置)。
+
+        校验顺序: 约束4(production 禁止) 优先于 约束1(secretless 仅允许),
+        让 production+secretless 直接报"production 禁止"而非"仅允许 test/development"。
+        """
+        # 规范化字段值
+        provider_backend = (self.PROVIDER_BACKEND or "").strip().lower()
+        storage_backend = (self.OBJECT_STORAGE_BACKEND or "").strip().lower()
+        provider_url = (self.PROVIDER_BASE_URL or "").strip().lower()
+        is_prod = self.ENVIRONMENT == "production"
+        # CI 环境识别(与 validate_required_fields 一致)
+        is_ci_env = (
+            os.getenv("CI", "").lower() in ("true", "1")
+            or os.getenv("GITHUB_ACTIONS", "").lower() in ("true", "1")
+        )
+        # secretless 允许的 APP_ENV: 仅 test/development。
+        # 注意: CI=true 不允许 staging/production 启用 secretless,
+        # 因为 staging/production 是 production-like 环境,禁止使用模拟器。
+        # CI=true 仅在 APP_ENV=test/development 时被识别为合法 secretless 环境。
+        allowed_secretless_envs = {"test", "development"}
+        app_env_allows_secretless = self.APP_ENV in allowed_secretless_envs
+
+        # 约束 4 (优先): production 时禁止 secretless/contract/minio
+        # 优先级最高,让生产环境违规直接报"production 禁止"
+        if is_prod:
+            if self.SECRETLESS_MODE:
+                raise ValueError(
+                    "[Settings] R76-O1: production 环境禁止 SECRETLESS_MODE=true。"
+                    "生产部署必须使用真实 Provider 与对象存储。"
+                )
+            if provider_backend == "contract":
+                raise ValueError(
+                    "[Settings] R76-O1: production 环境禁止 PROVIDER_BACKEND=contract。"
+                    "生产必须使用 telegram 真实 Provider。"
+                )
+            if storage_backend == "minio":
+                raise ValueError(
+                    "[Settings] R76-O1: production 环境禁止 OBJECT_STORAGE_BACKEND=minio。"
+                    "生产必须使用 r2 真实对象存储。"
+                )
+
+        # 约束 1: SECRETLESS_MODE=true 只能在 test/development/CI
+        if self.SECRETLESS_MODE and not app_env_allows_secretless:
+            raise ValueError(
+                "[Settings] R76-O1: SECRETLESS_MODE=true 仅允许在 APP_ENV=test/development "
+                f"或 CI=true 环境(当前 APP_ENV={self.APP_ENV!r}, CI={is_ci_env})。"
+                "生产环境禁止 secretless 模式(无法验证真实 Provider 边界)。"
+            )
+
+        # 约束 2: secretless 时强制 backend 切换
+        if self.SECRETLESS_MODE:
+            if provider_backend != "contract":
+                raise ValueError(
+                    "[Settings] R76-O1: SECRETLESS_MODE=true 时 "
+                    f"PROVIDER_BACKEND 必须为 'contract'(当前={provider_backend!r})。"
+                    "不允许使用真实 Telegram backend。"
+                )
+            if storage_backend != "minio":
+                raise ValueError(
+                    "[Settings] R76-O1: SECRETLESS_MODE=true 时 "
+                    f"OBJECT_STORAGE_BACKEND 必须为 'minio'(当前={storage_backend!r})。"
+                    "不允许使用 R2 真实凭证。"
+                )
+
+        # 约束 3: secretless 时禁止指向生产 endpoint
+        if self.SECRETLESS_MODE:
+            if "api.telegram.org" in provider_url:
+                raise ValueError(
+                    "[Settings] R76-O1: SECRETLESS_MODE=true 时 PROVIDER_BASE_URL "
+                    f"禁止指向 api.telegram.org(当前={provider_url!r})。"
+                    "请使用本地协议模拟器 URL(如 http://provider-sim:8088)。"
+                )
+            if (self.R2_ENDPOINT or "").strip():
+                raise ValueError(
+                    "[Settings] R76-O1: SECRETLESS_MODE=true 时禁止配置 R2_ENDPOINT。"
+                    "secretless 模式必须使用 MinIO,不允许 R2 真实凭证。"
+                )
+
+        # 约束 5: contract 模式必须提供 PROVIDER_BASE_URL 与测试token
+        if provider_backend == "contract":
+            if not (self.PROVIDER_BASE_URL or "").strip():
+                raise ValueError(
+                    "[Settings] R76-O1: PROVIDER_BACKEND=contract 时 "
+                    "PROVIDER_BASE_URL 必须配置(指向本地协议模拟器)。"
+                )
+            if not (self.PROVIDER_CONTRACT_TOKEN or "").strip():
+                raise ValueError(
+                    "[Settings] R76-O1: PROVIDER_BACKEND=contract 时 "
+                    "PROVIDER_CONTRACT_TOKEN 必须配置(CI 单次 run 临时token)。"
+                )
+
+        # 约束 6: minio 模式必须提供 S3 兼容 endpoint 与临时 key
+        if storage_backend == "minio":
+            if not (self.S3_ENDPOINT_URL or "").strip():
+                raise ValueError(
+                    "[Settings] R76-O1: OBJECT_STORAGE_BACKEND=minio 时 "
+                    "S3_ENDPOINT_URL 必须配置(MinIO S3 兼容 endpoint)。"
+                )
+            if not (self.S3_ACCESS_KEY_ID or "").strip():
+                raise ValueError(
+                    "[Settings] R76-O1: OBJECT_STORAGE_BACKEND=minio 时 "
+                    "S3_ACCESS_KEY_ID 必须配置(CI 临时 MinIO key)。"
+                )
+            if not (self.S3_SECRET_ACCESS_KEY or "").strip():
+                raise ValueError(
+                    "[Settings] R76-O1: OBJECT_STORAGE_BACKEND=minio 时 "
+                    "S3_SECRET_ACCESS_KEY 必须配置(CI 临时 MinIO secret)。"
+                )
+            if not (self.S3_BUCKET_NAME or "").strip():
+                raise ValueError(
+                    "[Settings] R76-O1: OBJECT_STORAGE_BACKEND=minio 时 "
+                    "S3_BUCKET_NAME 必须配置(MinIO 测试 bucket)。"
+                )
+            # minio 仅允许 test/development/CI(production 已在约束4 拦截,此处拦 staging)
+            if self.APP_ENV == "staging":
+                raise ValueError(
+                    "[Settings] R76-O1: OBJECT_STORAGE_BACKEND=minio "
+                    f"仅允许在 APP_ENV=test/development/CI(当前={self.APP_ENV!r})。"
+                )
+
         return self
 
     def _validate_all_fields(self):

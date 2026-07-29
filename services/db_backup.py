@@ -4,25 +4,30 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets as _secrets
 import subprocess
 from datetime import datetime, timezone
 
 from loguru import logger
 
 from config import settings
-from database.session import _client as db_client, get_config, _validate_identifier
-from storage.r2 import _r2 as r2_storage, configure_r2_dynamic
-from services.backup_schema import (
-    BACKUP_SCHEMA, get_backup_tables, get_conflict_col,
-    get_tables_by_source,
-)
-from services.i18n import translate as _i18n_t
+from database.session import _client as db_client
+from database.session import _validate_identifier, get_config
 from services.backup_crypto import (
     encrypt_payload,
+    get_key_id,
     is_encryption_available,
 )
+
+# R73 §5.3 P0-05: 三段式备份 COMPLETE marker 构建(不可伪造 HMAC 签名)
+from services.backup_dr_validate import build_complete_marker
+from services.backup_schema import BACKUP_SCHEMA, get_backup_tables, get_tables_by_source
+
 # R48 P1: 统一错误码协议化(替代裸字符串 RuntimeError)
 from services.error_codes import AppError, ErrorCodes
+from services.i18n import translate as _i18n_t
+from storage.r2 import _r2 as r2_storage
+from storage.r2 import configure_storage_from_settings
 
 # ─── 表清单(单一事实源: services/backup_schema.py) ───
 # 保留向后兼容的别名,等价于原 SMALL_TABLES / _LARGE_TABLES / _TABLE_WHERE
@@ -88,8 +93,11 @@ def _get_commit_sha() -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
             cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            check=False,
         )
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout.strip()[:12]
@@ -115,8 +123,17 @@ def _build_bundle_manifest(
     encryption_info: dict | None = None,
     ciphertext_sha256: str | None = None,
     backup_id: str = "",
+    *,
+    # R73 §5.3 P0-05: 新增强制信任链字段(可选,向后兼容 daemon 路径)
+    source_sha: str = "",
+    source_database_identity: str = "",
+    schema_fingerprint: str = "",
+    payload_key: str = "",
+    manifest_key: str = "",
+    key_id: str = "",
+    created_at: str = "",
 ) -> dict:
-    """构建 bundle manifest(R35 P1-7, R36 H7 增强, R40 P0-6 双 checksum)。
+    """构建 bundle manifest(R35 P1-7, R36 H7 增强, R40 P0-6 双 checksum, R73 §5.3 P0-05 强信任链)。
 
     Bundle 包含:
     - commit SHA(git rev-parse HEAD 或环境变量)
@@ -130,6 +147,9 @@ def _build_bundle_manifest(
     - R36 H7: backup_type (full/incremental)
     - R36 H7: watermark (本次备份的 updated_at 上界)
     - R36 H7: encryption (加密元数据)
+    - R73 §5.3 P0-05: source_sha / source_database_identity / schema_fingerprint /
+      payload_key / manifest_key / key_id / created_at(强信任链绑定字段,
+      使 manifest 自身可被独立校验,无需依赖外部 latest 指针)
     """
     tables = backup_data.get("tables", {})
     table_stats = {}
@@ -167,6 +187,22 @@ def _build_bundle_manifest(
         # R36 H7: 加密元数据
         "encryption": encryption_info or {"encrypted": False, "algorithm": "none"},
     }
+    # R73 §5.3 P0-05: 追加强信任链字段(仅当调用方提供时写入,
+    # 保持向后兼容 — daemon 路径 / 旧测试不传这些参数时 manifest 结构不变)
+    if source_sha:
+        manifest["source_sha"] = source_sha
+    if source_database_identity:
+        manifest["source_database_identity"] = source_database_identity
+    if schema_fingerprint:
+        manifest["schema_fingerprint"] = schema_fingerprint
+    if payload_key:
+        manifest["payload_key"] = payload_key
+    if manifest_key:
+        manifest["manifest_key"] = manifest_key
+    if key_id:
+        manifest["key_id"] = key_id
+    if created_at:
+        manifest["created_at"] = created_at
     return manifest
 
 
@@ -175,17 +211,27 @@ def _build_bundle_manifest(
 # ═══════════════════════════════════════════════════════════════
 
 async def _backup_crdb_tables(tables: list[str], watermark: str | None = None) -> dict:
-    """备份 CRDB 表(走 CockroachDB SELECT *)。
+    """按 ``BACKUP_SCHEMA`` 显式列清单备份 CRDB 表。
 
     R35 P1-5: 仅备份 source="crdb" 的表,避免对 SQLite-only 表执行 CRDB 查询。
     R36 H7: 支持 watermark 增量备份(只查 updated_at > watermark 的行)。
     R37 P1-5: 增量备份同时捕捉 deleted_at > watermark 的软删除行,
               解决仅靠 updated_at 无法捕捉删除事件的问题。
+    R83: 禁止 ``SELECT *`` 将未审计的新列静默带入 payload。备份与恢复均以
+         ``BACKUP_SCHEMA.columns`` 为单一事实源；列漂移由测试和真实查询 fail-closed。
     """
     results = {}
     for table in sorted(tables):
         try:
             safe_name = _validate_identifier(table)
+            schema = BACKUP_SCHEMA[table]
+            if not schema.columns:
+                raise AppError(
+                    ErrorCodes.BACKUP_PAYLOAD_CANONICAL_INVALID,
+                    params={"reason": "backup_schema_columns_empty", "field": table},
+                )
+            safe_columns = [_validate_identifier(column) for column in schema.columns]
+            column_sql = ", ".join(f'"{column}"' for column in safe_columns)
             conditions = []
             # 表级 WHERE 条件(如 status = 'active')
             table_where = _TABLE_WHERE.get(table)
@@ -195,7 +241,6 @@ async def _backup_crdb_tables(tables: list[str], watermark: str | None = None) -
             # 同时检查 updated_at(常规变更)和 deleted_at(软删除)
             # 任一列 > watermark 都纳入本次增量备份
             if watermark:
-                schema = BACKUP_SCHEMA.get(table)
                 ts_cols = []
                 if schema and "updated_at" in schema.columns:
                     ts_cols.append('"updated_at"')
@@ -210,13 +255,19 @@ async def _backup_crdb_tables(tables: list[str], watermark: str | None = None) -
             if conditions:
                 where_clause = " AND ".join(conditions)
                 if watermark and "$1" in where_clause:
-                    sql = f'SELECT * FROM "{safe_name}" WHERE {where_clause}'
+                    sql = (
+                        f'SELECT {column_sql} FROM "{safe_name}" '
+                        f'WHERE {where_clause}'
+                    )
                     records = await db_client.fetch(sql, watermark)
                 else:
-                    sql = f'SELECT * FROM "{safe_name}" WHERE {where_clause}'
+                    sql = (
+                        f'SELECT {column_sql} FROM "{safe_name}" '
+                        f'WHERE {where_clause}'
+                    )
                     records = await db_client.fetch(sql)
             else:
-                sql = f'SELECT * FROM "{safe_name}"'
+                sql = f'SELECT {column_sql} FROM "{safe_name}"'
                 records = await db_client.fetch(sql)
             results[table] = [dict(r) for r in records]
             logger.debug(f"[Backup][CRDB] {table}: {len(records)} 行(watermark={watermark or 'none'})")
@@ -505,10 +556,10 @@ async def _run_backup_loop():
         f"增量配置: 每 {_FULL_BACKUP_INTERVAL} 次增量后做一次全量。"
     )
 
-    # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
-    await configure_r2_dynamic()
+    # R76 O7 / 10.G: 统一对象存储配置(R2 生产 / MinIO CI),根据 OBJECT_STORAGE_BACKEND 选择
+    await configure_storage_from_settings()
     if not r2_storage._access_key or not r2_storage._secret_key:
-        logger.warning("R2 凭证未配置(.env 和 config 表均无),数据库备份跳过")
+        logger.warning("对象存储凭证未配置(.env 和 config 表均无),数据库备份跳过")
         return
 
     interval_cfg = await get_config("db_backup_interval")
@@ -759,8 +810,8 @@ async def list_backups() -> list[dict]:
 
     供管理后台/admin_bot 调用，展示可恢复的备份列表。
     """
-    # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
-    await configure_r2_dynamic()
+    # R76 O7 / 10.G: 统一对象存储配置(R2 生产 / MinIO CI)
+    await configure_storage_from_settings()
     if not r2_storage._access_key:
         return []
     objects = await r2_storage.list_objects(prefix="db_backup/db_backup_", max_keys=1000)
@@ -838,8 +889,8 @@ async def restore_from_backup(key: str, tables: list[str] | None = None, merge: 
             },
         )
 
-    # R26-M1: R2 凭证优先从 config 表读取（r2_secret_key 解密），fallback .env
-    await configure_r2_dynamic()
+    # R76 O7 / 10.G: 统一对象存储配置(R2 生产 / MinIO CI)
+    await configure_storage_from_settings()
     if not r2_storage._access_key:
         # R48 P1: 协议化错误码替代裸字符串 RuntimeError
         raise AppError(ErrorCodes.BACKUP_RESTORE_R2_CREDENTIAL_MISSING)
@@ -894,6 +945,10 @@ def _build_db_backup_decryptor():
 
     生产环境应配置 BACKUP_KEK;未配置时无法走严格三段式解密路径,
     调用方应在调用前检测并提示用户使用离线迁移工具。
+
+    R73 §5.24: 异常路径 fail-closed — 解密器构建失败(非"未配置 KEK"的预期
+    情况)必须抛出 AppError 而非静默返回 None,防止调用方在不知情的情况下
+    以 None 解密器执行恢复导致数据损坏。
     """
     try:
         from services.backup_crypto import is_encryption_available
@@ -901,8 +956,321 @@ def _build_db_backup_decryptor():
             return None
         from services.backup_crypto import BackupDecryptor  # type: ignore
         return BackupDecryptor()
+    except AppError:
+        raise
+    except Exception as e:
+        logger.bind(
+            component="db_backup",
+            event="decryptor_build_failed_unexpected",
+            error=str(e),
+        ).error("")
+        raise AppError(
+            ErrorCodes.BACKUP_DECRYPTOR_BUILD_FAILED,
+            message=f"解密器构建失败: {e}",
+        ) from e
+
+
+# ═══════════════════════════════════════════════════════════════
+# R73 §5.3 P0-05: 不可变 backup_id + 三段式上传 readback + 结构化 evidence
+# ═══════════════════════════════════════════════════════════════
+
+
+def _generate_backup_id(source_sha: str = "") -> str:
+    """R73 §5.3 P0-05: 生成不可变 backup_id。
+
+    格式: ``YYYYMMDD_HHMMSS_<sha8>_<nonce8>``
+
+    - UTC 时间戳(秒精度,与 manifest backup_started_at 一致)
+    - source_sha 前 8 字符(调用方传入 git commit SHA 或业务版本标识)
+    - 8 字符随机 nonce(4 字节 hex,提供同秒内唯一性)
+
+    backup_id 一旦生成就不可变 — 三段式 payload/manifest/COMPLETE 的 R2 key
+    均绑定此 backup_id,任何篡改都会导致 readback 校验或 COMPLETE marker
+    签名验证失败。
+
+    Args:
+        source_sha: 调用方提供的 source SHA(优先使用);
+                    为空时回退到当前 git commit SHA(_get_commit_sha())
+
+    Returns:
+        不可变 backup_id 字符串(长度固定: 17 + 1 + 8 + 1 + 8 = 35)
+    """
+    now_utc = datetime.now(timezone.utc)
+    ts = now_utc.strftime("%Y%m%d_%H%M%S")
+    # source_sha 优先级: 调用方传入 > git commit SHA > "unknown0"
+    sha_src = (source_sha or _get_commit_sha() or "unknown0")
+    # 取前 8 字符并补足(若 source_sha 短于 8 字符)
+    sha8 = (sha_src.lower() + "00000000")[:8]
+    # 8 字符随机 nonce(4 字节 hex;token_hex 默认小写)
+    nonce8 = _secrets.token_hex(4)
+    return f"{ts}_{sha8}_{nonce8}"
+
+
+def _compute_schema_fingerprint() -> str:
+    """R73 §5.3 P0-05: 计算 BACKUP_SCHEMA 的稳定指纹(SHA-256 前 16 hex)。
+
+    将 BACKUP_SCHEMA 中每张表的(name, source, pk_columns, columns, is_large,
+    where_clause)按表名排序后序列化为 canonical JSON,计算 SHA-256 前 16 字符。
+
+    用途:
+        - 写入 manifest.schema_fingerprint(与 manifest.schema_version 互补:
+          schema_version 是粗略版本号,指纹能精确检测 schema 变更)
+        - 调用方可在备份前后比对指纹,确认 schema 未发生漂移
+
+    Returns:
+        16 字符 hex 指纹
+    """
+    fingerprint_parts = []
+    for table_name in sorted(BACKUP_SCHEMA.keys()):
+        schema = BACKUP_SCHEMA[table_name]
+        fingerprint_parts.append({
+            "name": schema.name,
+            "source": schema.source,
+            "pk_columns": list(schema.pk_columns),
+            "columns": list(schema.columns),
+            "is_large": schema.is_large,
+            "where_clause": schema.where_clause,
+        })
+    canonical = json.dumps(
+        fingerprint_parts,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()[:16]
+
+
+def _get_source_database_identity() -> str:
+    """R73 §5.3 P0-05: 获取源数据库身份标识(SHA-256 前 16 hex,不暴露连接串)。
+
+    优先级:
+        1. settings.COCKROACHDB_URL(生产 CRDB)— 取 SHA-256 前 16 hex
+        2. cache_store DB_PATH(本地 SQLite)— 取 SHA-256 前 16 hex
+        3. "unknown"(无法确定源时)
+
+    使用 SHA-256 摘要而非原始连接串,避免在 manifest 中暴露密码/主机名等
+    敏感信息,但仍能在备份前后比对以确认源数据库未发生切换。
+
+    Returns:
+        16 字符 hex 身份标识,或 "unknown"
+    """
+    try:
+        crdb_url = getattr(settings, "COCKROACHDB_URL", "") or ""
+        if crdb_url:
+            return hashlib.sha256(crdb_url.encode("utf-8")).hexdigest()[:16]
+    except Exception as e:
+        logger.debug(
+            _i18n_t('services.db_backup.s15', error=e)
+        )
+    # 回退到 SQLite cache_store 路径
+    try:
+        from database.cache_store import DB_PATH as CACHE_DB_PATH
+        return hashlib.sha256(str(CACHE_DB_PATH).encode("utf-8")).hexdigest()[:16]
+    except Exception as e:
+        logger.debug(
+            _i18n_t('services.db_backup.s15', error=e)
+        )
+    return "unknown"
+
+
+def _build_signed_complete_marker(
+    backup_id: str,
+    manifest_key: str,
+    manifest_sha256: str,
+    payload_key: str,
+    payload_sha256: str,
+    signing_key: bytes,
+    schema_version: str = "",
+) -> bytes:
+    """R73 §5.3 P0-05: 构建带 HMAC-SHA256 签名的 COMPLETE marker。
+
+    委托给 services.backup_dr_validate.build_complete_marker,
+    使用 versioned canonical JSON 签名载荷(R60 P0-04),含:
+        backup_id + manifest_key + manifest_sha256 + payload_key + payload_sha256 + schema_version
+
+    防止 COMPLETE marker 被伪造或字段被替换(payload_key 进入签名内容,
+    避免攻击者将 COMPLETE 指向任意 payload)。
+
+    Args:
+        backup_id: 不可变 backup_id
+        manifest_key: manifest.json 的 R2 key
+        manifest_sha256: manifest 原始 bytes 的 SHA-256(64 hex)
+        payload_key: payload.enc 的 R2 key
+        payload_sha256: 密文 SHA-256(64 hex)
+        signing_key: HMAC 签名密钥(bytes,来自 BACKUP_SIGNING_KEY)
+        schema_version: schema 版本字符串(进入签名内容,默认用 _BACKUP_SCHEMA_VERSION)
+
+    Returns:
+        COMPLETE marker JSON bytes(含 signature + signature_version=1)
+    """
+    schema_ver = schema_version or _BACKUP_SCHEMA_VERSION
+    return build_complete_marker(
+        backup_id=backup_id,
+        manifest_key=manifest_key,
+        manifest_sha256=manifest_sha256,
+        payload_key=payload_key,
+        payload_sha256=payload_sha256,
+        signing_key=signing_key,
+        schema_version=schema_ver,
+    )
+
+
+async def _verify_object_readback(
+    r2_storage,
+    key: str,
+    expected_sha256: str,
+    expected_size: int,
+) -> None:
+    """R73 §5.3 P0-05: 三段式上传 readback 校验。
+
+    上传后重新下载对象,校验:
+        1. SHA-256 与 expected_sha256 一致(对象内容完整性)
+        2. 字节长度与 expected_size 一致(防止截断上传)
+
+    任何一项不匹配即抛 AppError(fail-closed,不写 status=success evidence)。
+
+    Args:
+        r2_storage: R2 存储客户端
+        key: R2 对象 key
+        expected_sha256: 期望的 SHA-256(64 hex)
+        expected_size: 期望的字节长度
+
+    Raises:
+        AppError: readback 校验失败(SHA 不匹配 / 大小不匹配 / 下载失败)
+    """
+    try:
+        downloaded = await r2_storage.download(key)
+    except Exception as e:
+        # R73 §5.3 P0-05: readback 下载失败 = 上传未持久化,fail-closed
+        logger.error(
+            _i18n_t('services.db_backup.s16', key=key, error=e)
+        )
+        raise AppError(
+            ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+            params={
+                "reason": (
+                    f"R73 §5.3 P0-05: readback download failed for key={key}: {e}"
+                ),
+            },
+        )
+    if downloaded is None:
+        logger.error(
+            _i18n_t('services.db_backup.s17', key=key)
+        )
+        raise AppError(
+            ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+            params={
+                "reason": (
+                    f"R73 §5.3 P0-05: readback returned None for key={key} "
+                    "(object may not have been persisted)"
+                ),
+            },
+        )
+    actual_sha = _compute_sha256(downloaded)
+    if actual_sha != expected_sha256:
+        logger.error(
+            _i18n_t(
+                'services.db_backup.s18',
+                key=key,
+                expected_16=expected_sha256[:16],
+                actual_16=actual_sha[:16],
+            )
+        )
+        raise AppError(
+            ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+            params={
+                "reason": (
+                    f"R73 §5.3 P0-05: readback SHA mismatch for key={key} "
+                    f"(expected={expected_sha256[:16]}..., actual={actual_sha[:16]}...)"
+                ),
+            },
+        )
+    if len(downloaded) != expected_size:
+        logger.error(
+            _i18n_t(
+                'services.db_backup.s19',
+                key=key,
+                expected_size=expected_size,
+                actual_size=len(downloaded),
+            )
+        )
+        raise AppError(
+            ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+            params={
+                "reason": (
+                    f"R73 §5.3 P0-05: readback size mismatch for key={key} "
+                    f"(expected={expected_size}, actual={len(downloaded)})"
+                ),
+            },
+        )
+
+
+def _record_secret_evidence(signing_key: bytes | str | None) -> dict:
+    """R73 §5.3 P0-05: 记录 RC 备份 evidence 中的密钥存在性(不暴露密钥值)。
+
+    要求(R73 §5.3):
+        RC backup evidence 不写 secret 值,但记录:
+            - secret_present: bool —— BACKUP_SIGNING_KEY 是否非空
+            - secret_length_range: str —— 长度区间(分桶,避免暴露精确长度)
+            - key_id: str —— KEK 标识符(已是 SHA-256 摘要,非密钥本身)
+
+    长度区间分桶策略:
+        - "empty"               —— 0 字节
+        - "short (<16)"         —— 1-15 字节(过短,不安全)
+        - "normal (16-32)"      —— 16-32 字节(常见 HMAC key 长度)
+        - "long (33-64)"        —— 33-64 字节
+        - "extra-long (>64)"    —— >64 字节
+
+    Args:
+        signing_key: BACKUP_SIGNING_KEY 的原始值(str 或 bytes),
+                     None 视为未配置
+
+    Returns:
+        {"secret_present": bool, "secret_length_range": str, "key_id": str}
+    """
+    if signing_key is None:
+        return {
+            "secret_present": False,
+            "secret_length_range": "empty",
+            "key_id": "",
+        }
+    # 计算 byte 长度(str 用 utf-8 编码,bytes 直接取长度)
+    if isinstance(signing_key, str):
+        byte_len = len(signing_key.encode("utf-8"))
+    elif isinstance(signing_key, (bytes, bytearray)):
+        byte_len = len(signing_key)
+    else:
+        # 未知类型,按未配置处理
+        return {
+            "secret_present": False,
+            "secret_length_range": "empty",
+            "key_id": "",
+        }
+    if byte_len == 0:
+        return {
+            "secret_present": False,
+            "secret_length_range": "empty",
+            "key_id": "",
+        }
+    # 分桶(避免精确长度暴露,但仍能用于安全审计)
+    if byte_len < 16:
+        length_range = "short (<16)"
+    elif byte_len <= 32:
+        length_range = "normal (16-32)"
+    elif byte_len <= 64:
+        length_range = "long (33-64)"
+    else:
+        length_range = "extra-long (>64)"
+    # key_id 来自 KEK(若配置),非 BACKUP_SIGNING_KEY 本身
+    try:
+        kek_key_id = get_key_id()
     except Exception:
-        return None
+        kek_key_id = ""
+    return {
+        "secret_present": True,
+        "secret_length_range": length_range,
+        "key_id": kek_key_id,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -912,56 +1280,89 @@ def _build_db_backup_decryptor():
 
 async def backup_once(
     output_json_path: str | None = None,
+    backup_type: str = "full",
+    reason: str = "",
+    source_sha: str = "",
     timeout: int = 240,
 ) -> dict:
-    """R72 P0-10 / RC60: 执行一次性备份(不进入 daemon 循环),带整体超时。
+    """R72 P0-10 / RC60 / R73 §5.3 P0-05: 执行一次性备份(不进入 daemon 循环),带整体超时。
 
     用于 RC 门禁中的真实 backup→restore 演练:
       1. 初始化 DB + R2(不计入 timeout)
-      2. 执行单次备份(watermark → backup_all_tables → encrypt → upload → manifest)
-      3. 保存 watermark
-      4. 输出结构化 JSON evidence
+      2. 生成不可变 backup_id(UTC 时间戳 + source_sha + 随机 nonce)
+      3. 执行单次全量备份(backup_all_tables → encrypt → 3-对象上传)
+      4. 上传 payload.enc + manifest.json + COMPLETE marker(后者最后)
+      5. 对每个对象做 readback 校验(SHA-256 + 字节大小)
+      6. 保存 watermark
+      7. 输出结构化 JSON evidence(含 secret_present / secret_length_range / key_id)
 
     R72 RC60: 为防止 asyncpg 连接无超时导致 compose-runtime-e2e
     backup_restore 阶段挂起 600s,在此处添加 asyncio.wait_for 整体超时。
     timeout 秒未完成则返回 status="timeout" 的 evidence 并由 main() 退出码 1 标记失败。
     240s 默认值远小于编排器 540s 超时(60s 余量供 init_db / cleanup)。
 
+    R73 §5.3 P0-05 整改要点:
+      - 强制 full once: backup_type 必须为 "full"(传 "incremental" 即 AppError)
+      - 不可变 backup_id: UTC 秒精度时间戳 + 8 字符 source_sha + 8 字符随机 nonce
+      - 三段式上传: payload.enc + manifest.json + COMPLETE marker(后者最后)
+      - Readback 校验: 对每个对象重新下载,校验 SHA-256 + 字节大小,任一不匹配即 AppError
+      - 结构化 evidence: 含 secret_present / secret_length_range / key_id(不暴露密钥值)
+      - Fail-closed: 任何 R2/CRDB/crypto/signing/timeout 错误均抛 AppError,
+        不生成 status="success" 部分证据
+
     Args:
         output_json_path: 可选,将 evidence JSON 写入文件
-        timeout: 整体超时秒数(默认 240),覆盖 backup_all_tables → encrypt → upload
+        backup_type: 备份类型(R73 §5.3 P0-05 强制 "full";"incremental" 会被拒绝)
+        reason: 备份原因(写入 evidence.reason,用于审计)
+        source_sha: 调用方提供的 source SHA(优先用,空则回退到 git commit SHA)
+        timeout: 整体超时秒数(默认 240),覆盖 backup_all_tables → encrypt → upload → readback
 
     Returns:
         包含 backup_id / manifest / evidence 的字典。
         status="success" 表示成功;status="timeout" 表示整体超时(调用方应视为失败)。
+        失败时抛 AppError,不返回 status="success" 部分证据。
 
     Raises:
-        AppError: R2 凭证缺失 / 加密不可用 / 上传失败
+        AppError: R2 凭证缺失 / 加密不可用 / signing_key 缺失 /
+                  backup_type != "full"(full once 强制)/
+                  上传失败 / readback 校验失败 / COMPLETE marker 构建失败
     """
     # R72 RC62: init_db 移入 _do_backup_inner() 内部,受 asyncio.wait_for 保护
     # 原实现将 init_db 放在 wait_for 之外,导致 init_db 卡住时 --timeout 完全失效,
     # 编排器只能等到 600s 超时强杀,无结构化 evidence 输出。
     async def _do_backup_inner() -> dict:
+        # R73 §5.3 P0-05: 强制 full once — backup_type 必须为 "full"
+        if backup_type != "full":
+            raise AppError(
+                ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                params={
+                    "reason": (
+                        f"R73 §5.3 P0-05: backup_once enforces full once — "
+                        f"backup_type must be 'full', got '{backup_type}'. "
+                        f"Incremental backups are not supported in one-shot mode."
+                    ),
+                },
+            )
+
         # 确保数据库连接池已初始化(init_db 计入 timeout,防止 connect() 卡住)
         if not db_client.is_connected:
             from database.session import init_db
             await init_db()
 
-        # R2 凭证动态配置
-        await configure_r2_dynamic()
+        # R76 O7 / 10.G: 统一对象存储配置(R2 生产 / MinIO CI)
+        await configure_storage_from_settings()
         if not r2_storage._access_key:
             raise AppError(
                 ErrorCodes.BACKUP_RESTORE_R2_CREDENTIAL_MISSING,
                 params={
                     "reason": (
-                        "R72 P0-10: R2 凭证缺失 — backup_once 需要 R2 凭证,"
+                        "R72 P0-10: 对象存储凭证缺失 — backup_once 需要凭证,"
                         "不得在缺少凭证时返回成功(fail-closed)"
                     ),
                 },
             )
 
-        # 加密可用性检查
-        from services.backup_crypto import is_encryption_available
+        # 加密可用性检查(R72 P0-10: 备份必须加密,绝不上传明文)
         if not is_encryption_available():
             raise AppError(
                 ErrorCodes.BACKUP_DECRYPT_KEK_MISSING,
@@ -970,48 +1371,80 @@ async def backup_once(
                 },
             )
 
-        # 读取上次 watermark
-        last_wm = await _get_last_watermark()
-        if last_wm is None:
-            backup_type = "full"
-            watermark = None
-            incremental_count = 0
-        elif last_wm.get("incremental_count", 0) >= _FULL_BACKUP_INTERVAL:
-            backup_type = "full"
-            watermark = None
-            incremental_count = 0
-        else:
-            backup_type = "incremental"
-            watermark = last_wm.get("updated_at")
-            incremental_count = last_wm.get("incremental_count", 0) + 1
+        # R73 §5.3 P0-05: BACKUP_SIGNING_KEY 必须配置(用于 COMPLETE marker HMAC 签名)
+        # Settings 中定义为 str(环境变量总是 str),hmac.new 要求 bytes,故做 encode 转换
+        _signing_key_raw = getattr(settings, "BACKUP_SIGNING_KEY", "") or ""
+        if not _signing_key_raw:
+            raise AppError(
+                ErrorCodes.BACKUP_RESTORE_TRUST_CHAIN_REQUIRED,
+                params={
+                    "reason": (
+                        "R73 §5.3 P0-05: BACKUP_SIGNING_KEY 未配置 — "
+                        "backup_once 需要此密钥为 COMPLETE marker 做 HMAC-SHA256 签名,"
+                        "restore 端会用同一密钥验签(fail-closed)"
+                    ),
+                },
+            )
+        _signing_key_bytes = (
+            _signing_key_raw.encode("utf-8")
+            if isinstance(_signing_key_raw, str)
+            else _signing_key_raw
+        )
 
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-        data = await backup_all_tables(watermark=watermark, backup_type=backup_type)
+        # R73 §5.3 P0-05: 生成不可变 backup_id(UTC 时间戳 + source_sha + 随机 nonce)
+        # backup_once 强制 full,不读取 watermark(避免被篡改影响 backup_id)
+        backup_id = _generate_backup_id(source_sha=source_sha)
+        backup_type_inner = "full"  # 强制 full,不再读 last_wm
+        incremental_count = 0
+
+        # 备份数据采集(全量)
+        data = await backup_all_tables(watermark=None, backup_type=backup_type_inner)
 
         r38_metadata = data.pop("_r38_p1_5_metadata", {})
         data = _redact_secrets(data)
         plaintext = json.dumps(data, default=str, ensure_ascii=False).encode("utf-8")
 
+        # 加密 plaintext(用 backup_id 作 AAD 绑定)
         enc_result = encrypt_payload(
             plaintext,
-            backup_id=timestamp,
+            backup_id=backup_id,
             schema_version=_BACKUP_SCHEMA_VERSION,
         )
+        upload_content = enc_result["ciphertext"]
 
+        # 计算 R2 key(三段式,绑定 backup_id)
+        payload_key = f"db_backup/payload_{backup_id}_{backup_type_inner}.enc"
+        manifest_key = f"db_backup/manifest_{backup_id}_{backup_type_inner}.json"
+        complete_key = f"db_backup/COMPLETE_{backup_id}_{backup_type_inner}.COMPLETE"
+
+        # R73 §5.3 P0-05: 计算 schema_fingerprint + source_database_identity(强信任链字段)
+        schema_fingerprint = _compute_schema_fingerprint()
+        source_database_identity = _get_source_database_identity()
+
+        # R73 §5.3 P0-05: 计算 manifest bytes(用于 SHA-256 + COMPLETE marker 绑定)
+        # 必须在 _build_bundle_manifest 之后,基于最终 manifest dict 序列化
+        # manifest 字段在加密元信息补充后才完整,故分两步构建
         manifest = _build_bundle_manifest(
             backup_data=data,
             content=plaintext,
             start_time=r38_metadata.get("start_time", datetime.now(timezone.utc)),
             end_time=r38_metadata.get("end_time", datetime.now(timezone.utc)),
-            backup_type=r38_metadata.get("backup_type", backup_type),
+            backup_type=r38_metadata.get("backup_type", backup_type_inner),
             watermark=r38_metadata.get("watermark"),
             prev_watermark=r38_metadata.get("prev_watermark"),
             ciphertext_sha256=enc_result.get("ciphertext_sha256"),
-            backup_id=timestamp,
+            backup_id=backup_id,
+            # R73 §5.3 P0-05 强信任链字段
+            source_sha=source_sha or _get_commit_sha(),
+            source_database_identity=source_database_identity,
+            schema_fingerprint=schema_fingerprint,
+            payload_key=payload_key,
+            manifest_key=manifest_key,
+            key_id=enc_result.get("key_id") or get_key_id(),
+            created_at=datetime.now(timezone.utc).isoformat(),
         )
 
         if enc_result["encrypted"]:
-            from services.backup_crypto import get_key_id
             manifest["encryption"] = {
                 "encrypted": True,
                 "algorithm": enc_result["algorithm"],
@@ -1022,31 +1455,83 @@ async def backup_once(
         else:
             manifest["encryption"] = {"encrypted": False, "algorithm": "none"}
 
-        # 上传 payload + manifest
-        upload_content = enc_result["ciphertext"]
-        payload_key = f"db_backup/db_backup_{timestamp}_{backup_type}.bin"
-        await r2_storage.upload(
-            payload_key, upload_content,
-            "application/octet-stream" if enc_result["encrypted"] else "application/json",
+        # R73 §5.3 P0-05: 三段式上传(payload → manifest → COMPLETE,后者最后)
+        # 顺序保证:COMPLETE marker 最后上传,仅在 payload + manifest 已确认存在后才写入;
+        # 若任一前置步骤失败,COMPLETE 不会被写入,restore 端会因缺少 COMPLETE 而 fail-closed。
+        payload_ct = (
+            "application/octet-stream" if enc_result["encrypted"] else "application/json"
         )
-        manifest_key = f"db_backup/manifest_{timestamp}_{backup_type}.json"
-        await r2_storage.upload(
-            manifest_key,
-            json.dumps(manifest, ensure_ascii=False).encode("utf-8"),
-            "application/json",
+        # 1. 上传 payload.enc
+        await r2_storage.upload(payload_key, upload_content, payload_ct)
+        # 1a. readback 校验 payload
+        await _verify_object_readback(
+            r2_storage, payload_key,
+            expected_sha256=manifest["ciphertext_sha256"],
+            expected_size=len(upload_content),
         )
 
-        # 保存 watermark
+        # 2. 上传 manifest.json(此时 payload 已确认存在且校验通过)
+        manifest_bytes = json.dumps(manifest, ensure_ascii=False).encode("utf-8")
+        await r2_storage.upload(
+            manifest_key, manifest_bytes, "application/json",
+        )
+        # 2a. readback 校验 manifest(SHA = sha256(manifest_bytes),size = len(manifest_bytes))
+        await _verify_object_readback(
+            r2_storage, manifest_key,
+            expected_sha256=_compute_sha256(manifest_bytes),
+            expected_size=len(manifest_bytes),
+        )
+
+        # 3. 上传 COMPLETE marker(最后,绑定 backup_id + manifest_key + payload_key + 各 SHA)
+        complete_marker_bytes = _build_signed_complete_marker(
+            backup_id=backup_id,
+            manifest_key=manifest_key,
+            manifest_sha256=_compute_sha256(manifest_bytes),
+            payload_key=payload_key,
+            payload_sha256=manifest["ciphertext_sha256"],
+            signing_key=_signing_key_bytes,
+        )
+        await r2_storage.upload(
+            complete_key, complete_marker_bytes, "application/json",
+        )
+        # 3a. readback 校验 COMPLETE marker
+        await _verify_object_readback(
+            r2_storage, complete_key,
+            expected_sha256=_compute_sha256(complete_marker_bytes),
+            expected_size=len(complete_marker_bytes),
+        )
+
+        # 保存 watermark(用于后续增量备份调度;即使 backup_once 也会保存,
+        # 让 daemon 模式下次启动时能从正确位置开始增量)
         current_wm = manifest.get("watermark")
-        await _save_watermark(current_wm, backup_type, incremental_count)
+        await _save_watermark(current_wm, backup_type_inner, incremental_count)
 
+        # R73 §5.3 P0-05: 构建结构化 evidence(不暴露密钥值,仅记录存在性 + 长度区间 + key_id)
+        secret_evidence = _record_secret_evidence(_signing_key_raw)
+        # R73 P0-05: 三对象结构化 evidence — 同时提供独立字段(向后兼容)
+        # 与 objects dict(供 compose_runtime_e2e.phase_full_backup_to_r2 严格校验)
         evidence = {
-            "backup_id": timestamp,
-            "backup_type": backup_type,
+            "backup_id": backup_id,
+            "backup_type": backup_type_inner,
+            "reason": reason,
             "manifest": manifest,
             "payload_key": payload_key,
             "manifest_key": manifest_key,
+            "complete_key": complete_key,
+            # R73 P0-05: 三对象 readback 校验结构化字段
+            # compose_runtime_e2e.phase_full_backup_to_r2 读取此 dict 验证三对象存在
+            "objects": {
+                "payload": payload_key,
+                "manifest": manifest_key,
+                "COMPLETE": complete_key,
+            },
             "status": "success",
+            # R73 §5.3 P0-05: secret evidence(不暴露密钥值)
+            "secret_present": secret_evidence["secret_present"],
+            "secret_length_range": secret_evidence["secret_length_range"],
+            "key_id": secret_evidence["key_id"],
+            # R73 §5.3 P0-05: readback 已通过标记(便于审计)
+            "readback_verified": True,
         }
 
         if output_json_path:
@@ -1057,7 +1542,18 @@ async def backup_once(
             )
 
         logger.info(
-            _i18n_t('services.db_backup.s8', backup_id=timestamp, backup_type=backup_type)
+            _i18n_t(
+                'services.db_backup.s8', backup_id=backup_id, backup_type=backup_type_inner,
+            )
+        )
+        logger.info(
+            _i18n_t(
+                'services.db_backup.s20',
+                backup_id=backup_id,
+                payload_key=payload_key,
+                manifest_key=manifest_key,
+                complete_key=complete_key,
+            )
         )
         return evidence
 
@@ -1117,16 +1613,26 @@ async def backup_once(
 
 
 def main():
-    """R72 P0-10 / RC60: db_backup CLI 入口。
+    """R72 P0-10 / RC60 / R73 §5.3 P0-05: db_backup CLI 入口。
 
     用法:
       # 一次性备份(不进入 daemon 循环)
       python -m services.db_backup backup --once --output-json /tmp/backup_evidence.json
       # 带自定义超时(秒),用于 compose-runtime-e2e 等 CI 场景
       python -m services.db_backup backup --once --timeout 240 --output-json /tmp/backup_evidence.json
+      # R73 §5.3 P0-05: 带备份类型/原因/source SHA(用于审计与不可变 backup_id 绑定)
+      python -m services.db_backup backup --once --type full \\
+          --reason "rc_release" --source-sha "$GIT_SHA" \\
+          --output-json /tmp/backup_evidence.json
 
       # daemon 模式(原有行为,通过 run_all.py 调用)
       python -m services.db_backup daemon
+
+    R73 §5.3 P0-05:
+      - --type incremental 会被 backup_once 拒绝(full once 强制),
+        CLI 允许传入但函数 fail-closed,便于审计尝试。
+      - --source-sha 用于绑定不可变 backup_id(空则回退 git commit SHA)。
+      - --reason 写入 evidence.reason,供审计追溯备份触发原因。
     """
     import argparse
 
@@ -1151,6 +1657,23 @@ def main():
         "--timeout", type=int, default=240,
         help=_i18n_t('services.db_backup.s13'),
     )
+    backup_parser.add_argument(
+        # R73 §5.3 P0-05: 备份类型(full/incremental)。
+        # backup_once 强制 full once,传 incremental 会被 AppError 拒绝,
+        # CLI 允许传入以便审计尝试(fail-closed 而非隐藏选项)。
+        "--type", type=str, default="full", choices=["full", "incremental"],
+        help=_i18n_t('services.db_backup.s21'),
+    )
+    backup_parser.add_argument(
+        # R73 §5.3 P0-05: 备份原因(写入 evidence.reason,用于审计追溯)。
+        "--reason", type=str, default="",
+        help=_i18n_t('services.db_backup.s22'),
+    )
+    backup_parser.add_argument(
+        # R73 §5.3 P0-05: source SHA(优先于 git commit SHA 绑定不可变 backup_id)。
+        "--source-sha", type=str, default="",
+        help=_i18n_t('services.db_backup.s23'),
+    )
 
     # daemon 子命令
     daemon_parser = subparsers.add_parser("daemon", help=_i18n_t('services.db_backup.s7'))
@@ -1168,6 +1691,9 @@ def main():
         result = asyncio.run(
             backup_once(
                 output_json_path=args.output_json,
+                backup_type=args.type,
+                reason=args.reason,
+                source_sha=args.source_sha,
                 timeout=args.timeout,
             )
         )

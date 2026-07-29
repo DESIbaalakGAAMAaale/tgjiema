@@ -103,6 +103,9 @@ async def real_store_with_engine(monkeypatch):
 
     kek_b64 = generate_kek()
     monkeypatch.setenv("BACKUP_KEK", kek_b64)
+    # R76 P0-06: _restore_preverified_payload 内部 issue_capability 需要
+    # RESTORE_CAPABILITY_SIGNING_KEY(32 字节 hex);测试环境注入临时 key
+    monkeypatch.setenv("RESTORE_CAPABILITY_SIGNING_KEY", "a" * 64)
 
     try:
         s = CacheStore()

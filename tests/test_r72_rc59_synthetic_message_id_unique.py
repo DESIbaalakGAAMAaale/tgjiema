@@ -223,11 +223,12 @@ class TestRC59SourceCodePattern:
         """源码中 _build_*_message 应使用 f-string 追加方法后缀。"""
         source = SYNTHETIC_TRANSACTION_PATH.read_text(encoding="utf-8")
         # 必须出现三次 f"{trace_id}:<suffix>" 模式
+        # R73 P0-04: 新增 dsp_dispatch 后缀(原 R72 RC59 三个 → R73 四个)
         import re
         matches = re.findall(r'"message_id"\s*:\s*f"\{trace_id\}:(\w+)"', source)
         suffixes = set(matches)
-        expected = {"heartbeat", "upload_session", "file_index"}
+        expected = {"heartbeat", "upload_session", "file_index", "dsp_dispatch"}
         assert suffixes == expected, (
-            f"RC59: message_id 后缀集合应为 {expected}, "
+            f"RC59/R73: message_id 后缀集合应为 {expected}, "
             f"实际: {suffixes}"
         )

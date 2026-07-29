@@ -1,0 +1,217 @@
+{
+  "schema_version": "provider-contract/v1",
+  "description": "R76 O3: Provider 模拟器协议契约 fixture(供 secretless CI/本地测试使用)",
+  "ci_token_default": "ci-local-token",
+  "endpoints": {
+    "health": {
+      "method": "GET",
+      "path": "/health",
+      "auth": false,
+      "description": "返回模拟器自身状态(files_count/receipts_count/active_faults)"
+    },
+    "upload_fixture": {
+      "method": "POST",
+      "path": "/__fixtures/files",
+      "auth": "X-Contract-Token",
+      "request_body": "raw bytes (任意文件内容)",
+      "response": {
+        "file_id": "sha256:<hex>",
+        "file_unique_id": "sha256:<hex>",
+        "file_size": "<int>",
+        "file_sha256": "<hex>"
+      },
+      "description": "上传测试文件,返回内容寻址 file_id(sha256 前缀)"
+    },
+    "deliver_update": {
+      "method": "POST",
+      "path": "/__fixtures/updates",
+      "auth": "X-Contract-Token",
+      "request_body": {
+        "app_url": "http://up-bot:8000",
+        "update": {
+          "update_id": 1,
+          "message": {
+            "message_id": 1,
+            "from": {"id": 111, "is_bot": false, "first_name": "CI User"},
+            "chat": {"id": 111, "type": "private"},
+            "date": 1710000000,
+            "document": {"file_id": "sha256:abc123", "file_unique_id": "sha256:abc123", "file_name": "test.txt"}
+          }
+        },
+        "trace_id": "<可选,优先取 X-Trace-Id>"
+      },
+      "response": {
+        "status": "delivered",
+        "app_status": 200,
+        "app_body": "<应用返回体前 500 字符>"
+      },
+      "description": "把 Update 投递到应用公开入口(/internal/contract/update),不直接调用 bots.*"
+    },
+    "get_me": {
+      "method": "GET",
+      "path": "/bot/{token}/getMe",
+      "auth": "X-Contract-Token + ci-local-token",
+      "response": {
+        "ok": true,
+        "result": {
+          "id": 999999999,
+          "is_bot": true,
+          "first_name": "tgjiema-ci-bot",
+          "username": "tgjiema_ci_bot"
+        }
+      },
+      "description": "返回固定 ci-bot 身份,token 必须为 ci-local-token"
+    },
+    "get_file": {
+      "method": "GET",
+      "path": "/bot/{token}/getFile?file_id=sha256:<hex>",
+      "auth": "X-Contract-Token + ci-local-token",
+      "response": {
+        "ok": true,
+        "result": {
+          "file_id": "sha256:<hex>",
+          "file_unique_id": "sha256:<hex>",
+          "file_size": "<int>",
+          "file_path": "sha256:<hex>"
+        }
+      },
+      "description": "返回文件描述符;file_path 等于 file_id,用于 download_file"
+    },
+    "download_file": {
+      "method": "GET",
+      "path": "/files/{file_id}/content",
+      "auth": "X-Contract-Token",
+      "response": "raw bytes (application/octet-stream)",
+      "response_headers": {
+        "X-File-Sha256": "<hex>"
+      },
+      "description": "返回文件原始字节流;file_id 可能带 sha256: 前缀或裸 hex"
+    },
+    "send_message": {
+      "method": "POST",
+      "path": "/bot/{token}/sendMessage",
+      "auth": "X-Contract-Token + ci-local-token",
+      "request_body": {
+        "chat_id": "<int>",
+        "text": "<string>",
+        "reply_markup": "<可选,透传>"
+      },
+      "response": {
+        "ok": true,
+        "result": {
+          "message_id": "<int, 从 1000 递增>",
+          "date": "<unix timestamp>",
+          "chat": {"id": "<int>", "type": "private"},
+          "text": "<string>"
+        }
+      },
+      "description": "持久化出站消息到 outbox 和 receipts"
+    },
+    "send_document": {
+      "method": "POST",
+      "path": "/bot/{token}/sendDocument",
+      "auth": "X-Contract-Token + ci-local-token",
+      "request_body": {
+        "chat_id": "<int>",
+        "document": "<file_id 字符串>",
+        "caption": "<可选>"
+      },
+      "response": {
+        "ok": true,
+        "result": {
+          "message_id": "<int>",
+          "date": "<unix timestamp>",
+          "chat": {"id": "<int>", "type": "private"},
+          "document": {"file_id": "<string>", "file_unique_id": "<string>"}
+        }
+      },
+      "description": "持久化出站文档到 outbox 和 receipts"
+    },
+    "set_fault": {
+      "method": "POST",
+      "path": "/__faults",
+      "auth": "X-Contract-Token",
+      "request_body": {
+        "operation": "getMe | getFile | download | sendMessage | sendDocument",
+        "status": 401,
+        "delay_ms": 0,
+        "retry_after": null,
+        "repeat": 1,
+        "body": null
+      },
+      "response": {
+        "status": "ok",
+        "plan": "<FaultPlan.to_dict()>"
+      },
+      "description": "设置确定性故障计划;repeat 耗尽后自动恢复正常响应"
+    },
+    "clear_faults": {
+      "method": "DELETE",
+      "path": "/__faults",
+      "auth": "X-Contract-Token",
+      "response": {"status": "ok", "cleared": true},
+      "description": "清除所有故障计划"
+    },
+    "get_receipts": {
+      "method": "GET",
+      "path": "/__receipts/{trace_id}",
+      "auth": "X-Contract-Token",
+      "response": {
+        "trace_id": "<string>",
+        "count": "<int>",
+        "receipts": [
+          {
+            "schema_version": "provider-receipt/v1",
+            "trace_id": "<string>",
+            "operation": "upload_fixture | deliver_update | getMe | getFile | download | sendMessage | sendDocument | fault_*",
+            "request_digest": "<sha256 hex>",
+            "response_digest": "<sha256 hex>",
+            "message_id": "<int or null>",
+            "file_id": "<string or null>",
+            "file_sha256": "<string or null>",
+            "status": "ok | fault_<status> | deliver_failed | app_<status>",
+            "attempt": "<int>",
+            "timestamp": "<RFC3339 UTC>",
+            "previous_digest": "<string>",
+            "signature": "<HMAC-SHA256 hex>"
+          }
+        ]
+      },
+      "description": "返回该 trace 的全部回执(含故障 receipt);signature 由 PROVIDER_RECEIPT_KEY 签名"
+    },
+    "get_outbox": {
+      "method": "GET",
+      "path": "/__outbox/{chat_id}",
+      "auth": "X-Contract-Token",
+      "response": {
+        "chat_id": "<int>",
+        "messages": [
+          {
+            "message_id": "<int>",
+            "payload": "<原始请求 JSON>",
+            "kind": "sendMessage | sendDocument",
+            "timestamp": "<RFC3339 UTC>"
+          }
+        ]
+      },
+      "description": "返回该 chat_id 的全部出站消息(便于验证脚本核对最终输出)"
+    }
+  },
+  "fault_operations": ["getMe", "getFile", "download", "sendMessage", "sendDocument"],
+  "fault_status_codes": [401, 429, 500],
+  "receipt_signature": {
+    "algorithm": "HMAC-SHA256",
+    "key_env_var": "PROVIDER_RECEIPT_KEY",
+    "canonicalization": "json.dumps(receipt_without_signature, sort_keys=True, separators=(',', ':'))"
+  },
+  "ci_environment_vars": {
+    "PROVIDER_CONTRACT_TOKEN": "openssl rand -hex 16 (单次 run 临时令牌)",
+    "PROVIDER_RECEIPT_KEY": "openssl rand -hex 32 (单次 run HMAC 签名密钥)",
+    "PROVIDER_CI_TOKEN": "ci-local-token (固定值,不访问公网)"
+  },
+  "production_boundary": {
+    "must_not_contain": "tests/support/provider_simulator.py 不得打入生产镜像",
+    "scanner_rule": "scan_production_bypasses.py 阻断 PROVIDER_BASE_URL 指向 simulator 的生产配置",
+    "compose_profile": "仅 docker-compose.secretless.yml 引入 provider-sim 服务"
+  }
+}

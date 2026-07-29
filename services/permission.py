@@ -88,7 +88,8 @@ async def get_or_create_user(user_id: int, username: str = None, first_name: str
         # 同步写入 SQLite 本地缓存
         try:
             from database.cache_store import get_cache_store
-            await get_cache_store().upsert_user_local(user, mark_dirty=False)
+            # R75 P0-07: mark_dirty=True (scanner 要求;CRDB 已写入,dirty_outbox 为冗余兜底)
+            await get_cache_store().upsert_user_local(user, mark_dirty=True)
         except Exception as cache_err:
             logger.debug(f"[Permission] upsert_user_local 失败 user={user_id}: {cache_err}")
         # F1: 新用户注册,递增本地计数器

@@ -294,8 +294,8 @@ class TestP1_14AuditCoverage:
         assert "R67 P1-14" in content
 
     def test_image_tag_still_uses_ci_prefix(self, compute_image_tag_script: str):
-        """image tag 仍使用 ci-{sha}-{run_id} 前缀(不变性)。"""
-        assert 'IMAGE_TAG="ci-${{ github.sha }}-${{ github.run_id }}"' in compute_image_tag_script
+        """R73 P1-04: image tag 使用动态前缀模板(rc/production/dev/ci-{sha}-{run_id})。"""
+        assert 'IMAGE_TAG="${IMAGE_TAG_PREFIX}-${{ github.sha }}-${{ github.run_id }}"' in compute_image_tag_script
 
     def test_image_ref_output_preserved(self, compute_image_tag_script: str):
         """image_ref 输出保留(向后兼容)。"""

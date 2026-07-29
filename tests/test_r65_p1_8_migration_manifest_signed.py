@@ -1,4 +1,4 @@
-"""R65 P1-08: migration manifest 001-007 全集合 + 签名链完整性测试。
+"""R65 P1-08: migration manifest 001-009 全集合 + 签名链完整性测试。
 
 审计背景(R65 终审报告 P1-08):
     Migration 005/006/007 需纳入签名 release manifest。
@@ -8,7 +8,7 @@
 
 测试覆盖矩阵(10 个场景):
   内容完整性(5 个):
-    1. Manifest 包含 001-007 全集合
+    1. Manifest 包含 001-009 全集合
     2. predecessor 链完整(001 ← 002 ← ... ← 007)
     3. 每个 SQL 文件 SHA-256 与 manifest 一致
     4. 每个 migration 的 ddl_version 单调非递减
@@ -47,8 +47,9 @@ MIGRATIONS_DIR = REPO_ROOT / "database" / "migrations"
 MANIFEST_PATH = MIGRATIONS_DIR / "migration-manifest.json"
 CHECK_SCRIPT = REPO_ROOT / "scripts" / "check_migration_manifest.py"
 
-# R65 P1-08: 期望的 migration_id 集合(001-007 全集合)
-EXPECTED_MIGRATION_IDS: list[str] = [f"{i:03d}" for i in range(1, 8)]
+# R65 P1-08: 期望的 migration_id 集合(001-009 全集合)
+# R76 P0-06: 新增 009_restore_capability_nonce_binding.sql(nonce 数据库 CAS)
+EXPECTED_MIGRATION_IDS: list[str] = [f"{i:03d}" for i in range(1, 10)]
 
 
 # ════════════════════════════════════════════════════════════════
@@ -104,20 +105,20 @@ def _run_check_strict(manifest_path: Path | None = None) -> subprocess.Completed
 # ════════════════════════════════════════════════════════════════
 
 class TestManifestContent:
-    """manifest 内容完整性测试 — 验证 001-007 全集合字段。"""
+    """manifest 内容完整性测试 — 验证 001-009 全集合字段。"""
 
-    def test_manifest_includes_all_migrations_001_to_007(self):
-        """场景 1: manifest 必须包含 001-007 全集合。"""
+    def test_manifest_includes_all_migrations_001_to_009(self):
+        """场景 1: manifest 必须包含 001-009 全集合。"""
         data = _load_manifest()
         ids = [str(e.get("migration_id", "")).strip() for e in data["migrations"]]
         for expected in EXPECTED_MIGRATION_IDS:
             assert expected in ids, (
                 f"manifest 缺少 migration_id={expected} "
-                f"(期望 001-007 全集合,实际: {sorted(ids)})"
+                f"(期望 001-009 全集合,实际: {sorted(ids)})"
             )
 
     def test_predecessor_chain_correct(self):
-        """场景 2: predecessor 链完整(001 ← 002 ← ... ← 007)。
+        """场景 2: predecessor 链完整(001 ← 002 ← ... ← 009)。
 
         第一个 migration (001) 的 predecessor 必须为 null;
         其余 migration_id=N 的 predecessor 必须等于前一个 migration_id。
@@ -128,8 +129,8 @@ class TestManifestContent:
             (e for e in data["migrations"] if str(e.get("migration_id", "")).strip()),
             key=lambda e: str(e.get("migration_id", "")),
         )
-        # 期望 8 个 migration (R67 P1-06 新增 008_restore_switch_reconciler.sql)
-        assert len(entries) == 8, f"期望 8 个 migration,实际 {len(entries)}"
+        # 期望 9 个 migration (R76 P0-06 新增 009_restore_capability_nonce_binding.sql)
+        assert len(entries) == 9, f"期望 9 个 migration,实际 {len(entries)}"
         # 001 是首个,predecessor 必须为 null
         assert entries[0]["migration_id"] == "001"
         first_pred = entries[0].get("predecessor")
@@ -234,7 +235,7 @@ class TestCheckScriptStrict:
     def test_strict_exits_1_on_missing_migration(self, tmp_path):
         """场景 7: 缺少 migration → exit 1。
 
-        移除 migration_id=007 后,strict 模式应检测到 001-007 全集合缺失。
+        移除 migration_id=007 后,strict 模式应检测到 001-009 全集合缺失。
         """
         data = _load_manifest()
         # 移除 007

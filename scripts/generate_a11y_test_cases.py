@@ -50,15 +50,15 @@ def _install_fake_config_if_missing() -> None:
             cfg = sys.modules["config"]
             if hasattr(cfg, "settings") and cfg.settings is not None:
                 return
-        except Exception:
-            pass
+        except Exception as _e:
+            print(f"[WARN] _install_fake_config_if_missing: sys.modules['config'] check failed: {_e}", file=sys.stderr)
     try:
         import config  # noqa: F401  type: ignore
         if hasattr(config, "settings") and config.settings is not None:
             # 真实 config 可导入,不覆盖
             return
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[WARN] _install_fake_config_if_missing: config import failed: {_e}", file=sys.stderr)
     # 注入 mock config(Settings 校验失败时降级)
     from unittest.mock import MagicMock
     mock_settings = MagicMock(name="mock_settings_for_codegen")
