@@ -1,0 +1,71 @@
+# RC runtime identity override.
+#
+# This file is layered after docker-compose.prod.yml and docker-compose.secretless.yml
+# for the Release Gates compose-runtime-e2e job. It removes local build contexts
+# from every application role and binds those roles to the exact immutable
+# candidate RepoDigest supplied through TGJIEMA_IMAGE.
+#
+# Infrastructure simulators (provider-sim, MinIO, CockroachDB) remain defined by
+# docker-compose.secretless.yml and are isolated to the CI network. Production
+# deployment continues to use docker-compose.prod.yml unchanged.
+
+services:
+  migration:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  db_writer:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  crdb_sync:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  up:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  idx:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  dsp:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  mon:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  admin_bot:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  admin:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  db_backup:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+
+  r40_scheduler:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}
+    environment:
+      - APP_ENV=test
+      - SECRETLESS_MODE=true
+      - PROVIDER_BACKEND=contract
+      - PROVIDER_BASE_URL=http://provider-sim:8088
+      - PROVIDER_CONTRACT_TOKEN=${CI_PROVIDER_CONTRACT_TOKEN:?CI_PROVIDER_CONTRACT_TOKEN must be set}
+      - OBJECT_STORAGE_BACKEND=minio
+      - S3_ENDPOINT_URL=http://minio:9000
+      - S3_ACCESS_KEY_ID=${CI_MINIO_ROOT_USER:?CI_MINIO_ROOT_USER must be set}
+      - S3_SECRET_ACCESS_KEY=${CI_MINIO_ROOT_PASSWORD:?CI_MINIO_ROOT_PASSWORD must be set}
+      - S3_BUCKET_NAME=tgjiema-backup
+      - SECRETLESS_CRDB_HOST=${SECRETLESS_CRDB_HOST:?SECRETLESS_CRDB_HOST must be set}
+      - SECRETLESS_CRDB_SQL_PORT=${SECRETLESS_CRDB_SQL_PORT:?SECRETLESS_CRDB_SQL_PORT must be set}
+      - SECRETLESS_CRDB_DATABASE=${SECRETLESS_CRDB_DATABASE:?SECRETLESS_CRDB_DATABASE must be set}
+      - SECRETLESS_CRDB_URL=${SECRETLESS_CRDB_URL:?SECRETLESS_CRDB_URL must be generated}
+      - COCKROACHDB_URL=${SECRETLESS_CRDB_URL:?SECRETLESS_CRDB_URL must be generated}
+      - BACKUP_SIGNING_KEY=${CI_BACKUP_SIGNING_KEY:?CI_BACKUP_SIGNING_KEY must be set}
+    depends_on:
+      redis:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+      cockroachdb:
+        condition: service_healthy
+
+  prometheus_exporter:
+    image: ${TGJIEMA_IMAGE:?TGJIEMA_IMAGE must be an immutable RepoDigest}

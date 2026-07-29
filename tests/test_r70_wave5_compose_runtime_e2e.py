@@ -707,6 +707,69 @@ class TestPhaseExecutionMocked:
             f"start_core 应 pass: error={result.error}"
         )
 
+    def test_compose_command_preserves_ordered_file_identity(self, orch, monkeypatch):
+        """所有 Compose 子命令必须复用相同且有序的文件集合。"""
+        files = [
+            orch.REPO_ROOT / "docker-compose.prod.yml",
+            orch.REPO_ROOT / "docker-compose.secretless.yml",
+            orch.REPO_ROOT / "docker-compose.rc-candidate.yml",
+        ]
+        monkeypatch.setattr(orch, "COMPOSE_FILES", files)
+        monkeypatch.setattr(orch, "COMPOSE_FILE", files[0])
+
+        command = orch._compose_cmd(["up", "-d", "redis"])
+        assert command == [
+            "docker", "compose",
+            "-f", str(files[0]),
+            "-f", str(files[1]),
+            "-f", str(files[2]),
+            "up", "-d", "redis",
+        ]
+
+    def test_compose_digest_changes_with_overlay_order(self, orch, monkeypatch, tmp_path):
+        """证据 digest 必须绑定文件路径、内容和 overlay 顺序。"""
+        first = tmp_path / "first.yml"
+        second = tmp_path / "second.yml"
+        first.write_text("services: {}\n", encoding="utf-8")
+        second.write_text("services: {}\n", encoding="utf-8")
+        monkeypatch.setattr(orch, "COMPOSE_FILE", first)
+        monkeypatch.setattr(orch, "COMPOSE_FILES", [first, second])
+        forward = orch._get_compose_digest()
+        monkeypatch.setattr(orch, "COMPOSE_FILES", [second, first])
+        reverse = orch._get_compose_digest()
+        assert forward.startswith("sha256:")
+        assert reverse.startswith("sha256:")
+        assert forward != reverse
+
+    def test_main_accepts_repeated_compose_files(self, orch, monkeypatch):
+        """CLI 必须按传入顺序激活多文件身份，不能回退到 production 单文件。"""
+        observed: list[list[Path]] = []
+        pass_result = orch.PhaseResult(
+            phase="preflight", description="mock", status="pass",
+            timestamp="t", duration_seconds=0, readiness_checks=[],
+        )
+        original = orch.PHASE_FUNCS["preflight"]
+        orch.PHASE_FUNCS["preflight"] = lambda timeout: (
+            observed.append(orch._active_compose_files()) or pass_result
+        )
+        try:
+            exit_code = orch.main([
+                "--phase", "preflight",
+                "--compose-file", "docker-compose.prod.yml",
+                "--compose-file", "docker-compose.secretless.yml",
+                "--compose-file", "docker-compose.rc-candidate.yml",
+            ])
+        finally:
+            orch.PHASE_FUNCS["preflight"] = original
+            orch.COMPOSE_FILE = orch.DEFAULT_COMPOSE_FILE
+            orch.COMPOSE_FILES = [orch.DEFAULT_COMPOSE_FILE]
+        assert exit_code == 0
+        assert [path.name for path in observed[0]] == [
+            "docker-compose.prod.yml",
+            "docker-compose.secretless.yml",
+            "docker-compose.rc-candidate.yml",
+        ]
+
     def test_main_returns_0_when_all_phases_pass(self, orch, monkeypatch):
         """所有阶段 pass 时 main() 返回 0(mock 所有 phase 函数)。"""
         # mock 所有 phase 函数返回 pass

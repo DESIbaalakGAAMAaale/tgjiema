@@ -250,7 +250,8 @@ class TestSecretlessCredentialsInjectionStep:
 
         export_pos = job_block.index('echo "SECRETLESS_CRDB_HOST=cockroachdb"')
         render_pos = job_block.index(
-            "docker compose -f docker-compose.yml -f docker-compose.secretless.yml"
+            "docker compose -f docker-compose.prod.yml -f docker-compose.secretless.yml "
+            "-f docker-compose.rc-candidate.yml"
         )
         assert export_pos < render_pos, (
             "R83 RC runtime: SECRETLESS_CRDB_* 必须在 merged Compose graph 渲染前导出"
@@ -459,9 +460,58 @@ class TestBackupRestorePhaseUsesSecretlessCredentials:
             "R76 §10.F: 必须使用 docker-compose.secretless.yml overlay "
             "启动 secretless 隔离测试环境"
         )
-        # 验证使用 -f 参数组合
-        pattern = r'docker\s+compose\s+-f\s+docker-compose\.yml\s+-f\s+docker-compose\.secretless\.yml'
-        assert re.search(pattern, job_block), (
-            "R76 §10.F: 必须使用 `docker compose -f docker-compose.yml "
-            "-f docker-compose.secretless.yml` 组合命令"
+        # RC runtime 必须从完整生产角色拓扑出发，再叠加 Secretless 环境和
+        # immutable candidate identity；启动和编排器必须使用完全相同的集合。
+        pattern = (
+            r"docker\s+compose\s+-f\s+docker-compose\.prod\.yml\s+"
+            r"-f\s+docker-compose\.secretless\.yml\s+"
+            r"-f\s+docker-compose\.rc-candidate\.yml"
         )
+        assert re.search(pattern, job_block), (
+            "R84 RC runtime: 必须使用 prod + secretless + rc-candidate 三层 Compose"
+        )
+        for cli_arg in (
+            "--compose-file docker-compose.prod.yml",
+            "--compose-file docker-compose.secretless.yml",
+            "--compose-file docker-compose.rc-candidate.yml",
+        ):
+            assert cli_arg in job_block, (
+                f"R84 RC runtime: 编排器缺少权威 Compose 参数 {cli_arg}"
+            )
+        assert (
+            "R73_RUNTIME_CONFIG_DIGEST: "
+            "${{ steps.identity.outputs.runtime_config_digest }}"
+        ) in job_block, (
+            "R84 RC runtime: 阶段级 envelope 必须绑定 identity step 的 exact "
+            "runtime_config_digest"
+        )
+
+    def test_rc_candidate_overlay_binds_all_application_roles_to_digest(self):
+        """候选 overlay 必须清除 build 并把全部应用角色绑定到 TGJIEMA_IMAGE。"""
+        overlay_path = REPO_ROOT / "docker-compose.rc-candidate.yml"
+        overlay = yaml.safe_load(overlay_path.read_text(encoding="utf-8"))
+        services = overlay.get("services", {})
+        required_roles = {
+            "migration", "db_writer", "crdb_sync", "up", "idx", "dsp",
+            "mon", "admin_bot", "admin", "db_backup", "r40_scheduler",
+            "prometheus_exporter",
+        }
+        assert set(services) == required_roles
+        for role in required_roles:
+            service = services[role]
+            assert "build" not in service, f"{role} 不得声明 local build"
+            assert service.get("image", "").startswith("${TGJIEMA_IMAGE:?"), (
+                f"{role} 必须绑定 exact candidate RepoDigest"
+            )
+
+    def test_rc_scheduler_is_secretless_and_depends_on_isolated_crdb(self):
+        """生产拓扑独有的 scheduler 在 RC 中也必须切换到隔离测试环境。"""
+        overlay = yaml.safe_load(
+            (REPO_ROOT / "docker-compose.rc-candidate.yml").read_text(encoding="utf-8")
+        )
+        scheduler = overlay["services"]["r40_scheduler"]
+        environment = dict(item.split("=", 1) for item in scheduler["environment"])
+        assert environment["APP_ENV"] == "test"
+        assert environment["SECRETLESS_MODE"] == "true"
+        assert environment["COCKROACHDB_URL"].startswith("${SECRETLESS_CRDB_URL:?")
+        assert "cockroachdb" in scheduler["depends_on"]

@@ -90,8 +90,12 @@ from loguru import logger
 # 项目根目录
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# 生产 compose 文件
-COMPOSE_FILE = REPO_ROOT / "docker-compose.prod.yml"
+# 默认生产 Compose 身份。RC Secretless 运行通过可重复的 --compose-file
+# 显式注入完整 Compose 文件集合；所有 docker compose 子命令、preflight 和
+# evidence 必须复用同一集合，禁止启动一套拓扑后退回另一套拓扑。
+DEFAULT_COMPOSE_FILE = REPO_ROOT / "docker-compose.prod.yml"
+COMPOSE_FILE = DEFAULT_COMPOSE_FILE  # 向后兼容既有单文件测试/调用方
+COMPOSE_FILES: list[Path] = [DEFAULT_COMPOSE_FILE]
 
 # .env 文件路径(包含 REDIS_*_PASSWORD 和 TGJIEMA_IMAGE)
 ENV_FILE = REPO_ROOT / ".env"
@@ -142,6 +146,11 @@ _STORAGE_CONFIG: dict[str, str] = {
     "signing_key": "",       # CI_BACKUP_SIGNING_KEY
     "expect": "",            # failure | no-production-tag | ""
 }
+
+# 阶段 16 诊断 envelope 的权威 DAG 上下文。main() 在执行每个阶段前
+# 原位更新该列表，使 phase_evidence_signing() 能聚合此前所有 required 阶段，
+# 避免上游失败后仍因硬编码 success 生成 promotion_eligible=true 的冲突证据。
+_DAG_RESULTS_CONTEXT: list["PhaseResult"] = []
 
 
 def _get_entrypoint_roles() -> set[str]:
@@ -407,6 +416,59 @@ class PhaseResult:
     readiness_checks: list[dict[str, Any]] = field(default_factory=list)
 
 
+def _aggregate_required_phase_conclusion(
+    results: list[PhaseResult],
+) -> tuple[str, bool, dict[str, Any]]:
+    """聚合阶段 16 之前的 required DAG 结果并生成 fail-closed 结论。
+
+    只有前 15 个 required 阶段各出现且恰好出现一次、状态全部为 pass 时，
+    才返回 ("success", True, details)。缺失、重复、fail、skipped 或未知状态
+    均返回 ("failure", False, details)，防止诊断 evidence 冒充晋级授权。
+    """
+    required_phases = [
+        phase_name for phase_name, _ in PHASES
+        if phase_name != "evidence_signing"
+    ]
+    statuses_by_phase: dict[str, list[str]] = {
+        phase_name: [] for phase_name in required_phases
+    }
+    for result in results:
+        if result.phase in statuses_by_phase:
+            statuses_by_phase[result.phase].append(result.status)
+
+    missing = [
+        phase_name for phase_name, statuses in statuses_by_phase.items()
+        if not statuses
+    ]
+    duplicates = {
+        phase_name: statuses
+        for phase_name, statuses in statuses_by_phase.items()
+        if len(statuses) > 1
+    }
+    non_pass = {
+        phase_name: statuses[0]
+        for phase_name, statuses in statuses_by_phase.items()
+        if len(statuses) == 1 and statuses[0] != "pass"
+    }
+    all_required_passed = not missing and not duplicates and not non_pass
+    details = {
+        "required_phase_count": len(required_phases),
+        "observed_required_phase_count": sum(
+            1 for statuses in statuses_by_phase.values() if statuses
+        ),
+        "required_phase_statuses": {
+            phase_name: statuses[0] if len(statuses) == 1 else statuses
+            for phase_name, statuses in statuses_by_phase.items()
+        },
+        "missing_required_phases": missing,
+        "duplicate_required_phases": duplicates,
+        "non_pass_required_phases": non_pass,
+        "all_required_phases_passed": all_required_passed,
+    }
+    conclusion = "success" if all_required_passed else "failure"
+    return conclusion, all_required_passed, details
+
+
 def _now_iso() -> str:
     """返回当前 UTC 时间的 ISO 8601 字符串。"""
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -469,9 +531,23 @@ def _docker_available() -> bool:
         return False
 
 
+def _active_compose_files() -> list[Path]:
+    """返回当前权威 Compose 文件集合。
+
+    COMPOSE_FILE 保留给既有调用方和测试；当 COMPOSE_FILES 仍为默认值而
+    COMPOSE_FILE 被覆盖时，自动采用被覆盖的单文件身份。
+    """
+    if COMPOSE_FILES == [DEFAULT_COMPOSE_FILE] and COMPOSE_FILE != DEFAULT_COMPOSE_FILE:
+        return [COMPOSE_FILE]
+    return list(COMPOSE_FILES)
+
+
 def _compose_cmd(args: list[str]) -> list[str]:
-    """构造 docker compose 命令(指定 -f docker-compose.prod.yml)。"""
-    return ["docker", "compose", "-f", str(COMPOSE_FILE)] + args
+    """构造复用同一权威 Compose 文件集合的命令。"""
+    command = ["docker", "compose"]
+    for compose_file in _active_compose_files():
+        command.extend(["-f", str(compose_file)])
+    return command + args
 
 
 def _fail_result(
@@ -734,16 +810,21 @@ def phase_preflight(timeout: int) -> PhaseResult:
             ],
         )
 
-    # 2. docker-compose.prod.yml 文件存在
-    if not COMPOSE_FILE.is_file():
+    # 2. 每个权威 Compose 文件都必须存在；禁止缺失 overlay 时静默回退。
+    compose_files = _active_compose_files()
+    missing_compose_files = [path for path in compose_files if not path.is_file()]
+    if not compose_files or missing_compose_files:
         return _fail_result(
             phase="preflight",
             description=description,
             started=started,
-            error=f"docker-compose.prod.yml 不存在: {COMPOSE_FILE}",
+            error=(
+                "Compose 文件集合为空或存在缺失项: "
+                f"{[str(path) for path in missing_compose_files]}"
+            ),
             readiness_checks=[
                 {"check": "docker_daemon", "status": "pass"},
-                {"check": "compose_file", "status": "fail"},
+                {"check": "compose_files", "status": "fail"},
             ],
         )
 
@@ -1075,7 +1156,8 @@ def phase_preflight(timeout: int) -> PhaseResult:
         started=started,
         evidence={
             "docker_available": True,
-            "compose_file": str(COMPOSE_FILE),
+            "compose_file": str(_active_compose_files()[0]),
+            "compose_files": [str(path) for path in _active_compose_files()],
             "env_file": str(ENV_FILE),
             "tgjiema_image": tgjiema_image,
             "redis_passwords_set": [
@@ -6500,25 +6582,46 @@ def phase_evidence_signing(timeout: int) -> PhaseResult:
     except ValueError:
         run_attempt = 1
 
+    overall_conclusion, all_required_passed, dag_aggregate = (
+        _aggregate_required_phase_conclusion(_DAG_RESULTS_CONTEXT)
+    )
+    event = os.environ.get("GITHUB_EVENT_NAME", "push")
+    ref = os.environ.get("GITHUB_REF", "refs/tags/rc-v-runtime-e2e")
+    promotion_eligible = (
+        all_required_passed
+        and event == "push"
+        and ref.startswith("refs/tags/rc-v")
+        and image_repo_digest is not None
+        and runtime_config_digest is not None
+    )
     payload = {
         "phases": [phase_name for phase_name, _ in PHASES],
         "phase_count": len(PHASES),
         "dag_enforced": True,
+        "dag_aggregate": dag_aggregate,
     }
+    readiness_checks.append({
+        "check": "required_phase_aggregate",
+        "status": "pass",
+        "overall_conclusion": overall_conclusion,
+        "promotion_eligible": promotion_eligible,
+        **dag_aggregate,
+    })
 
     try:
         envelope = envelope_module.build_evidence_envelope(
             gate_level="rc",
-            event="push",
-            ref=os.environ.get("GITHUB_REF", "refs/tags/rc-v-runtime-e2e"),
+            event=event,
+            ref=ref,
             source_sha=source_sha,
             run_id=run_id,
             run_attempt=run_attempt,
             workflow_path=".github/workflows/release-gates.yml",
-            overall_conclusion="success",
+            overall_conclusion=overall_conclusion,
             payload=payload,
             image_repo_digest=image_repo_digest,
             runtime_config_digest=runtime_config_digest,
+            promotion_eligible=promotion_eligible,
         )
     except Exception as e:
         return _fail_result(
@@ -8082,15 +8185,25 @@ def _get_image_repo_digest() -> str:
 
 
 def _get_compose_digest() -> str:
-    """R71 Wave 2: 获取 docker-compose.prod.yml 的 SHA256 digest。
+    """获取有序 Compose 文件集合的确定性 SHA256 digest。
 
-    用于 evidence 输出,确保 Compose 文件内容可追溯。
+    每个文件以仓库相对路径和原始字节共同参与哈希，防止同内容不同 overlay
+    顺序或不同文件名被误认为同一运行配置身份。任一读取失败即返回空值。
     """
+    digest = hashlib.sha256()
     try:
-        content = COMPOSE_FILE.read_bytes()
-        return "sha256:" + hashlib.sha256(content).hexdigest()
+        for compose_file in _active_compose_files():
+            try:
+                identity = compose_file.resolve().relative_to(REPO_ROOT.resolve()).as_posix()
+            except ValueError:
+                identity = str(compose_file.resolve())
+            digest.update(identity.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(compose_file.read_bytes())
+            digest.update(b"\0")
     except OSError:
         return ""
+    return "sha256:" + digest.hexdigest()
 
 
 def _build_role_matrix() -> dict[str, Any]:
@@ -8143,7 +8256,8 @@ def _build_evidence(
         "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
         "image_repo_digest": _get_image_repo_digest(),
         "compose_digest": _get_compose_digest(),
-        "compose_file": str(COMPOSE_FILE),
+        "compose_file": str(_active_compose_files()[0]),
+        "compose_files": [str(path) for path in _active_compose_files()],
         "env_file": str(ENV_FILE),
         "role_matrix": _build_role_matrix(),
         # R73 §5.15: DAG 元数据
@@ -8240,6 +8354,15 @@ def main(argv: list[str] | None = None) -> int:
         help="每阶段超时秒数(默认 600)",
     )
     parser.add_argument(
+        "--compose-file",
+        action="append",
+        metavar="PATH",
+        help=(
+            "权威 Compose 文件，可重复指定并按顺序合并；"
+            "默认仅使用 docker-compose.prod.yml"
+        ),
+    )
+    parser.add_argument(
         "--keep-on-success",
         action="store_true",
         help="全部通过时跳过 final_identity_and_cleanup,保留容器供人工检查",
@@ -8298,6 +8421,19 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # RC runtime identity: 所有阶段必须复用调用方显式给出的有序 Compose
+    # 文件集合。相对路径锚定到仓库根；缺失文件由 preflight fail-closed。
+    global COMPOSE_FILE, COMPOSE_FILES
+    if args.compose_file:
+        COMPOSE_FILES = [
+            Path(value) if Path(value).is_absolute() else REPO_ROOT / value
+            for value in args.compose_file
+        ]
+        COMPOSE_FILE = COMPOSE_FILES[0]
+    else:
+        COMPOSE_FILES = [DEFAULT_COMPOSE_FILE]
+        COMPOSE_FILE = DEFAULT_COMPOSE_FILE
+
     # R80 Step 12/13: 将 CLI 存储参数注入模块级 _STORAGE_CONFIG
     _STORAGE_CONFIG["storage_backend"] = args.storage_backend
     _STORAGE_CONFIG["endpoint"] = args.endpoint
@@ -8340,6 +8476,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     results: list[PhaseResult] = []
+    _DAG_RESULTS_CONTEXT.clear()
     # R73 §5.15: 跟踪已失败/skipped 的阶段(用于 DAG 传播)
     # 一旦阶段 fail 或 skipped(上游传播),其所有下游非 ALLOWED 阶段必须 skipped
     failed_or_skipped: set[str] = set()
@@ -8401,7 +8538,11 @@ def main(argv: list[str] | None = None) -> int:
             _print_result(result)
             continue
 
-        # 执行阶段
+        # 执行阶段。阶段 16 调用前先暴露前序 DAG 结果的只读快照，
+        # 使诊断 envelope 能按真实阶段状态 fail-closed 聚合。
+        if phase_name == "evidence_signing":
+            _DAG_RESULTS_CONTEXT.clear()
+            _DAG_RESULTS_CONTEXT.extend(results)
         phase_func = PHASE_FUNCS[phase_name]
         try:
             result = phase_func(args.timeout)

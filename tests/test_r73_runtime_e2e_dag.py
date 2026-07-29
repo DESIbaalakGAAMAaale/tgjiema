@@ -699,3 +699,186 @@ class TestEvidenceDagMetadata:
         assert "blocking_reason" in summary, (
             "phase_summary 必须包含 blocking_reason"
         )
+
+
+# ════════════════════════════════════════════════════════════════
+# I. 阶段 16 诊断 envelope fail-closed 聚合
+# ════════════════════════════════════════════════════════════════
+
+
+class TestDiagnosticEnvelopeConclusion:
+    """验证阶段级诊断 envelope 不会在上游失败后声称可晋级。"""
+
+    @staticmethod
+    def _result(orch, phase_name: str, status: str):
+        return orch.PhaseResult(
+            phase=phase_name,
+            description="test",
+            status=status,
+            timestamp="2026-01-01T00:00:00+00:00",
+            duration_seconds=0.1,
+        )
+
+    def _required_results(self, orch, status_overrides=None):
+        status_overrides = status_overrides or {}
+        return [
+            self._result(
+                orch,
+                phase_name,
+                status_overrides.get(phase_name, "pass"),
+            )
+            for phase_name, _ in orch.PHASES
+            if phase_name != "evidence_signing"
+        ]
+
+    def test_all_required_pass_yields_success(self, orch):
+        conclusion, eligible, details = (
+            orch._aggregate_required_phase_conclusion(
+                self._required_results(orch)
+            )
+        )
+        assert conclusion == "success"
+        assert eligible is True
+        assert details["all_required_phases_passed"] is True
+        assert details["missing_required_phases"] == []
+        assert details["non_pass_required_phases"] == {}
+
+    @pytest.mark.parametrize("status", ["fail", "skipped"])
+    def test_fail_or_skipped_yields_failure(self, orch, status):
+        conclusion, eligible, details = (
+            orch._aggregate_required_phase_conclusion(
+                self._required_results(
+                    orch,
+                    {"start_infrastructure": status},
+                )
+            )
+        )
+        assert conclusion == "failure"
+        assert eligible is False
+        assert details["all_required_phases_passed"] is False
+        assert details["non_pass_required_phases"] == {
+            "start_infrastructure": status,
+        }
+
+    def test_missing_or_duplicate_required_phase_yields_failure(self, orch):
+        results = self._required_results(orch)
+        results = [r for r in results if r.phase != "actual_switch"]
+        results.append(self._result(orch, "preflight", "pass"))
+
+        conclusion, eligible, details = (
+            orch._aggregate_required_phase_conclusion(results)
+        )
+        assert conclusion == "failure"
+        assert eligible is False
+        assert details["missing_required_phases"] == ["actual_switch"]
+        assert details["duplicate_required_phases"] == {
+            "preflight": ["pass", "pass"],
+        }
+
+    def test_phase_evidence_signing_uses_failed_dag_conclusion(
+        self, orch, monkeypatch
+    ):
+        captured: dict[str, object] = {}
+
+        class EnvelopeModule:
+            @staticmethod
+            def build_evidence_envelope(**kwargs):
+                captured.update(kwargs)
+                return {
+                    "gate_level": kwargs["gate_level"],
+                    "overall_conclusion": kwargs["overall_conclusion"],
+                    "promotion_eligible": kwargs["promotion_eligible"],
+                }
+
+            @staticmethod
+            def validate_envelope(envelope):
+                return True, []
+
+        class Spec:
+            loader = MagicMock()
+
+        Spec.loader.exec_module = lambda module: None
+        monkeypatch.setattr(orch, "_docker_available", lambda: True)
+        monkeypatch.setattr(orch, "_get_source_sha", lambda: "a" * 40)
+        monkeypatch.setattr(
+            importlib.util,
+            "spec_from_file_location",
+            lambda *args, **kwargs: Spec(),
+        )
+        monkeypatch.setattr(
+            importlib.util,
+            "module_from_spec",
+            lambda spec: EnvelopeModule,
+        )
+        monkeypatch.setenv(
+            "TGJIEMA_IMAGE",
+            "ghcr.io/maxiuquan/tgjiema@sha256:" + "b" * 64,
+        )
+        monkeypatch.setenv("R73_RUNTIME_CONFIG_DIGEST", "sha256:" + "c" * 64)
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+        monkeypatch.setenv("GITHUB_REF", "refs/tags/rc-v1.0.86")
+        orch._DAG_RESULTS_CONTEXT.clear()
+        orch._DAG_RESULTS_CONTEXT.extend(
+            self._required_results(
+                orch,
+                {"start_infrastructure": "fail"},
+            )
+        )
+
+        result = orch.phase_evidence_signing(timeout=10)
+
+        assert result.status == "pass"
+        assert captured["overall_conclusion"] == "failure"
+        assert captured["promotion_eligible"] is False
+        assert result.evidence["envelope"]["promotion_eligible"] is False
+
+    def test_phase_evidence_signing_only_promotable_when_all_pass(
+        self, orch, monkeypatch
+    ):
+        captured: dict[str, object] = {}
+
+        class EnvelopeModule:
+            @staticmethod
+            def build_evidence_envelope(**kwargs):
+                captured.update(kwargs)
+                return {
+                    "gate_level": kwargs["gate_level"],
+                    "overall_conclusion": kwargs["overall_conclusion"],
+                    "promotion_eligible": kwargs["promotion_eligible"],
+                }
+
+            @staticmethod
+            def validate_envelope(envelope):
+                return True, []
+
+        class Spec:
+            loader = MagicMock()
+
+        Spec.loader.exec_module = lambda module: None
+        monkeypatch.setattr(orch, "_docker_available", lambda: True)
+        monkeypatch.setattr(orch, "_get_source_sha", lambda: "a" * 40)
+        monkeypatch.setattr(
+            importlib.util,
+            "spec_from_file_location",
+            lambda *args, **kwargs: Spec(),
+        )
+        monkeypatch.setattr(
+            importlib.util,
+            "module_from_spec",
+            lambda spec: EnvelopeModule,
+        )
+        monkeypatch.setenv(
+            "TGJIEMA_IMAGE",
+            "ghcr.io/maxiuquan/tgjiema@sha256:" + "b" * 64,
+        )
+        monkeypatch.setenv("R73_RUNTIME_CONFIG_DIGEST", "sha256:" + "c" * 64)
+        monkeypatch.setenv("GITHUB_EVENT_NAME", "push")
+        monkeypatch.setenv("GITHUB_REF", "refs/tags/rc-v1.0.86")
+        orch._DAG_RESULTS_CONTEXT.clear()
+        orch._DAG_RESULTS_CONTEXT.extend(self._required_results(orch))
+
+        result = orch.phase_evidence_signing(timeout=10)
+
+        assert result.status == "pass"
+        assert captured["overall_conclusion"] == "success"
+        assert captured["promotion_eligible"] is True

@@ -821,7 +821,7 @@ jobs:
           echo "tree_sha=${TREE_SHA}" >> "$GITHUB_OUTPUT"
           # R75 P1-02: 删除 runtime config digest 的 || echo unknown 吞错
           # 文件缺失或 sha 计算失败必须 fail-closed,不得生成可继续使用的 "unknown" digest
-          RUNTIME_CONFIG_DIGEST=$(sha256sum docker-compose.yml docker-compose.prod.yml config/groups.yaml config/topology.yaml | sha256sum | cut -d' ' -f1)
+          RUNTIME_CONFIG_DIGEST=$(sha256sum docker-compose.yml docker-compose.prod.yml docker-compose.secretless.yml docker-compose.rc-candidate.yml config/groups.yaml config/topology.yaml | sha256sum | cut -d' ' -f1)
           echo "runtime_config_digest=sha256:${RUNTIME_CONFIG_DIGEST}" >> "$GITHUB_OUTPUT"
           echo "tag_object_sha=${TAG_OBJECT_SHA}"
           echo "source_sha=${SOURCE_SHA}"
@@ -985,19 +985,19 @@ jobs:
           # 所有临时凭证通过环境变量注入(由上一步生成)
           echo "=== R76 10.F / R79 §10.2: Starting single-CRDB infrastructure ==="
           # R79 §10.3: 先运行 resolved 服务图硬门禁
-          docker compose -f docker-compose.yml -f docker-compose.secretless.yml \
+          docker compose -f docker-compose.prod.yml -f docker-compose.secretless.yml -f docker-compose.rc-candidate.yml \
             config --format json > runtime-smoke-compose-resolved.json 2>/dev/null || \
-            docker compose -f docker-compose.yml -f docker-compose.secretless.yml \
+            docker compose -f docker-compose.prod.yml -f docker-compose.secretless.yml -f docker-compose.rc-candidate.yml \
             config > runtime-smoke-compose-resolved.json
           python scripts/validate_secretless_service_graph.py \
             runtime-smoke-compose-resolved.json \
             --export-graph artifacts/secretless-e2e/service-graph.json
-          docker compose -f docker-compose.yml -f docker-compose.secretless.yml up -d \
+          docker compose -f docker-compose.prod.yml -f docker-compose.secretless.yml -f docker-compose.rc-candidate.yml up -d \
             provider-sim minio minio-init cockroachdb
           # 等待 provider-sim 就绪
           echo "Waiting for provider-sim to be ready..."
           for i in $(seq 1 30); do
-            if docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T provider-sim \
+            if docker compose -f docker-compose.prod.yml -f docker-compose.secretless.yml -f docker-compose.rc-candidate.yml exec -T provider-sim \
               python -c "import urllib.request; r=urllib.request.urlopen('http://localhost:8088/health'); exit(0 if r.status==200 else 1)" \
               >/dev/null 2>&1; then
               echo "provider-sim is ready (attempt ${i})"
@@ -1008,7 +1008,7 @@ jobs:
           # 等待 MinIO 就绪
           echo "Waiting for MinIO to be ready..."
           for i in $(seq 1 30); do
-            if docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T minio \
+            if docker compose -f docker-compose.prod.yml -f docker-compose.secretless.yml -f docker-compose.rc-candidate.yml exec -T minio \
               mc ready local >/dev/null 2>&1; then
               echo "MinIO is ready (attempt ${i})"
               break
@@ -1019,7 +1019,7 @@ jobs:
           # R79 §10.2: 单拓扑服务 cockroachdb,healthcheck 走 SQL 端口 26258
           echo "Waiting for CockroachDB (cockroachdb:26258 single-topology) to be ready..."
           for i in $(seq 1 30); do
-            if docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T cockroachdb \
+            if docker compose -f docker-compose.prod.yml -f docker-compose.secretless.yml -f docker-compose.rc-candidate.yml exec -T cockroachdb \
               cockroach sql --insecure --host=localhost:26258 -e "SELECT 1" >/dev/null 2>&1; then
               echo "CockroachDB is ready (attempt ${i})"
               break
@@ -1030,7 +1030,7 @@ jobs:
           # CockroachDB CLI 不支持 PostgreSQL psql 的 `-t` 选项；同时禁止在
           # set -o pipefail 下用 head 截断 CLI 输出，否则 SIGPIPE/解析差异会让
           # 已就绪的基础设施以 rc=4 误判失败。完整捕获并验证非空输出。
-          if ! CRDB_VERSION_OUTPUT=$(docker compose -f docker-compose.yml -f docker-compose.secretless.yml exec -T \
+          if ! CRDB_VERSION_OUTPUT=$(docker compose -f docker-compose.prod.yml -f docker-compose.secretless.yml -f docker-compose.rc-candidate.yml exec -T \
             cockroachdb cockroach sql --insecure --host=localhost:26258 -e "SELECT version();" 2>&1); then
             echo "::error::CockroachDB version probe failed"
             printf '%s\n' "${CRDB_VERSION_OUTPUT}"
@@ -1043,12 +1043,15 @@ jobs:
           printf 'CockroachDB version probe:\n%s\n' "${CRDB_VERSION_OUTPUT}"
           echo "=== Secretless infrastructure ready ==="
 
-      - name: Run Compose Runtime E2E (11 phases, fail-closed)
+      - name: Run Compose Runtime E2E (16 phases, fail-closed)
         env:
           # R71 RC3 fix: compose_runtime_e2e.py 的 preflight 从 os.environ 读取
           # TGJIEMA_IMAGE(line 411),而不是从 .env 文件。必须在 step env 中
           # 显式注入,否则 preflight 的 image_digest 检查失败。
           TGJIEMA_IMAGE: ${{ needs.docker-build.outputs.image_name }}@${{ needs.docker-build.outputs.image_digest }}
+          # R84: 阶段级诊断 envelope 必须绑定本 job 已计算的 exact runtime
+          # config digest；禁止缺失时生成可晋级 evidence。
+          R73_RUNTIME_CONFIG_DIGEST: ${{ steps.identity.outputs.runtime_config_digest }}
           # R71 RC4 fix: preflight 还检查 REDIS_*_PASSWORD 环境变量非空。
           # .env 文件中的值不会自动加载到 os.environ,必须在 step env 中显式注入。
           REDIS_WRITER_PASSWORD: ci-placeholder-writer
@@ -1057,10 +1060,8 @@ jobs:
           REDIS_ADMIN_PASSWORD: ci-placeholder-admin
         run: |
           set -euo pipefail
-          echo "=== R71 Wave 2: Compose Runtime E2E (11 phases) ==="
-          echo "Phase list: preflight / start_core / start_bots / migration_check /"
-          echo "            health_check / redis_acl_check / business_smoke /"
-          echo "            backup_restore / sigterm / restart / teardown"
+          echo "=== R73 §5.15: Compose Runtime E2E (16 phases) ==="
+          echo "Phase list: preflight through evidence_signing (strict DAG)"
           echo ""
           echo "R71 P0-06: business_smoke 通过合成交易验证完整业务链路"
           echo "           (Redis XADD → db_writer → SQLite → 幂等 → DLQ → 清理)"
@@ -1069,6 +1070,9 @@ jobs:
           echo ""
           echo "TGJIEMA_IMAGE=${TGJIEMA_IMAGE}"
           python scripts/compose_runtime_e2e.py \
+            --compose-file docker-compose.prod.yml \
+            --compose-file docker-compose.secretless.yml \
+            --compose-file docker-compose.rc-candidate.yml \
             --timeout 600 \
             --output runtime-e2e-evidence.json
           echo "=== R71 Wave 2: Compose Runtime E2E 通过 ==="
