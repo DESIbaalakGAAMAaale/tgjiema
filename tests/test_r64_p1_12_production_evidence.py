@@ -31,14 +31,12 @@ R64 P1-12 验收标准:
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import pytest
-import pytest_asyncio
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -859,6 +857,48 @@ class TestReleaseGatesProductionEvidenceJob:
         assert "evidence_envelope.py build" in content
         # 应调用 evidence_envelope.py CLI validate 子命令 (defense in depth)
         assert "evidence_envelope.py validate" in content
+
+    def test_rc_envelope_waits_for_complete_rc_gate_set(self):
+        """RC envelope 必须聚合完整 RC-only 门禁，不得在 runtime 失败前定案。"""
+        path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
+        content = path.read_text(encoding="utf-8")
+        pe_idx = content.index("generate-evidence-envelope:")
+        rs_idx = content.index("promote-rc-reusable:", pe_idx)
+        pe_block = content[pe_idx:rs_idx]
+
+        required_needs = {
+            "compose-runtime-e2e",
+            "runtime-smoke-compose",
+            "publish-attestation",
+            "attestation-semantics-verify",
+            "verify-only-3x",
+            "tag-ruleset-verify",
+            "verify-git-source-governance",
+            "rc-continuity",
+            "bind-runtime-config",
+            "migration-manifest-gate",
+            "migration-binding-gate",
+            "oci-allowlist-verify",
+            "validate-oci-rootfs",
+            "secretless-crdb-closed-loop-gate",
+        }
+        for job in required_needs:
+            assert job in pe_block, f"RC envelope 缺少 required need: {job}"
+
+    def test_rc_envelope_conclusion_is_not_hardcoded_success(self):
+        """失败 RC 必须生成 failure conclusion，不能硬编码 success。"""
+        path = REPO_ROOT / ".github" / "workflows" / "release-gates.yml"
+        content = path.read_text(encoding="utf-8")
+        pe_idx = content.index("generate-evidence-envelope:")
+        rs_idx = content.index("promote-rc-reusable:", pe_idx)
+        pe_block = content[pe_idx:rs_idx]
+
+        assert 'OVERALL_CONCLUSION="failure"' in pe_block
+        assert 'overall_conclusion=${OVERALL_CONCLUSION}' in pe_block
+        assert '--overall-conclusion "${OVERALL_CONCLUSION}"' in pe_block
+        assert '--overall-conclusion "success"' not in pe_block
+        assert "NEEDS_COMPOSE_RUNTIME_E2E" in pe_block
+        assert "NEEDS_VERIFY_ONLY_3X" in pe_block
 
     def test_generate_evidence_envelope_job_has_proper_permissions(self):
         """generate-evidence-envelope job 应有正确的 permissions 设置。"""

@@ -833,6 +833,13 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Install Compose Runtime E2E dependencies (fail-closed)
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -c "import loguru; print(f'loguru={loguru.__version__}')"
+
       - name: Login to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9
         with:
@@ -3758,7 +3765,13 @@ jobs:
     # push (should_push=false) / PR 场景下会被跳过,本 job 通过 if: always()
     # 仍会运行,此时 host_config_digest 输出为空字符串 (evidence_envelope.py
     # CLI 会规范化为 None,envelope 不可晋级 — 符合 R73 §5.7 rules)。
-    needs: [docker-build, sbom, sign-image, publish-attestation, bind-runtime-config]
+    needs: [docker-build, docker-digest-verify, sbom, sign-image,
+            publish-attestation, attestation-semantics-verify, verify-only-3x,
+            bind-runtime-config, compose-runtime-e2e, runtime-smoke-compose,
+            verify-git-source-governance, rc-continuity, tag-ruleset-verify,
+            migration-manifest-gate, migration-binding-gate,
+            oci-allowlist-verify, validate-oci-rootfs,
+            secretless-crdb-closed-loop-gate]
     permissions:
       contents: read
       actions: read
@@ -3769,6 +3782,7 @@ jobs:
       # R73 P1-05: 输出 gate_level / promotion_eligible / artifact_prefix 供下游 job 引用
       gate_level: ${{ steps.gate.outputs.gate_level }}
       promotion_eligible: ${{ steps.gate.outputs.promotion_eligible }}
+      overall_conclusion: ${{ steps.gate.outputs.overall_conclusion }}
       artifact_prefix: ${{ steps.gate.outputs.artifact_prefix }}
       envelope_path: ${{ steps.envelope.outputs.envelope_path }}
     steps:
@@ -3798,18 +3812,46 @@ jobs:
         GH_EVENT: ${{ github.event_name }}
         GH_REF: ${{ github.ref }}
         NEEDS_DOCKER_BUILD: ${{ needs.docker-build.result }}
+        NEEDS_DOCKER_DIGEST_VERIFY: ${{ needs.docker-digest-verify.result }}
         NEEDS_SBOM: ${{ needs.sbom.result }}
         NEEDS_SIGN_IMAGE: ${{ needs.sign-image.result }}
         NEEDS_PUBLISH_ATTESTATION: ${{ needs.publish-attestation.result }}
+        NEEDS_ATTESTATION_SEMANTICS_VERIFY: ${{ needs.attestation-semantics-verify.result }}
+        NEEDS_VERIFY_ONLY_3X: ${{ needs.verify-only-3x.result }}
+        NEEDS_BIND_RUNTIME_CONFIG: ${{ needs.bind-runtime-config.result }}
+        NEEDS_COMPOSE_RUNTIME_E2E: ${{ needs.compose-runtime-e2e.result }}
+        NEEDS_RUNTIME_SMOKE_COMPOSE: ${{ needs.runtime-smoke-compose.result }}
+        NEEDS_VERIFY_GIT_SOURCE_GOVERNANCE: ${{ needs.verify-git-source-governance.result }}
+        NEEDS_RC_CONTINUITY: ${{ needs.rc-continuity.result }}
+        NEEDS_TAG_RULESET_VERIFY: ${{ needs.tag-ruleset-verify.result }}
+        NEEDS_MIGRATION_MANIFEST_GATE: ${{ needs.migration-manifest-gate.result }}
+        NEEDS_MIGRATION_BINDING_GATE: ${{ needs.migration-binding-gate.result }}
+        NEEDS_OCI_ALLOWLIST_VERIFY: ${{ needs.oci-allowlist-verify.result }}
+        NEEDS_VALIDATE_OCI_ROOTFS: ${{ needs.validate-oci-rootfs.result }}
+        NEEDS_SECRETLESS_CRDB_CLOSED_LOOP_GATE: ${{ needs.secretless-crdb-closed-loop-gate.result }}
       run: |
         set -euo pipefail
         echo "=== R73 P1-05: Determine gate level ==="
         echo "  event: ${GH_EVENT}"
         echo "  ref:   ${GH_REF}"
-        echo "  needs.docker-build.result:        ${NEEDS_DOCKER_BUILD}"
-        echo "  needs.sbom.result:                ${NEEDS_SBOM}"
-        echo "  needs.sign-image.result:          ${NEEDS_SIGN_IMAGE}"
-        echo "  needs.publish-attestation.result: ${NEEDS_PUBLISH_ATTESTATION}"
+        echo "  needs.docker-build.result:                     ${NEEDS_DOCKER_BUILD}"
+        echo "  needs.docker-digest-verify.result:              ${NEEDS_DOCKER_DIGEST_VERIFY}"
+        echo "  needs.sbom.result:                             ${NEEDS_SBOM}"
+        echo "  needs.sign-image.result:                       ${NEEDS_SIGN_IMAGE}"
+        echo "  needs.publish-attestation.result:              ${NEEDS_PUBLISH_ATTESTATION}"
+        echo "  needs.attestation-semantics-verify.result:     ${NEEDS_ATTESTATION_SEMANTICS_VERIFY}"
+        echo "  needs.verify-only-3x.result:                   ${NEEDS_VERIFY_ONLY_3X}"
+        echo "  needs.bind-runtime-config.result:              ${NEEDS_BIND_RUNTIME_CONFIG}"
+        echo "  needs.compose-runtime-e2e.result:              ${NEEDS_COMPOSE_RUNTIME_E2E}"
+        echo "  needs.runtime-smoke-compose.result:            ${NEEDS_RUNTIME_SMOKE_COMPOSE}"
+        echo "  needs.verify-git-source-governance.result:     ${NEEDS_VERIFY_GIT_SOURCE_GOVERNANCE}"
+        echo "  needs.rc-continuity.result:                    ${NEEDS_RC_CONTINUITY}"
+        echo "  needs.tag-ruleset-verify.result:               ${NEEDS_TAG_RULESET_VERIFY}"
+        echo "  needs.migration-manifest-gate.result:          ${NEEDS_MIGRATION_MANIFEST_GATE}"
+        echo "  needs.migration-binding-gate.result:           ${NEEDS_MIGRATION_BINDING_GATE}"
+        echo "  needs.oci-allowlist-verify.result:              ${NEEDS_OCI_ALLOWLIST_VERIFY}"
+        echo "  needs.validate-oci-rootfs.result:               ${NEEDS_VALIDATE_OCI_ROOTFS}"
+        echo "  needs.secretless-crdb-closed-loop-gate.result: ${NEEDS_SECRETLESS_CRDB_CLOSED_LOOP_GATE}"
         # 1) 根据 ref 计算 gate_level / artifact_prefix
         if [[ "${GH_REF}" == refs/tags/rc-v* ]]; then
           GATE_LEVEL="rc"
@@ -3825,26 +3867,57 @@ jobs:
           GATE_LEVEL="development"
           ARTIFACT_PREFIX="development-evidence"
         fi
-        # 2) 计算 promotion_eligible — 仅 rc-v* tag + 所有 required gates success
+        # 2) 计算 authoritative conclusion 与 promotion_eligible。
+        # RC 必须等待完整 RC-only 链路成功；任一 required gate
+        # failure/cancelled/skipped 均生成 failure envelope 并禁止晋级。
         PROMOTION_ELIGIBLE="false"
+        OVERALL_CONCLUSION="success"
         if [[ "${GATE_LEVEL}" == "rc" && "${GH_EVENT}" == "push" ]]; then
-          ALL_SUCCESS="true"
-          for r in NEEDS_DOCKER_BUILD NEEDS_SBOM NEEDS_SIGN_IMAGE NEEDS_PUBLISH_ATTESTATION; do
+          for r in \
+            NEEDS_DOCKER_BUILD \
+            NEEDS_DOCKER_DIGEST_VERIFY \
+            NEEDS_SBOM \
+            NEEDS_SIGN_IMAGE \
+            NEEDS_PUBLISH_ATTESTATION \
+            NEEDS_ATTESTATION_SEMANTICS_VERIFY \
+            NEEDS_VERIFY_ONLY_3X \
+            NEEDS_BIND_RUNTIME_CONFIG \
+            NEEDS_COMPOSE_RUNTIME_E2E \
+            NEEDS_RUNTIME_SMOKE_COMPOSE \
+            NEEDS_VERIFY_GIT_SOURCE_GOVERNANCE \
+            NEEDS_RC_CONTINUITY \
+            NEEDS_TAG_RULESET_VERIFY \
+            NEEDS_MIGRATION_MANIFEST_GATE \
+            NEEDS_MIGRATION_BINDING_GATE \
+            NEEDS_OCI_ALLOWLIST_VERIFY \
+            NEEDS_VALIDATE_OCI_ROOTFS \
+            NEEDS_SECRETLESS_CRDB_CLOSED_LOOP_GATE; do
             if [[ "${!r}" != "success" ]]; then
-              ALL_SUCCESS="false"
+              OVERALL_CONCLUSION="failure"
               break
             fi
           done
-          if [[ "${ALL_SUCCESS}" == "true" ]]; then
+          if [[ "${OVERALL_CONCLUSION}" == "success" ]]; then
             PROMOTION_ELIGIBLE="true"
           fi
+        elif [[ "${GATE_LEVEL}" == "production" && "${GH_EVENT}" == "push" ]]; then
+          # Production envelope 是部署记录，不是新的 promotion candidate。
+          # 仅聚合本 job 可见的 production 路径依赖，eligibility 始终为 false。
+          for r in NEEDS_DOCKER_BUILD NEEDS_DOCKER_DIGEST_VERIFY NEEDS_SBOM; do
+            if [[ "${!r}" != "success" ]]; then
+              OVERALL_CONCLUSION="failure"
+              break
+            fi
+          done
         fi
         echo "gate_level=${GATE_LEVEL}" >> "$GITHUB_OUTPUT"
         echo "promotion_eligible=${PROMOTION_ELIGIBLE}" >> "$GITHUB_OUTPUT"
+        echo "overall_conclusion=${OVERALL_CONCLUSION}" >> "$GITHUB_OUTPUT"
         echo "artifact_prefix=${ARTIFACT_PREFIX}" >> "$GITHUB_OUTPUT"
         echo ""
         echo "  gate_level:         ${GATE_LEVEL}"
         echo "  promotion_eligible: ${PROMOTION_ELIGIBLE}"
+        echo "  overall_conclusion: ${OVERALL_CONCLUSION}"
         echo "  artifact_prefix:    ${ARTIFACT_PREFIX}"
 
     - name: Download release attestation artifact (for supply chain verification)
@@ -3962,6 +4035,7 @@ jobs:
       env:
         GATE_LEVEL: ${{ steps.gate.outputs.gate_level }}
         PROMOTION_ELIGIBLE: ${{ steps.gate.outputs.promotion_eligible }}
+        OVERALL_CONCLUSION: ${{ steps.gate.outputs.overall_conclusion }}
         ARTIFACT_PREFIX: ${{ steps.gate.outputs.artifact_prefix }}
         GH_EVENT: ${{ github.event_name }}
         GH_REF: ${{ github.ref }}
@@ -3979,6 +4053,7 @@ jobs:
         echo "=== R73 P1-05: Build typed evidence envelope ==="
         echo "  gate_level:         ${GATE_LEVEL}"
         echo "  promotion_eligible: ${PROMOTION_ELIGIBLE}"
+        echo "  overall_conclusion: ${OVERALL_CONCLUSION}"
         echo "  artifact_prefix:    ${ARTIFACT_PREFIX}"
         echo "  event:              ${GH_EVENT}"
         echo "  ref:                ${GH_REF}"
@@ -4009,7 +4084,7 @@ jobs:
           --run-attempt "${GH_RUN_ATTEMPT}" \
           --event "${GH_EVENT}" \
           --ref "${GH_REF}" \
-          --overall-conclusion "success" \
+          --overall-conclusion "${OVERALL_CONCLUSION}" \
           --image-repo-digest "${IMAGE_REPO_DIGEST}" \
           --runtime-config-digest "${RUNTIME_CONFIG_DIGEST}" \
           --output "${ENVELOPE_PATH}"
@@ -4017,7 +4092,7 @@ jobs:
         echo ""
         echo "=== R73 P1-05: Validate envelope (defense in depth) ==="
         python3 scripts/evidence_envelope.py validate "${ENVELOPE_PATH}"
-        # 二次断言:promotion_eligible 字段必须与 steps.gate 计算一致
+        # 二次断言:eligibility 和 conclusion 必须与完整 needs 聚合一致。
         python3 -c "
         import json
         with open('${ENVELOPE_PATH}') as f:
@@ -4027,7 +4102,12 @@ jobs:
         expected_pe = '${PROMOTION_ELIGIBLE}'.lower() == 'true'
         assert env['promotion_eligible'] is expected_pe, \
             f'promotion_eligible mismatch: {env[\"promotion_eligible\"]} != {expected_pe}'
-        print(f'PASS: envelope tiered invariants verified (gate_level={env[\"gate_level\"]}, promotion_eligible={env[\"promotion_eligible\"]})')
+        assert env['overall_conclusion'] == '${OVERALL_CONCLUSION}', \
+            f'overall_conclusion mismatch: {env[\"overall_conclusion\"]} != ${OVERALL_CONCLUSION}'
+        if env['overall_conclusion'] != 'success':
+            assert env['promotion_eligible'] is False, \
+                'failed envelope must never be promotion eligible'
+        print(f'PASS: envelope tiered invariants verified (gate_level={env[\"gate_level\"]}, promotion_eligible={env[\"promotion_eligible\"]}, overall_conclusion={env[\"overall_conclusion\"]})')
         "
 
     - name: "R73 P1-05: Upload tiered evidence artifact"

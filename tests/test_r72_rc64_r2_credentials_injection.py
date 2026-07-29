@@ -279,6 +279,29 @@ class TestSecretlessCredentialsInjectionStep:
         assert 'echo "::error::CockroachDB version probe returned empty output"' in probe
         assert probe.count("exit 1") >= 2
 
+    def test_runtime_e2e_dependencies_installed_before_execution(self):
+        """RC runtime job 必须在执行编排器前安装并探测 runtime 依赖。"""
+        source = _read_workflow()
+        job_block = _extract_compose_runtime_e2e_block(source)
+        install_pos = job_block.index(
+            "Install Compose Runtime E2E dependencies (fail-closed)"
+        )
+        requirements_pos = job_block.index(
+            "python -m pip install -r requirements.txt", install_pos
+        )
+        import_probe_pos = job_block.index(
+            'python -c "import loguru;', requirements_pos
+        )
+        execute_pos = job_block.index(
+            "python scripts/compose_runtime_e2e.py", import_probe_pos
+        )
+
+        assert install_pos < requirements_pos < import_probe_pos < execute_pos
+        dependency_step = job_block[install_pos:execute_pos]
+        assert "set -euo pipefail" in dependency_step
+        assert "continue-on-error" not in dependency_step
+        assert "|| true" not in dependency_step
+
     def test_secretless_mode_flag_enabled(self):
         """SECRETLESS_MODE=true 必须写入 .env.shared。
 
