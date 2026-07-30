@@ -1043,7 +1043,9 @@ def _query_crdb_count(
     # 完整的多行 Python 脚本,由 subprocess.run 的 input 参数提供。
     script = f"""\
 import asyncio, sys
-from database.session import get_file_records_col, get_pending_uploads_col
+from config import settings
+from database.session import _client, get_file_records_col, get_pending_uploads_col
+
 _TABLE_MAP = {{
     'file_records': get_file_records_col,
     'upload_sessions': get_pending_uploads_col,
@@ -1053,16 +1055,25 @@ _COL = {where_column!r}
 _VAL = {where_value!r}
 
 async def _q():
-    if _TABLE not in _TABLE_MAP:
-        print(-1)
-        return
+    # R91 fix: docker compose exec 启动新 Python 进程,_client._pool 为 None。
+    # 必须先 configure + connect_runtime_only 初始化连接池,否则
+    # D1Collection._query 调用 _client._pool.acquire() 抛
+    # AttributeError: 'NoneType' object has no attribute 'acquire'。
+    # skip_cache_store=True: 跳过 SQLite 缓存初始化(只读查询不需要)。
+    _client.configure(settings.COCKROACHDB_URL)
+    await _client.connect_runtime_only(skip_cache_store=True)
     try:
+        if _TABLE not in _TABLE_MAP:
+            print(-1)
+            return
         col = _TABLE_MAP[_TABLE]()
         rows = await col.find({{_COL: _VAL}})
         print(len(rows))
     except Exception as e:
         print(-1)
         sys.stderr.write(f'CRDB query failed: {{type(e).__name__}}: {{e}}')
+    finally:
+        await _client.close()
 
 asyncio.run(_q())
 """
