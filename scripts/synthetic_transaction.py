@@ -237,9 +237,10 @@ def _build_heartbeat_message(trace_id: str) -> dict[str, Any]:
             "name": trace_id,
             "total_processed": 0,
             "total_errors": 0,
-            # R73 P0-04: 在 message 元数据中记录 trace_id(即使 write_bot_heartbeat
-            # 不接受此参数,也要在 message 中记录以贯穿交易链路)
-            "trace_id": trace_id,
+            # R85 fix: trace_id 只放在顶层 msg["trace_id"](见下),不放入 data。
+            # db_writer._execute_sqlite 调用 await method(**data),若 data 含
+            # write_bot_heartbeat 不接受的 trace_id 会抛 TypeError → 永久死信 → ACK,
+            # 导致 verify 永远查不到落库记录。
         },
         "redis_key": "cache:all_bot_heartbeats",
         # RC59 fix: message_id 必须跨步骤唯一,否则 writer_inbox 幂等检查
@@ -396,7 +397,9 @@ def _build_dsp_dispatch_message(trace_id: str) -> dict[str, Any]:
             "task_type": "single",
             "protect_content": 0,
             "event_type": "delivery_requested",
-            "trace_id": trace_id,
+            # R85 fix: trace_id 只放在顶层 msg["trace_id"](见下),不放入 data。
+            # create_outbox_entry 不接受 trace_id 参数,放入 data 会导致
+            # db_writer 抛 TypeError → 永久死信 → ACK,verify 查不到落库。
         },
         "redis_key": f"cache:upload_outbox:{trace_id}",
         # RC59 fix: message_id 跨步骤唯一(参见 _build_heartbeat_message 注释)

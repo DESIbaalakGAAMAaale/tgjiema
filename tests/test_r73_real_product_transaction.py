@@ -116,15 +116,18 @@ class TestR73DspDispatchMessage:
     """R73 P0-04: 验证 _build_dsp_dispatch_message 包含 trace_id。"""
 
     def test_dsp_dispatch_message_has_trace_id_in_data(self, synthetic_tx):
-        """_build_dsp_dispatch_message 返回的消息 data 中必须包含 trace_id。"""
+        """R85 fix: _build_dsp_dispatch_message 的 data 中不得包含 trace_id。
+
+        create_outbox_entry 方法签名不接受 trace_id 参数,若放入 data 会导致
+        db_writer._execute_sqlite 的 await method(**data) 抛 TypeError →
+        永久死信 → ACK,verify 永远查不到落库记录。
+        trace_id 只应放在顶层 msg["trace_id"]。
+        """
         trace_id = "synthetic_r73_dsp_trace_id"
         msg = synthetic_tx._build_dsp_dispatch_message(trace_id)
-        assert "trace_id" in msg["data"], (
-            "R73 P0-04: dsp_dispatch 消息的 data 中必须包含 trace_id 字段"
-        )
-        assert msg["data"]["trace_id"] == trace_id, (
-            f"R73 P0-04: dsp_dispatch.data.trace_id 应为 {trace_id!r},"
-            f"实际: {msg['data']['trace_id']!r}"
+        assert "trace_id" not in msg["data"], (
+            "R85 fix: dsp_dispatch 消息的 data 中不得包含 trace_id 字段"
+            "(create_outbox_entry 不接受此参数,会导致 TypeError)"
         )
 
     def test_dsp_dispatch_message_has_top_level_trace_id(self, synthetic_tx):
@@ -549,3 +552,131 @@ class TestR73CleanupExtended:
 # _validate_role 均为已删除的内部 API,因此本测试类一并移除。
 # 新的测试覆盖见 tests/integration/test_secretless_provider_transaction.py
 # 和 tests/integration/test_provider_fault_contract.py。
+
+
+class TestR85DataSignatureCompatibility:
+    """R85 fix: 验证 _build_*_message 返回的 data 字段与业务方法签名兼容。
+
+    整改背景: rc-v1.0.89 在 compose-runtime-e2e phase 4
+    (real_product_transaction_before_backup) 失败,根因为
+    _build_heartbeat_message / _build_dsp_dispatch_message 在 data 中
+    放入了 trace_id 字段,但 write_bot_heartbeat / create_outbox_entry
+    方法签名不接受此参数,导致 db_writer._execute_sqlite 的
+    await method(**data) 抛 TypeError → 永久死信 → ACK,
+    verify 永远查不到落库记录。
+
+    本测试类用 inspect.signature 校验每个 _build_*_message 的 data
+    字段与对应业务方法签名兼容,防止未来再次出现同类问题。
+    """
+
+    def _get_cache_store_method_signature(self, method_name: str):
+        """加载 CacheStore 类并返回指定方法的参数集合。"""
+        import inspect
+        # 延迟导入,避免模块加载阶段触发 config/settings 初始化
+        sys.modules.setdefault("telegram", MagicMock())
+        sys.modules.setdefault("telegram.ext", MagicMock())
+        from database.cache_store import CacheStore
+        method = getattr(CacheStore, method_name, None)
+        assert method is not None, f"CacheStore.{method_name} 不存在"
+        sig = inspect.signature(method)
+        return set(sig.parameters.keys())
+
+    def test_heartbeat_data_compatible_with_write_bot_heartbeat(self, synthetic_tx):
+        """_build_heartbeat_message 的 data 字段必须与 write_bot_heartbeat 签名兼容。"""
+        trace_id = "synthetic_r85_heartbeat_sig"
+        msg = synthetic_tx._build_heartbeat_message(trace_id)
+        method_params = self._get_cache_store_method_signature("write_bot_heartbeat")
+        # write_bot_heartbeat(self, name, total_processed, total_errors)
+        # 移除 self
+        method_params.discard("self")
+        data_keys = set(msg["data"].keys())
+        extra_keys = data_keys - method_params
+        assert not extra_keys, (
+            f"R85 fix: heartbeat data 含方法签名不接受的字段: {extra_keys}"
+            f"(write_bot_heartbeat 接受: {method_params})"
+        )
+        # 验证 trace_id 不在 data 中(顶层才有)
+        assert "trace_id" not in msg["data"], (
+            "R85 fix: heartbeat data 不得包含 trace_id 字段"
+        )
+        assert msg.get("trace_id") == trace_id, (
+            "R85 fix: heartbeat 顶层 trace_id 必须存在"
+        )
+
+    def test_dsp_dispatch_data_compatible_with_create_outbox_entry(self, synthetic_tx):
+        """_build_dsp_dispatch_message 的 data 字段必须与 create_outbox_entry 签名兼容。"""
+        trace_id = "synthetic_r85_dsp_sig"
+        msg = synthetic_tx._build_dsp_dispatch_message(trace_id)
+        method_params = self._get_cache_store_method_signature("create_outbox_entry")
+        method_params.discard("self")
+        data_keys = set(msg["data"].keys())
+        extra_keys = data_keys - method_params
+        assert not extra_keys, (
+            f"R85 fix: dsp_dispatch data 含方法签名不接受的字段: {extra_keys}"
+            f"(create_outbox_entry 接受: {method_params})"
+        )
+        assert "trace_id" not in msg["data"], (
+            "R85 fix: dsp_dispatch data 不得包含 trace_id 字段"
+        )
+        assert msg.get("trace_id") == trace_id, (
+            "R85 fix: dsp_dispatch 顶层 trace_id 必须存在"
+        )
+
+    def test_upload_session_data_compatible_with_create_upload_session(self, synthetic_tx):
+        """_build_upload_session_message 的 data 字段必须与 create_upload_session 签名兼容。
+
+        create_upload_session 已包含 trace_id 形参,所以 data 中可含 trace_id。
+        """
+        trace_id = "synthetic_r85_upload_sig"
+        msg = synthetic_tx._build_upload_session_message(trace_id)
+        method_params = self._get_cache_store_method_signature("create_upload_session")
+        method_params.discard("self")
+        data_keys = set(msg["data"].keys())
+        extra_keys = data_keys - method_params
+        assert not extra_keys, (
+            f"R85 fix: upload_session data 含方法签名不接受的字段: {extra_keys}"
+            f"(create_upload_session 接受: {method_params})"
+        )
+
+    def test_file_index_data_compatible_with_upsert_file_record_local(self, synthetic_tx):
+        """_build_file_index_message 的 data 字段必须与 upsert_file_record_local 签名兼容。"""
+        trace_id = "synthetic_r85_file_idx_sig"
+        msg = synthetic_tx._build_file_index_message(trace_id)
+        method_params = self._get_cache_store_method_signature("upsert_file_record_local")
+        method_params.discard("self")
+        data_keys = set(msg["data"].keys())
+        extra_keys = data_keys - method_params
+        assert not extra_keys, (
+            f"R85 fix: file_index data 含方法签名不接受的字段: {extra_keys}"
+            f"(upsert_file_record_local 接受: {method_params})"
+        )
+
+    def test_all_builders_data_compatible_with_method_signatures(self, synthetic_tx):
+        """R85 防回归:所有 _build_*_message 的 data 字段必须与业务方法签名兼容。
+
+        这是防止未来再次出现 TypeError 死信问题的统一防回归。
+        """
+        import inspect
+        sys.modules.setdefault("telegram", MagicMock())
+        sys.modules.setdefault("telegram.ext", MagicMock())
+        from database.cache_store import CacheStore
+
+        builders = [
+            ("write_bot_heartbeat", synthetic_tx._build_heartbeat_message),
+            ("create_upload_session", synthetic_tx._build_upload_session_message),
+            ("upsert_file_record_local", synthetic_tx._build_file_index_message),
+            ("create_outbox_entry", synthetic_tx._build_dsp_dispatch_message),
+        ]
+        trace_id = "synthetic_r85_all_compat"
+        for method_name, builder in builders:
+            msg = builder(trace_id)
+            method = getattr(CacheStore, method_name, None)
+            assert method is not None, f"CacheStore.{method_name} 不存在"
+            sig = inspect.signature(method)
+            method_params = set(sig.parameters.keys()) - {"self"}
+            data_keys = set(msg["data"].keys())
+            extra_keys = data_keys - method_params
+            assert not extra_keys, (
+                f"R85 fix: {method_name} 的 data 含不接受字段: {extra_keys}"
+                f"(接受: {method_params})"
+            )
