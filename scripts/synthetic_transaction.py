@@ -1036,35 +1036,50 @@ def _query_crdb_count(
     # 通过 crdb_sync 容器执行 Python 代码查询 CRDB
     # 使用 importlib 加载 collection,通过 D1Collection.fetch_all 等方法查询
     # 表名 / 列名 / 值通过 ? 参数化查询防注入(trace_id 仅含字母数字和下划线)
-    inline_code = (
-        "import asyncio, sys; "
-        "from database.session import ("
-        "get_file_records_col, get_pending_uploads_col); "
-        "_TABLE_MAP = {"
-        "'file_records': get_file_records_col, "
-        "'upload_sessions': get_pending_uploads_col}; "
-        f"_TABLE = {table!r}; "
-        f"_COL = {where_column!r}; "
-        f"_VAL = {where_value!r}; "
-        "async def _q(): "
-        "  if _TABLE not in _TABLE_MAP: "
-        "    print(-1); return; "
-        "  try: "
-        "    col = _TABLE_MAP[_TABLE](); "
-        "    rows = await col.fetch_all(); "
-        "    cnt = sum(1 for r in rows if str(r.get(_COL, '')) == _VAL); "
-        "    print(cnt); "
-        "  except Exception as e: "
-        "    print(-1); "
-        "    sys.stderr.write(f'CRDB query failed: {type(e).__name__}: {e}'); "
-        "asyncio.run(_q())"
-    )
+    #
+    # R85 fix: 原实现使用 python -c "单行代码" 传递 async def,但 Python 的
+    # -c 模式不支持用分号分隔的复合语句(async def / if / try / except),
+    # 导致 SyntaxError: invalid syntax。改为通过 stdin(python -)传递
+    # 完整的多行 Python 脚本,由 subprocess.run 的 input 参数提供。
+    script = f"""\
+import asyncio, sys
+from database.session import get_file_records_col, get_pending_uploads_col
+_TABLE_MAP = {{
+    'file_records': get_file_records_col,
+    'upload_sessions': get_pending_uploads_col,
+}}
+_TABLE = {table!r}
+_COL = {where_column!r}
+_VAL = {where_value!r}
+
+async def _q():
+    if _TABLE not in _TABLE_MAP:
+        print(-1)
+        return
+    try:
+        col = _TABLE_MAP[_TABLE]()
+        rows = await col.fetch_all()
+        cnt = sum(1 for r in rows if str(r.get(_COL, '')) == _VAL)
+        print(cnt)
+    except Exception as e:
+        print(-1)
+        sys.stderr.write(f'CRDB query failed: {{type(e).__name__}}: {{e}}')
+
+asyncio.run(_q())
+"""
     cmd = _compose_cmd([
         "exec", "-T", "crdb_sync",
-        "python", "-c", inline_code,
+        "python", "-",
     ])
     try:
-        result = _run(cmd, timeout=timeout, cwd=REPO_ROOT)
+        result = subprocess.run(
+            cmd,
+            input=script,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(REPO_ROOT),
+        )
     except subprocess.TimeoutExpired:
         return (-1, "", "timeout", -1)
     count = -1

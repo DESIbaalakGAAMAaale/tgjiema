@@ -680,3 +680,121 @@ class TestR85DataSignatureCompatibility:
                 f"R85 fix: {method_name} 的 data 含不接受字段: {extra_keys}"
                 f"(接受: {method_params})"
             )
+
+
+class TestR90CrdbQueryScriptSyntax:
+    """R90 fix: 验证 _query_crdb_count 生成的 CRDB 查询脚本是语法合法的 Python。
+
+    整改背景: rc-v1.0.90 在 compose-runtime-e2e phase 4
+    (real_product_transaction_before_backup) 的 crdb_sync_verify 步骤失败,
+    根因为 _query_crdb_count 使用 python -c "单行代码" 传递 async def / if /
+    try / except 复合语句,但 Python -c 模式不支持用分号分隔复合语句,
+    导致 SyntaxError: invalid syntax。
+
+    修复: 改为通过 stdin(python -)传递完整多行 Python 脚本。
+    本测试类验证生成的脚本可被 compile() 成功解析,防止语法错误回归。
+    """
+
+    def test_crdb_query_script_is_syntactically_valid(self, synthetic_tx):
+        """_query_crdb_count 生成的脚本必须能通过 compile() 语法检查。
+
+        R90 fix: 原实现使用 python -c 传递单行脚本,async def + if/try/except
+        无法在分号分隔的单行中正确解析。改为 stdin 多行脚本后必须验证语法合法。
+        """
+        import ast
+
+        # 通过 mock subprocess.run 捕获传入 stdin 的脚本内容
+        captured_script = []
+
+        class FakeResult:
+            returncode = 0
+            stdout = "0\n"
+            stderr = ""
+
+        def fake_run(cmd, *, input=None, **kwargs):
+            captured_script.append(input)
+            return FakeResult()
+
+        with patch.object(synthetic_tx.subprocess, "run", side_effect=fake_run):
+            synthetic_tx._query_crdb_count(
+                "file_records", "file_code", "test_trace_123", timeout=5,
+            )
+
+        assert len(captured_script) == 1, "subprocess.run 应被调用恰好 1 次"
+        script = captured_script[0]
+        assert script is not None, "stdin 脚本不应为 None"
+        assert isinstance(script, str), "stdin 脚本应为 str 类型"
+
+        # 使用 compile() 验证脚本语法合法
+        # 若脚本有语法错误,compile() 会抛 SyntaxError
+        try:
+            compile(script, "<crdb_query_script>", "exec")
+        except SyntaxError as e:
+            pytest.fail(
+                f"R90 fix: CRDB 查询脚本存在语法错误: {e}\n"
+                f"脚本内容:\n{script}"
+            )
+
+    def test_crdb_query_script_uses_stdin_not_dash_c(self, synthetic_tx):
+        """R90 fix: 查询命令必须使用 python - (stdin),而非 python -c (单行)。
+
+    python -c 不支持 async def / if / try 的复合语句在单行中用分号分隔,
+    导致 SyntaxError。python - 从 stdin 读取完整多行脚本,语法无限制。
+    """
+        captured_cmd = []
+
+        class FakeResult:
+            returncode = 0
+            stdout = "0\n"
+            stderr = ""
+
+        def fake_run(cmd, *, input=None, **kwargs):
+            captured_cmd.append(cmd)
+            return FakeResult()
+
+        with patch.object(synthetic_tx.subprocess, "run", side_effect=fake_run):
+            synthetic_tx._query_crdb_count(
+                "file_records", "file_code", "test_trace_456", timeout=5,
+            )
+
+        assert len(captured_cmd) == 1
+        cmd = captured_cmd[0]
+        assert "python" in cmd, "命令应包含 python"
+        assert "-" in cmd, "命令应使用 python - (stdin 模式)"
+        assert "-c" not in cmd, (
+            "R90 fix: 禁止使用 python -c(不支持 async def 单行),"
+            "必须使用 python - (stdin 多行脚本)"
+        )
+
+    def test_crdb_query_script_contains_async_def_and_asyncio_run(self, synthetic_tx):
+        """R90 fix: 脚本必须包含 async def 和 asyncio.run(),确保 CRDB 异步查询。
+
+    D1Collection.fetch_all 是 async 方法,必须通过 asyncio.run() 调用。
+    脚本中必须存在 async def _q() 和 asyncio.run(_q())。
+    """
+        captured_script = []
+
+        class FakeResult:
+            returncode = 0
+            stdout = "0\n"
+            stderr = ""
+
+        def fake_run(cmd, *, input=None, **kwargs):
+            captured_script.append(input)
+            return FakeResult()
+
+        with patch.object(synthetic_tx.subprocess, "run", side_effect=fake_run):
+            synthetic_tx._query_crdb_count(
+                "upload_sessions", "upload_id", "test_trace_789", timeout=5,
+            )
+
+        script = captured_script[0]
+        assert "async def _q" in script, (
+            "R90 fix: CRDB 查询脚本必须包含 async def _q() 定义"
+        )
+        assert "asyncio.run(_q())" in script, (
+            "R90 fix: CRDB 查询脚本必须包含 asyncio.run(_q()) 调用"
+        )
+        assert "await col.fetch_all()" in script, (
+            "R90 fix: CRDB 查询脚本必须通过 await col.fetch_all() 查询记录"
+        )
