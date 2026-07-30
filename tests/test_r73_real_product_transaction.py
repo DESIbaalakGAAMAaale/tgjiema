@@ -795,6 +795,7 @@ class TestR90CrdbQueryScriptSyntax:
         assert "asyncio.run(_q())" in script, (
             "R90 fix: CRDB 查询脚本必须包含 asyncio.run(_q()) 调用"
         )
-        assert "await col.fetch_all()" in script, (
-            "R90 fix: CRDB 查询脚本必须通过 await col.fetch_all() 查询记录"
+        assert "await col.find({" in script, (
+            "R90 fix: CRDB 查询脚本必须通过 await col.find() 查询记录"
+            "(D1Collection 没有 fetch_all 方法)"
         )

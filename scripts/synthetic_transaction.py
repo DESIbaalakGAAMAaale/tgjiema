@@ -1058,9 +1058,8 @@ async def _q():
         return
     try:
         col = _TABLE_MAP[_TABLE]()
-        rows = await col.fetch_all()
-        cnt = sum(1 for r in rows if str(r.get(_COL, '')) == _VAL)
-        print(cnt)
+        rows = await col.find({{_COL: _VAL}})
+        print(len(rows))
     except Exception as e:
         print(-1)
         sys.stderr.write(f'CRDB query failed: {{type(e).__name__}}: {{e}}')
