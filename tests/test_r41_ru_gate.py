@@ -367,12 +367,32 @@ class TestCrdbSyncLazyConnect:
             "_close_pool_if_idle 应调用 _close_crdb_only"
         )
 
-    def test_sync_dirty_outbox_calls_should_connect(self):
-        """_sync_dirty_outbox 应在开头调用 _should_connect 判断是否需要连接。"""
+    def test_sync_dirty_outbox_does_not_gate_on_should_connect(self):
+        """R93 fix: _sync_dirty_outbox 不得使用 _should_connect() 作为门禁。
+
+        根因: _sync_loop 在调用 _sync_dirty_outbox() 前已通过
+        _lazy_connect_crdb() 连接 CRDB pool,导致 _crdb_pool_connected=True。
+        而 _should_connect() 在 pool 已连接时返回 False(避免重复连接),
+        使 _sync_dirty_outbox() 提前 return — dirty_outbox 记录永不处理,
+        file_records 永远不会同步到 CRDB。
+
+        R93 fix: 移除 _should_connect() 门禁,直接调用幂等的 _lazy_connect_crdb()。
+        """
         source = _read_text(SERVICES_DIR / "crdb_sync_service.py")
-        # _sync_dirty_outbox 方法应调用 _should_connect
-        assert "_should_connect()" in source or "await _should_connect()" in source, (
-            "_sync_dirty_outbox 应调用 _should_connect"
+        # 提取 _sync_dirty_outbox 函数体(从 def 到下一个顶级 def/async def)
+        import re
+        match = re.search(
+            r"async def _sync_dirty_outbox\(\):(.*?)(?=\nasync def |\ndef |\nclass )",
+            source, re.DOTALL,
+        )
+        assert match, "无法在源码中定位 _sync_dirty_outbox 函数体"
+        func_body = match.group(1)
+        assert "await _should_connect()" not in func_body, (
+            "R93 fix: _sync_dirty_outbox 不得调用 _should_connect() 作为门禁"
+            "(pool 已连接时返回 False,导致 dirty_outbox 记录永不处理)"
+        )
+        assert "await _lazy_connect_crdb()" in func_body, (
+            "R93 fix: _sync_dirty_outbox 应直接调用幂等的 _lazy_connect_crdb()"
         )
 
     def test_sync_dirty_outbox_calls_close_pool_if_idle(self):
@@ -461,6 +481,81 @@ class TestClosePoolIfIdleRuntime:
         finally:
             svc._crdb_pool_connected = original_connected
             svc._last_dirty_seen_ts = original_dirty_ts
+
+
+# ════════════════════════════════════════════════════════════════
+# R93 fix: _sync_dirty_outbox 不再被 _should_connect 门禁阻塞
+# ════════════════════════════════════════════════════════════════
+
+
+class TestR93SyncDirtyOutboxNotBlockedByShouldConnect:
+    """R93 fix: 验证 _sync_dirty_outbox 在 pool 已连接时仍处理 dirty_outbox 记录。
+
+    根因(rc-v1.0.92 失败):
+        _sync_loop 调用顺序:
+          1. get_dirty_func() → 检测到 dirty
+          2. _lazy_connect_crdb() → 连接 pool → _crdb_pool_connected=True
+          3. sync_func() → _sync_dirty_outbox()
+        但 _sync_dirty_outbox() 内部调用 _should_connect(),
+        而 _should_connect() 在 _crdb_pool_connected=True 时返回 False,
+        导致 _sync_dirty_outbox() 提前 return,dirty_outbox 记录永不处理。
+
+    R93 fix: 移除 _should_connect() 门禁,直接调用幂等的 _lazy_connect_crdb()。
+    """
+
+    def test_sync_dirty_outbox_processes_records_when_pool_already_connected(self):
+        """pool 已连接时(模拟 _sync_loop 预先连接),_sync_dirty_outbox 仍应 dispatch 记录。"""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        import services.crdb_sync_service as svc
+
+        original_connected = svc._crdb_pool_connected
+        original_get_store = svc._get_cache_store_safe
+        original_lazy = svc._lazy_connect_crdb
+        original_close = svc._close_pool_if_idle
+        original_dispatch = svc._dispatch_dirty_outbox_to_crdb
+        original_route_dlq = svc._route_dirty_outbox_to_dlq
+        try:
+            # 模拟 _sync_loop 已连接 pool(这正是触发 bug 的状态)
+            svc._crdb_pool_connected = True
+
+            # 模拟 cache_store 有 1 条 dirty_outbox 记录
+            fake_record = {
+                "id": 1,
+                "table_name": "file_records",
+                "pk": "test_file_code",
+                "version": 1,
+                "operation": "upsert",
+                "payload": '{"file_code": "test_file_code"}',
+                "created_at": "2026-07-30T11:00:00Z",
+            }
+            fake_store = MagicMock()
+            fake_store.get_dirty_outbox_batch = AsyncMock(return_value=[fake_record])
+            fake_store.mark_dirty_processed = AsyncMock(return_value=None)
+            fake_store.mark_dirty_retry = AsyncMock(return_value=None)
+            svc._get_cache_store_safe = lambda: fake_store
+
+            # mock 连接/dispatch(不应调用 _should_connect)
+            svc._lazy_connect_crdb = AsyncMock(return_value=None)
+            svc._close_pool_if_idle = AsyncMock(return_value=None)
+            svc._dispatch_dirty_outbox_to_crdb = AsyncMock(return_value=[1])
+            svc._route_dirty_outbox_to_dlq = AsyncMock(return_value=None)
+
+            asyncio.run(svc._sync_dirty_outbox())
+
+            # 关键断言:dispatch 被调用(记录被处理)
+            svc._dispatch_dirty_outbox_to_crdb.assert_called_once()
+            # _lazy_connect_crdb 被调用(幂等,安全)
+            svc._lazy_connect_crdb.assert_called_once()
+            # 记录被标记为已处理(store 方法)
+            fake_store.mark_dirty_processed.assert_called_once()
+        finally:
+            svc._crdb_pool_connected = original_connected
+            svc._get_cache_store_safe = original_get_store
+            svc._lazy_connect_crdb = original_lazy
+            svc._close_pool_if_idle = original_close
+            svc._dispatch_dirty_outbox_to_crdb = original_dispatch
+            svc._route_dirty_outbox_to_dlq = original_route_dlq
 
 
 # ════════════════════════════════════════════════════════════════

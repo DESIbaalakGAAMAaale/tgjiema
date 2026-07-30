@@ -1680,14 +1680,13 @@ async def _sync_dirty_outbox():
     """R39 P0-4 / R41 RU 门禁: 消费 dirty_outbox — 按 table_name 分组 dispatch 到 CRDB。
 
     流程:
-        1. _should_connect(): 检查 dirty_outbox 是否有未处理记录(0 RU)
-        2. _lazy_connect_crdb(): dirty 存在时才连接 CRDB pool
-        3. get_dirty_outbox_batch(CRDB_SYNC_BATCH_SIZE): 拉取未处理记录
-        4. R41: 合并最高 version — 同一 (table_name, pk) 仅保留 version 最大的记录
+        1. _lazy_connect_crdb(): 幂等连接 CRDB pool(_sync_loop 已预先连接)
+        2. get_dirty_outbox_batch(CRDB_SYNC_BATCH_SIZE): 拉取未处理记录
+        3. R41: 合并最高 version — 同一 (table_name, pk) 仅保留 version 最大的记录
            (降低 CRDB UPSERT 次数,RU 消耗随合并比例下降)
-        5. 按 table_name 分组 dispatch 到 CRDB
-        6. mark_dirty_processed(ids): 标记成功处理的记录(含被合并的旧版本)
-        7. 末尾调用 _close_pool_if_idle(): 空闲超阈值时关闭 CRDB pool
+        4. 按 table_name 分组 dispatch 到 CRDB
+        5. mark_dirty_processed(ids): 标记成功处理的记录(含被合并的旧版本)
+        6. 末尾调用 _close_pool_if_idle(): 空闲超阈值时关闭 CRDB pool
 
     幂等: dispatcher 使用 INSERT ON CONFLICT DO UPDATE, 重复处理不会产生副作用。
     """
@@ -1695,21 +1694,19 @@ async def _sync_dirty_outbox():
     if store is None:
         return
 
-    # R41 RU 门禁: 先用 _should_connect() 判断是否需要连接 CRDB(0 RU)
-    if not await _should_connect():
-        # dirty_outbox 为空且 pool 未连接 → 直接返回(零 CRDB RU)
-        # 若 pool 已连接但无 dirty,则由 _close_pool_if_idle() 在末尾关闭
-        if _crdb_pool_connected:
-            await _close_pool_if_idle()
-        return
-
-    # R41: dirty 存在,懒加载 CRDB pool(若未连接)
+    # R93 fix: 移除 _should_connect() 门禁。
+    # 根因: _sync_loop 在调用本函数前已通过 get_dirty_func() 检测到 dirty,
+    # 并调用 _lazy_connect_crdb() 连接了 CRDB pool (_crdb_pool_connected=True)。
+    # 而 _should_connect() 在 pool 已连接时直接返回 False (意为"无需重复连接"),
+    # 导致 _sync_dirty_outbox() 提前 return — dirty_outbox 记录永不处理,
+    # file_records 永远不会同步到 CRDB。
+    # _lazy_connect_crdb() 是幂等的(已连接时直接返回),可直接安全调用。
     await _lazy_connect_crdb()
 
     # R41 RU 门禁: 使用 CRDB_SYNC_BATCH_SIZE(默认 100,范围 100-500)
     batch = await store.get_dirty_outbox_batch(limit=CRDB_SYNC_BATCH_SIZE)
     if not batch:
-        # dirty_outbox 为空(可能在 _should_connect 之后被另一轮消费了)
+        # dirty_outbox 为空(可能在 get_dirty_func 之后被另一轮消费了)
         # 仍然调用 _close_pool_if_idle() 释放空闲连接
         await _close_pool_if_idle()
         return
