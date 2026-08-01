@@ -1,1 +1,1 @@
-worker: python entrypoint.py
+worker: python docker/entrypoint.py
